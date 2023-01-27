@@ -3,9 +3,15 @@
 
 const std = @import("std");
 
+const ztun_pkg = std.build.Pkg{
+    .name = "ztun",
+    .source = .{ .path = "deps/ztun/src/ztun.zig" },
+};
+
 const zice_pkg = std.build.Pkg{
     .name = "zice",
-    .source = std.build.FileSource.relative("src/main.zig"),
+    .source = .{ .path = "src/main.zig" },
+    .dependencies = &[_]std.build.Pkg{ztun_pkg},
 };
 
 pub fn buildSamples(b: *std.build.Builder, mode: std.builtin.Mode, target: std.zig.CrossTarget) !void {

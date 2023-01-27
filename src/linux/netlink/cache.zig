@@ -229,7 +229,7 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
                                         address.address = net.Address{ .ipv4 = net.Ipv4Address{ .value = attribute_data[0..4].* } };
                                     },
                                     linux.AF.INET6 => {
-                                        address.address = net.Address{ .ipv6 = net.Ipv6Address{ .value = attribute_data[0..16].* } };
+                                        address.address = net.Address{ .ipv6 = net.Ipv6Address{ .value = attribute_data[0..16].*, .scope_id = addr_info.index } };
                                     },
                                     else => return error.UnknownFamily,
                                 }

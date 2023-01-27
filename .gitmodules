@@ -1,0 +1,3 @@
+[submodule "ztun"]
+	path = deps/ztun
+	url = git@github.com:Corendos/ztun.git

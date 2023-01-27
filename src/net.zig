@@ -37,6 +37,7 @@ pub const Ipv4Address = struct {
 /// Represents an IPv6 address.
 pub const Ipv6Address = struct {
     value: [16]u8,
+    scope_id: u32 = 0,
 
     pub fn format(value: Ipv6Address, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = options;
@@ -59,6 +60,9 @@ pub const Ipv6Address = struct {
             value.value[14],
             value.value[15],
         });
+        if (value.scope_id != 0) {
+            try writer.print("%{}", .{value.scope_id});
+        }
     }
 };
 
