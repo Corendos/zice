@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
+const xev = @import("xev");
+
 const nl = @import("../netlink.zig");
-const net = @import("../../net.zig");
+const zice = @import("../../../main.zig");
+const net = zice.net;
 
 const linux = std.os.linux;
 
@@ -50,13 +53,13 @@ pub const Cache = struct {
         self.addresses = addresses;
     }
 
-    pub fn getAddressesByInterfaceIndexAlloc(self: *const Cache, interface_index: u32, allocator: std.mem.Allocator) ![]net.Address {
-        var address_list = std.ArrayList(net.Address).init(allocator);
+    pub fn getAddressesByInterfaceIndexAlloc(self: *const Cache, interface_index: u32, allocator: std.mem.Allocator) ![]nl.Address {
+        var address_list = std.ArrayList(nl.Address).init(allocator);
         defer address_list.deinit();
 
         for (self.addresses) |address| {
             if (address.interface_index == interface_index) {
-                try address_list.append(address.address);
+                try address_list.append(address);
             }
         }
 
@@ -65,11 +68,11 @@ pub const Cache = struct {
 };
 
 pub fn listLink(netlink_socket: i32, allocator: std.mem.Allocator, storage: std.mem.Allocator) ![]nl.Link {
+    _ = storage;
     var temp_arena_state = std.heap.ArenaAllocator.init(allocator);
     defer temp_arena_state.deinit();
 
     var temp_arena = temp_arena_state.allocator();
-
     const request_header = linux.nlmsghdr{
         .len = nl.nlmsg_length(@sizeOf(linux.ifinfomsg)),
         .type = linux.NetlinkMessageType.RTM_GETLINK,
@@ -97,60 +100,16 @@ pub fn listLink(netlink_socket: i32, allocator: std.mem.Allocator, storage: std.
         break :blk buffer;
     };
 
-    try nl.write(netlink_socket, request_buffer);
+    _ = try std.os.write(netlink_socket, request_buffer);
 
     var link_list = std.ArrayList(nl.Link).init(allocator);
     defer link_list.deinit();
 
     const response_buffer = try temp_arena.alloc(u8, 8192);
+    _ = response_buffer;
 
-    var done: bool = false;
-    while (!done) {
-        const response = try nl.read(netlink_socket, response_buffer);
-
-        var message_it = nl.MessageIterator.init(@alignCast(@alignOf(linux.nlmsghdr), response));
-
-        while (message_it.next()) |message| {
-            if (message.flags & linux.NLM_F_MULTI == 0) {
-                done = true;
-            }
-
-            const message_payload = nl.nlmsg_data(message);
-            switch (message.type) {
-                linux.NetlinkMessageType.DONE => {
-                    done = true;
-                },
-                linux.NetlinkMessageType.RTM_NEWLINK => {
-                    var link = nl.Link{ .type = undefined, .interface_index = undefined };
-                    const link_info = @ptrCast(*const linux.ifinfomsg, @alignCast(@alignOf(linux.ifinfomsg), message_payload.ptr));
-                    link.type = @intCast(u32, link_info.type);
-                    link.interface_index = @intCast(u32, link_info.index);
-
-                    var attribute_it = nl.AttributeIterator.init(@alignCast(@alignOf(nl.rtattr), message_payload[@sizeOf(linux.ifinfomsg)..]));
-                    while (attribute_it.next()) |attribute| {
-                        const attribute_data = nl.rta_data(attribute);
-                        switch (nl.rtattr.as(linux.IFLA, attribute.*)) {
-                            linux.IFLA.IFNAME => {
-                                const name = @ptrCast([:0]const u8, attribute_data);
-                                link.name = try storage.dupe(u8, name);
-                            },
-                            linux.IFLA.ADDRESS => {
-                                std.mem.copy(u8, link.address[0..], attribute_data[0..6]);
-                            },
-                            else => {},
-                        }
-                    }
-
-                    try link_list.append(link);
-                },
-                linux.NetlinkMessageType.ERROR => {
-                    const nl_error = @ptrCast(*const nl.nlmsgerr, @alignCast(@alignOf(nl.nlmsgerr), message_payload.ptr));
-                    std.log.err("Got error:\n{}", .{nl_error});
-                },
-                else => {},
-            }
-        }
-    }
+    //var done: bool = false;
+    //while (!done) {}
 
     return link_list.toOwnedSlice();
 }
@@ -189,7 +148,7 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
         break :blk buffer;
     };
 
-    try nl.write(netlink_socket, request_buffer);
+    _ = try std.os.write(netlink_socket, request_buffer);
 
     var address_list = std.ArrayList(nl.Address).init(allocator);
     defer address_list.deinit();
@@ -198,7 +157,8 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
 
     var done: bool = false;
     while (!done) {
-        const response = try nl.read(netlink_socket, response_buffer);
+        const bytes_read = try std.os.read(netlink_socket, response_buffer);
+        const response = response_buffer[0..bytes_read];
 
         var message_it = nl.MessageIterator.init(@alignCast(@alignOf(linux.nlmsghdr), response));
 
@@ -226,10 +186,10 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
                             nl.IFA.IFA_ADDRESS => {
                                 switch (address.family) {
                                     linux.AF.INET => {
-                                        address.address = net.Address{ .ipv4 = net.Ipv4Address{ .value = attribute_data[0..4].* } };
+                                        address.address = std.net.Address.initIp4(attribute_data[0..4].*, 0);
                                     },
                                     linux.AF.INET6 => {
-                                        address.address = net.Address{ .ipv6 = net.Ipv6Address{ .value = attribute_data[0..16].*, .scope_id = addr_info.index } };
+                                        address.address = std.net.Address.initIp6(attribute_data[0..16].*, 0, 0, addr_info.index);
                                     },
                                     else => return error.UnknownFamily,
                                 }

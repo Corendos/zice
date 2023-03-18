@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const zice = @import("zice");
-const os = zice.os;
 
 pub const std_options = struct {
     pub fn logFn(
@@ -18,7 +17,7 @@ pub const std_options = struct {
         std.debug.getStderrMutex().lock();
         defer std.debug.getStderrMutex().unlock();
         const now = std.time.Instant.now() catch unreachable;
-        const thread_id = os.linux.c.gettid();
+        const thread_id = std.os.linux.gettid();
         const seconds = now.timestamp.tv_sec;
         const milliseconds = @intCast(u64, @divTrunc(now.timestamp.tv_nsec, std.time.ns_per_ms));
         nosuspend stderr.print("[{}.{:0>3}] [{}] ", .{ seconds, milliseconds, thread_id }) catch return;
@@ -26,33 +25,31 @@ pub const std_options = struct {
     }
 };
 
-pub fn bindAddresses(addresses: []zice.net.Address, allocator: std.mem.Allocator) !struct { addresses: []zice.net.Address, socket_fds: []i32 } {
-    var output_address_list = try std.ArrayList(zice.net.Address).initCapacity(allocator, addresses.len);
+pub fn bindAddresses(addresses: []std.net.Address, allocator: std.mem.Allocator) !struct { addresses: []std.net.Address, sockets: []zice.net.Socket } {
+    var output_address_list = try std.ArrayList(std.net.Address).initCapacity(allocator, addresses.len);
     defer output_address_list.deinit();
 
-    var socket_fds_list = try std.ArrayList(i32).initCapacity(allocator, addresses.len);
-    defer socket_fds_list.deinit();
-    errdefer for (socket_fds_list.items) |fd| {
-        os.linux.close(fd) catch {};
+    var sockets_list = try std.ArrayList(zice.net.Socket).initCapacity(allocator, addresses.len);
+    defer sockets_list.deinit();
+    errdefer for (sockets_list.items) |socket| {
+        std.os.close(socket.fd);
     };
 
     for (addresses) |address| {
-        const protocol_family = switch (address) {
-            .ipv4 => os.linux.ProtocolFamily.inet,
-            .ipv6 => os.linux.ProtocolFamily.inet6,
-        };
-        const socket = os.linux.socket(protocol_family, os.linux.SocketType.datagram) catch return error.BindError;
-        errdefer os.linux.close(socket) catch {};
+        const socket = zice.net.Socket{ .fd = std.os.socket(address.any.family, std.os.SOCK.DGRAM, 0) catch return error.BindError };
+        errdefer std.os.close(socket.fd);
 
-        zice.bind(socket, address, null) catch return error.BindError;
+        //std.os.bind(socket.fd, &address.any, address.getOsSockLen());
+
+        zice.bind(socket.fd, address) catch return error.BindError;
 
         try output_address_list.append(address);
-        try socket_fds_list.append(socket);
+        try sockets_list.append(socket);
     }
 
     return .{
         .addresses = try output_address_list.toOwnedSlice(),
-        .socket_fds = try socket_fds_list.toOwnedSlice(),
+        .sockets = try sockets_list.toOwnedSlice(),
     };
 }
 
@@ -69,32 +66,28 @@ pub fn main() !void {
         break :blk try bindAddresses(addresses, allocator);
     };
     const addresses = addresses_and_socket.addresses;
-    const socket_fds = addresses_and_socket.socket_fds;
+    const sockets = addresses_and_socket.sockets;
     defer allocator.free(addresses);
-    defer allocator.free(socket_fds);
+    defer allocator.free(sockets);
 
-    const host_candidates: []zice.Candidate = try zice.makeHostCandidates(addresses, socket_fds, allocator);
+    const host_candidates: []zice.Candidate = try zice.makeHostCandidates(addresses, sockets, allocator);
     defer allocator.free(host_candidates);
 
-    const server_reflexive_candidates: []zice.Candidate = try zice.makeServerReflexiveCandidates(host_candidates, socket_fds, allocator);
+    const server_reflexive_candidates: []zice.Candidate = try zice.makeServerReflexiveCandidates(host_candidates, sockets, allocator);
     defer allocator.free(server_reflexive_candidates);
 
     for (host_candidates) |candidate| {
-        std.log.info("{s} {} {} {} {}", .{
+        std.log.info("{s} {} {}", .{
             @tagName(candidate.type),
-            candidate.transport_address.address,
-            candidate.transport_address.port,
-            candidate.base_address.address,
-            candidate.base_address.port,
+            candidate.transport_address,
+            candidate.base_address,
         });
     }
     for (server_reflexive_candidates) |candidate| {
-        std.log.info("{s} {} {} {} {}", .{
+        std.log.info("{s} {} {}", .{
             @tagName(candidate.type),
-            candidate.transport_address.address,
-            candidate.transport_address.port,
-            candidate.base_address.address,
-            candidate.base_address.port,
+            candidate.transport_address,
+            candidate.base_address,
         });
     }
 }
