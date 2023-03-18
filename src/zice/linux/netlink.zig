@@ -379,12 +379,11 @@ pub const ListLinkContext = struct {
     userdata: ?*anyopaque,
     callback: *const fn (userdata: ?*anyopaque, result: ListLinkError!ListLinkResult) void,
 
-    write_completion: xev.Completion = .{},
-    read_completion: xev.Completion = .{},
-    read_buffer: [4096]u8 = undefined,
+    completion: xev.Completion = .{},
+    buffer: [4096]u8 = undefined,
 
-    links_list: std.ArrayListUnmanaged(Link) = std.ArrayListUnmanaged(Link){},
-    result_storage: std.heap.ArenaAllocator,
+    result_links_list: std.ArrayListUnmanaged(Link) = .{},
+    result_storage: ?std.heap.ArenaAllocator = null,
 
     pub fn init(
         socket: std.os.fd_t,
@@ -402,8 +401,8 @@ pub const ListLinkContext = struct {
     }
 
     pub fn cleanup(self: *ListLinkContext) void {
-        self.links_list.deinit(self.allocator);
-        self.result_storage.deinit();
+        self.result_links_list.deinit(self.allocator);
+        if (self.result_storage) |storage| storage.deinit();
     }
 };
 
@@ -414,24 +413,23 @@ pub fn listLinkAsyncWriteCallback(
     result: xev.Result,
 ) xev.CallbackAction {
     const context = @ptrCast(*ListLinkContext, @alignCast(@alignOf(ListLinkContext), userdata.?));
-    context.allocator.free(completion.op.write.buffer.slice);
     _ = result.write catch {
         context.cleanup();
         context.callback(context.userdata, error.Unexpected);
         return .disarm;
     };
 
-    context.read_completion = xev.Completion{
+    completion.* = xev.Completion{
         .op = .{
             .read = .{
                 .fd = context.socket,
-                .buffer = .{ .slice = &context.read_buffer },
+                .buffer = .{ .slice = &context.buffer },
             },
         },
         .userdata = context,
         .callback = listLinkAsyncReadCallback,
     };
-    loop.add(&context.read_completion);
+    loop.add(&context.completion);
 
     return .disarm;
 }
@@ -462,7 +460,7 @@ fn processMessage(message_it: *MessageIterator, context: *ListLinkContext) !bool
                     switch (rtattr.as(linux.IFLA, attribute.*)) {
                         linux.IFLA.IFNAME => {
                             const name = @ptrCast([:0]const u8, attribute_data);
-                            link.name = try context.result_storage.allocator().dupe(u8, name);
+                            link.name = try context.result_storage.?.allocator().dupe(u8, name);
                         },
                         linux.IFLA.ADDRESS => {
                             link.address = attribute_data[0..6].*;
@@ -478,13 +476,13 @@ fn processMessage(message_it: *MessageIterator, context: *ListLinkContext) !bool
                         },
                         linux.IFLA.QDISC => {
                             const qdisc = @ptrCast([:0]const u8, attribute_data);
-                            link.queueing_discipline = try context.result_storage.allocator().dupe(u8, qdisc);
+                            link.queueing_discipline = try context.result_storage.?.allocator().dupe(u8, qdisc);
                         },
                         else => {},
                     }
                 }
 
-                try context.links_list.append(context.allocator, link);
+                try context.result_links_list.append(context.allocator, link);
             },
             linux.NetlinkMessageType.ERROR => {
                 const nl_error = @ptrCast(*const nlmsgerr, @alignCast(@alignOf(nlmsgerr), message_payload.ptr));
@@ -507,25 +505,32 @@ fn listLinkAsyncReadCallback(
     const context = @ptrCast(*ListLinkContext, @alignCast(@alignOf(ListLinkContext), userdata.?));
     _ = completion;
 
+    if (context.result_storage == null) {
+        context.result_storage = std.heap.ArenaAllocator.init(context.allocator);
+    }
+
     const bytes_read = c_result.read catch {
         context.cleanup();
         context.callback(context.userdata, error.Unexpected);
         return .disarm;
     };
-    const response = context.read_buffer[0..bytes_read];
+    const response = context.buffer[0..bytes_read];
 
     var message_it = MessageIterator.init(@alignCast(@alignOf(linux.nlmsghdr), response));
     const done = processMessage(&message_it, context) catch {
+        context.cleanup();
         context.callback(context.userdata, error.Unexpected);
         return .disarm;
     };
 
     if (done) {
-        const result = blk: {
-            const links = context.links_list.toOwnedSlice(context.allocator) catch break :blk error.OutOfMemory;
-
-            break :blk ListLinkResult{ .links = links, .storage = context.result_storage };
+        var links = context.result_links_list.toOwnedSlice(context.allocator) catch |e| {
+            context.cleanup();
+            context.callback(context.userdata, e);
+            return .disarm;
         };
+
+        const result = ListLinkResult{ .links = links, .storage = context.result_storage.? };
         context.callback(context.userdata, result);
         return .disarm;
     }
@@ -535,10 +540,7 @@ fn listLinkAsyncReadCallback(
 
 pub fn listLinkAsync(context: *ListLinkContext, worker: anytype) !void {
     const raw_request = blk: {
-        var buffer = try context.allocator.alloc(u8, nlmsg_space(@sizeOf(linux.ifinfomsg)));
-        errdefer context.allocator.free(buffer);
-
-        var stream = std.io.fixedBufferStream(buffer);
+        var stream = std.io.fixedBufferStream(&context.buffer);
         var writer = stream.writer();
 
         const request_header = linux.nlmsghdr{
@@ -560,10 +562,10 @@ pub fn listLinkAsync(context: *ListLinkContext, worker: anytype) !void {
         try writer.writeStruct(request_header);
         try writer.writeStruct(request_payload);
 
-        break :blk buffer;
+        break :blk stream.getWritten();
     };
 
-    context.write_completion = xev.Completion{
+    context.completion = xev.Completion{
         .op = .{
             .write = .{
                 .fd = context.socket,
@@ -573,5 +575,5 @@ pub fn listLinkAsync(context: *ListLinkContext, worker: anytype) !void {
         .userdata = context,
         .callback = listLinkAsyncWriteCallback,
     };
-    worker.add(&context.write_completion);
+    worker.add(&context.completion);
 }
