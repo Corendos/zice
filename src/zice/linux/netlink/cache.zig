@@ -34,22 +34,22 @@ pub const Cache = struct {
         var new_storage = std.heap.ArenaAllocator.init(self.allocator);
         errdefer new_storage.deinit();
 
-        const links = try listLink(socket, self.allocator, new_storage.allocator());
-        errdefer self.allocator.free(links);
+        //const links = try listLink(socket, self.allocator, new_storage.allocator());
+        //errdefer self.allocator.free(links);
         const addresses = try listAddress(socket, self.allocator, new_storage.allocator());
         errdefer self.allocator.free(addresses);
 
-        const old_links = self.links;
+        //const old_links = self.links;
         const old_addresses = self.addresses;
         const old_storage_opt = self.storage;
-        defer self.allocator.free(old_links);
+        //defer self.allocator.free(old_links);
         defer self.allocator.free(old_addresses);
         defer if (old_storage_opt) |old_storage| {
             old_storage.deinit();
         };
 
         self.storage = new_storage;
-        self.links = links;
+        //self.links = links;
         self.addresses = addresses;
     }
 
@@ -173,11 +173,14 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
                     done = true;
                 },
                 linux.NetlinkMessageType.RTM_NEWADDR => {
-                    var address = nl.Address{ .family = undefined, .interface_index = undefined, .address = undefined };
-
                     const addr_info = @ptrCast(*const nl.ifaddrmsg, @alignCast(@alignOf(nl.ifaddrmsg), message_payload.ptr));
-                    address.interface_index = addr_info.index;
-                    address.family = addr_info.family;
+                    var address = nl.Address{
+                        .family = addr_info.family,
+                        .prefix_length = addr_info.prefixlen,
+                        .flags = addr_info.flags,
+                        .scope = addr_info.scope,
+                        .interface_index = @intCast(u8, addr_info.index),
+                    };
 
                     var attribute_it = nl.AttributeIterator.init(@alignCast(@alignOf(nl.rtattr), message_payload[@sizeOf(nl.ifaddrmsg)..]));
                     while (attribute_it.next()) |attribute| {
@@ -186,10 +189,20 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
                             nl.IFA.IFA_ADDRESS => {
                                 switch (address.family) {
                                     linux.AF.INET => {
-                                        address.address = std.net.Address.initIp4(attribute_data[0..4].*, 0);
+                                        const a align(8) = linux.sockaddr.in{
+                                            .port = 0,
+                                            .addr = @bitCast(u32, attribute_data[0..4].*),
+                                        };
+                                        address.local_address = @ptrCast(*const linux.sockaddr.storage, &a).*;
                                     },
                                     linux.AF.INET6 => {
-                                        address.address = std.net.Address.initIp6(attribute_data[0..16].*, 0, 0, addr_info.index);
+                                        const a align(8) = linux.sockaddr.in6{
+                                            .port = 0,
+                                            .flowinfo = 0,
+                                            .addr = attribute_data[0..16].*,
+                                            .scope_id = addr_info.index,
+                                        };
+                                        address.local_address = @ptrCast(*const linux.sockaddr.storage, &a).*;
                                     },
                                     else => return error.UnknownFamily,
                                 }

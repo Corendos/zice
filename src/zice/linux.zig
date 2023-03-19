@@ -7,70 +7,95 @@ pub const nl = @import("linux/netlink.zig");
 const zice = @import("../main.zig");
 const net = zice.net;
 
+pub fn Future(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        result: T = undefined,
+        barrier: std.Thread.ResetEvent = .{},
+
+        pub fn setValue(self: *Self, v: T) void {
+            self.result = v;
+            self.barrier.set();
+        }
+
+        pub fn getValue(self: *Self) T {
+            self.barrier.wait();
+            return self.result;
+        }
+    };
+}
+
 /// Gather IP address for all interfaces.
-pub fn getAddressesFromInterfaces(allocator: std.mem.Allocator) ![]std.net.Address {
+pub fn getAddressesFromInterfaces(allocator: std.mem.Allocator, worker: *zice.Worker) ![]std.net.Address {
     var temp_arena_state = std.heap.ArenaAllocator.init(allocator);
     defer temp_arena_state.deinit();
 
     var temp_arena = temp_arena_state.allocator();
 
-    const socket = try std.os.socket(std.os.linux.AF.NETLINK, std.os.linux.SOCK.RAW, std.os.linux.NETLINK.ROUTE);
+    const socket = s: {
+        const socket = try std.os.socket(std.os.linux.AF.NETLINK, std.os.linux.SOCK.RAW, std.os.linux.NETLINK.ROUTE);
+
+        const address = std.os.linux.sockaddr.nl{ .pid = 0, .groups = 0 };
+        try std.os.bind(socket, @ptrCast(*const std.os.linux.sockaddr, &address), @sizeOf(std.os.linux.sockaddr.nl));
+        break :s socket;
+    };
     defer std.os.close(socket);
 
-    const address = std.os.linux.sockaddr.nl{ .pid = 0, .groups = 0 };
-    try std.os.bind(socket, @ptrCast(*const std.os.linux.sockaddr, &address), @sizeOf(std.os.linux.sockaddr.nl));
+    const ListLinkResultFuture = Future(zice.nl.ListLinkError!zice.nl.ListLinkResult);
+    var links_future = ListLinkResultFuture{};
 
-    var netlink_cache = nl.Cache.init(temp_arena);
+    var list_link_context = zice.nl.ListLinkContext{
+        .socket = socket,
+        .allocator = temp_arena,
+        .userdata = &links_future,
+        .callback = (struct {
+            pub fn callback(userdata: ?*anyopaque, r: zice.nl.ListLinkError!zice.nl.ListLinkResult) void {
+                var future = @ptrCast(*ListLinkResultFuture, @alignCast(@alignOf(ListLinkResultFuture), userdata.?));
+                future.setValue(r);
+            }
+        }).callback,
+    };
+    try zice.nl.listLinkAsync(&list_link_context, worker);
+    var links_result = try links_future.getValue();
 
-    try netlink_cache.update(socket);
+    var links_map = std.AutoHashMap(u32, zice.nl.Link).init(temp_arena);
+    for (links_result.links) |link| {
+        try links_map.put(link.interface_index, link);
+    }
+
+    const ListAddressResultFuture = Future(zice.nl.ListAddressError!zice.nl.ListAddressResult);
+    var addresses_future = ListAddressResultFuture{};
+
+    var list_address_context = zice.nl.ListAddressContext{
+        .socket = socket,
+        .allocator = temp_arena,
+        .userdata = &addresses_future,
+        .callback = (struct {
+            pub fn callback(userdata: ?*anyopaque, r: zice.nl.ListAddressError!zice.nl.ListAddressResult) void {
+                var future = @ptrCast(*ListAddressResultFuture, @alignCast(@alignOf(ListAddressResultFuture), userdata.?));
+                future.setValue(r);
+            }
+        }).callback,
+    };
+    try zice.nl.listAddressAsync(&list_address_context, worker);
+    var address_result = try addresses_future.getValue();
+
     var address_list = std.ArrayList(std.net.Address).init(allocator);
     defer address_list.deinit();
 
-    for (netlink_cache.links) |link| {
-        if (link.device_type == nl.ARPHRD.LOOPBACK) continue;
-        const nl_addresses = try netlink_cache.getAddressesByInterfaceIndexAlloc(link.interface_index, temp_arena);
+    for (address_result.addresses) |nl_address| {
+        const interface_address = nl_address.interface_address orelse continue;
+        const associated_link = links_map.get(nl_address.interface_index) orelse continue;
+        if (associated_link.device_type == nl.ARPHRD.LOOPBACK) continue;
 
-        for (nl_addresses) |nl_address| {
-            if (nl_address.address.any.family == std.os.linux.AF.INET6) {
-                if (net.isSiteLocalIpv6(nl_address.address.in6) or net.isIpv4CompatibleIpv6(nl_address.address.in6) or net.isIpv4MappedIpv6(nl_address.address.in6)) continue;
-            }
-            try address_list.append(nl_address.address);
-        }
+        const posix_address = @ptrCast(*const std.os.sockaddr, &interface_address);
+        const inet_address = std.net.Address.initPosix(posix_address);
+
+        if (inet_address.any.family == std.os.AF.INET6 and (net.isSiteLocalIpv6(inet_address.in6) or net.isIpv4CompatibleIpv6(inet_address.in6) or net.isIpv4MappedIpv6(inet_address.in6))) continue;
+
+        try address_list.append(std.net.Address.initPosix(posix_address));
     }
 
     return address_list.toOwnedSlice();
-}
-
-pub fn bind(socket: i32, address: std.net.Address) std.os.BindError!void {
-    return std.os.bind(socket, &address.any, address.getOsSockLen());
-}
-
-pub fn getSocketPort(socket: i32) !u16 {
-    var address_storage: std.os.sockaddr.storage = undefined;
-    var address_size: u32 = @sizeOf(std.os.sockaddr.storage);
-
-    std.os.getsockname(socket, @ptrCast(*std.os.sockaddr, &address_storage), &address_size) catch return error.BindError;
-    return switch (address_storage.family) {
-        std.os.AF.INET => @ptrCast(*std.os.sockaddr.in, &address_storage).port,
-        std.os.AF.INET6 => @ptrCast(*std.os.sockaddr.in6, &address_storage).port,
-        else => error.UnsupportedFamily,
-    };
-}
-
-pub fn makeHostCandidates(addresses: []std.net.Address, sockets: []net.Socket, allocator: std.mem.Allocator) ![]zice.Candidate {
-    var candidate_list = try std.ArrayList(zice.Candidate).initCapacity(allocator, addresses.len);
-    defer candidate_list.deinit();
-
-    for (addresses, 0..) |_, i| {
-        const port = try getSocketPort(sockets[i].fd);
-        var address = addresses[i];
-        address.setPort(port);
-        try candidate_list.append(zice.Candidate{
-            .type = .host,
-            .transport_address = address,
-            .base_address = address,
-        });
-    }
-
-    return try candidate_list.toOwnedSlice();
 }

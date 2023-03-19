@@ -3,25 +3,6 @@
 
 const std = @import("std");
 
-const ztun_pkg = std.build.Pkg{
-    .name = "ztun",
-    .source = .{ .path = "deps/ztun/src/ztun.zig" },
-};
-
-const xev_pkg = std.build.Pkg{
-    .name = "xev",
-    .source = .{ .path = "deps/libxev/src/main.zig" },
-};
-
-const zice_pkg = std.build.Pkg{
-    .name = "zice",
-    .source = .{ .path = "src/main.zig" },
-    .dependencies = &[_]std.build.Pkg{
-        ztun_pkg,
-        xev_pkg,
-    },
-};
-
 pub fn buildSamples(b: *std.build.Builder, mode: std.builtin.Mode, target: std.zig.CrossTarget) !void {
     var arena_state = std.heap.ArenaAllocator.init(b.allocator);
     defer arena_state.deinit();
@@ -97,6 +78,7 @@ pub fn build(b: *std.build.Builder) void {
         .optimize = mode,
     });
     main_tests.addModule("ztun", ztun_module);
+    main_tests.addModule("xev", xev_module);
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&main_tests.step);

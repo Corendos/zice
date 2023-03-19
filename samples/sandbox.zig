@@ -6,138 +6,105 @@ const xev = @import("xev");
 
 const zice = @import("zice");
 
-pub fn wakerNoopCallback(
-    ud: ?*WorkerContext,
-    l: *xev.Loop,
-    c: *xev.Completion,
-    r: xev.Async.WaitError!void,
-) xev.CallbackAction {
-    _ = ud;
-    _ = r catch unreachable;
-    _ = c;
-    _ = l;
-    return .disarm;
+pub fn Future(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        result: T = undefined,
+        barrier: std.Thread.ResetEvent = .{},
+
+        pub fn setValue(self: *Self, v: T) void {
+            self.result = v;
+            self.barrier.set();
+        }
+
+        pub fn getValue(self: *Self) T {
+            self.barrier.wait();
+            return self.result;
+        }
+    };
 }
 
-const WorkerContext = struct {
-    event_loop: xev.Loop,
-    stopped_mutex: std.Thread.Mutex = .{},
-    stopped: bool = false,
-    waker: xev.Async,
-    waker_completion: xev.Completion = .{},
+pub const Context = struct {
+    sockets: []const std.os.fd_t,
+    addresses: []const std.net.Address,
 
-    submissions: zice.Intrusive(xev.Completion) = .{},
+    pub fn initFromAddresses(addresses: []std.net.Address, allocator: std.mem.Allocator) !Context {
+        var socket_list = try std.ArrayList(std.os.fd_t).initCapacity(allocator, addresses.len);
+        defer socket_list.deinit();
+        errdefer for (socket_list.items) |socket| {
+            std.os.close(socket);
+        };
+        var address_list = try std.ArrayList(std.net.Address).initCapacity(allocator, addresses.len);
+        defer address_list.deinit();
 
-    pub fn init() !WorkerContext {
-        return WorkerContext{
-            .event_loop = try xev.Loop.init(.{}),
-            .waker = try xev.Async.init(),
+        for (addresses) |address| {
+            const socket = try std.os.socket(address.any.family, std.os.SOCK.DGRAM, 0);
+            try std.os.bind(socket, &address.any, address.getOsSockLen());
+            const bound_address = blk: {
+                var a = address;
+                var a_len: std.os.socklen_t = a.getOsSockLen();
+                try std.os.getsockname(socket, &a.any, &a_len);
+                break :blk a;
+            };
+            try socket_list.append(socket);
+            try address_list.append(bound_address);
+        }
+
+        return .{
+            .sockets = socket_list.toOwnedSlice() catch unreachable,
+            .addresses = address_list.toOwnedSlice() catch unreachable,
         };
     }
 
-    pub fn deinit(self: *WorkerContext) void {
-        self.stop();
-        self.event_loop.deinit();
-        self.waker.deinit();
+    pub fn deinit(self: Context, allocator: std.mem.Allocator) void {
+        for (self.sockets) |socket| std.os.close(socket);
+        allocator.free(self.sockets);
+        allocator.free(self.addresses);
     }
-
-    pub fn stop(self: *WorkerContext) void {
-        self.stopped_mutex.lock();
-        defer self.stopped_mutex.unlock();
-        if (self.stopped) return;
-
-        self.stopped = true;
-
-        self.waker.notify() catch unreachable;
-    }
-
-    pub fn add(self: *WorkerContext, c: *xev.Completion) void {
-        self.submissions.push(c);
-        self.waker.notify() catch unreachable;
-    }
-
-    pub fn run(self: *WorkerContext) !void {
-        while (true) {
-            {
-                self.stopped_mutex.lock();
-                defer self.stopped_mutex.unlock();
-
-                if (self.stopped) {
-                    self.event_loop.stop();
-                    return;
-                }
-            }
-
-            while (self.submissions.pop()) |c| {
-                self.event_loop.add(c);
-            }
-
-            self.waker.wait(&self.event_loop, &self.waker_completion, WorkerContext, self, wakerNoopCallback);
-
-            try self.event_loop.run(.until_done);
-        }
-    }
-};
-
-pub const Context = struct {
-    barrier: std.Thread.ResetEvent,
-    result: zice.nl.ListLinkError!zice.nl.ListLinkResult,
 };
 
 pub fn main() !void {
-    const socket = try std.os.socket(std.os.linux.AF.NETLINK, std.os.SOCK.RAW, std.os.linux.NETLINK.ROUTE);
-    defer std.os.close(socket);
-
-    const address = std.os.linux.sockaddr.nl{ .pid = 0, .groups = 0 };
-
-    try std.os.bind(socket, @ptrCast(*const std.os.linux.sockaddr, &address), @sizeOf(std.os.linux.sockaddr.nl));
-
-    var worker_context = try WorkerContext.init();
-    defer worker_context.deinit();
+    var worker = try zice.Worker.init();
+    defer worker.deinit();
 
     const t = try std.Thread.spawn(.{}, (struct {
-        pub fn callback(context: *WorkerContext) !void {
-            try context.run();
+        pub fn callback(context: *zice.Worker) !void {
+            context.run();
         }
-    }).callback, .{&worker_context});
+    }).callback, .{&worker});
     defer t.join();
-    defer worker_context.stop();
+    defer worker.stop();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var allocator = gpa.allocator();
+    var allocator = std.heap.page_allocator;
 
-    var context = Context{
-        .barrier = std.Thread.ResetEvent{},
-        .result = undefined,
-    };
+    const addresses = try zice.getAddressesFromInterfaces(allocator, &worker);
+    defer allocator.free(addresses);
 
-    const start = std.time.nanoTimestamp();
-    var list_link_context = zice.nl.ListLinkContext.init(
-        socket,
-        allocator,
-        &context,
-        (struct {
-            pub fn callback(userdata: ?*anyopaque, r: zice.nl.ListLinkError!zice.nl.ListLinkResult) void {
-                var context_ptr = @ptrCast(*Context, @alignCast(@alignOf(Context), userdata.?));
-                context_ptr.result = r;
-                context_ptr.barrier.set();
-            }
-        }).callback,
-    );
-    try zice.nl.listLinkAsync(&list_link_context, &worker_context);
+    const context = try Context.initFromAddresses(addresses, allocator);
+    defer context.deinit(allocator);
 
-    context.barrier.wait();
-    const result = try context.result;
-    defer {
-        allocator.free(result.links);
-        result.storage.deinit();
+    std.log.debug("{any}", .{context});
+
+    const CandidateFuture = Future(zice.CandidateGatheringError!zice.CandidateGatheringResult);
+    var candidates_future = CandidateFuture{};
+
+    var candidate_gathering_context = try zice.CandidateGatheringContext.init(context.sockets, context.addresses, allocator, &candidates_future, (struct {
+        pub fn callback(userdata: ?*anyopaque, result: zice.CandidateGatheringError!zice.CandidateGatheringResult) void {
+            const candidates_future_ptr = @ptrCast(*CandidateFuture, @alignCast(@alignOf(CandidateFuture), userdata.?));
+            candidates_future_ptr.setValue(result);
+        }
+    }).callback);
+    defer candidate_gathering_context.cleanup();
+
+    zice.makeCandidates(&candidate_gathering_context, &worker);
+
+    const candidate_result = try candidates_future.getValue();
+    defer allocator.free(candidate_result.candidates);
+    for (candidate_result.candidates) |c| {
+        std.log.debug("{any}", .{c});
     }
-
-    const end = std.time.nanoTimestamp();
-    for (result.links) |link| {
-        std.log.debug("{}", .{link});
-    }
-    std.log.debug("Took {d}us", .{@intToFloat(f64, end - start) / @intToFloat(f64, std.time.ns_per_us)});
 }
