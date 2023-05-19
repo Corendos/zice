@@ -3,20 +3,21 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
 const ztun = @import("ztun");
 const xev = @import("xev");
+
+pub const net = @import("net.zig");
+
+pub usingnamespace switch (builtin.os.tag) {
+    .linux => @import("zice/linux.zig"),
+    else => @compileError("\"" ++ @tagName(builtin.os.tag) ++ "\" platform not supported"),
+};
 
 pub const Intrusive = @import("queue.zig").Intrusive;
 pub const Worker = @import("zice/Worker.zig");
 
-const platform = switch (builtin.os.tag) {
-    .linux => @import("zice/linux.zig"),
-    else => @compileError("\"" ++ @tagName(builtin.os.tag) ++ "\" platform is not supported yet."),
-};
-
-pub const net = @import("net.zig");
-pub usingnamespace platform;
-
+/// Represents an ICE candidate type. See https://www.rfc-editor.org/rfc/rfc8445#section-4 for definitions.
 pub const CandidateType = enum {
     host,
     server_reflexive,
@@ -24,12 +25,17 @@ pub const CandidateType = enum {
     relay,
 };
 
+/// Represents an ICE candidate.
 pub const Candidate = struct {
+    /// The type of candidate.
     type: CandidateType,
+    /// The candidate transport address.
     transport_address: std.net.Address,
+    /// The candidate base address.
     base_address: std.net.Address,
 };
 
+/// ICE protocol configuration.
 pub const Configuration = struct {
     /// Represents the value of Ta in the RFC 8489.
     pub const new_transaction_interval_ms: u64 = 50;
@@ -47,17 +53,27 @@ pub const Configuration = struct {
     }
 };
 
+/// Represents the status of each potential candidate when gathering them.
 pub const GatheringStatus = enum {
+    /// The candidate has just been created.
     new,
+    /// The candidate is currently being checked.
     checking,
+    /// The candidate check resulted in a failure.
     failed,
+    /// The candidate has been checked succesfully.
     done,
 };
 
+/// Stores the various fields required to handle retry during checks.
 const RetryTimerContext = struct {
+    /// The xev timer that is used.
     timer: xev.Timer,
+    /// The xev Completion associated with the timer.
     completion: xev.Completion = undefined,
+    /// The current timeout of the timer.
     timeout_ms: u64 = 0,
+    /// The number of request already sent.
     request_sent_count: usize = 0,
 };
 
@@ -91,10 +107,9 @@ pub const ReadData = struct {
     buffer: []u8 = &.{},
 };
 
-pub const CandidateGatheringError = error{OutOfMemory};
-
-pub const CandidateGatheringResult = struct {
-    candidates: []Candidate,
+pub const CandidateGatheringError = error{
+    OutOfMemory,
+    Unexpected,
 };
 
 pub const CandidateContext = struct {
@@ -147,12 +162,160 @@ pub const CandidateContext = struct {
         self.failed_timer.deinit();
         self.retry_timer.deinit();
     }
+
+    fn handleSendCallback(self: *CandidateContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) void {
+        _ = result.sendmsg catch |err| {
+            std.log.err("Got {} with candidate \"{}\" while writing to socket", .{ err, self.address });
+            self.status = .failed;
+            return;
+        };
+        _ = c;
+
+        self.request_sent_count += 1;
+        std.log.debug("STUN request sent for candidate \"{}\"", .{self.address});
+
+        if (self.request_sent_count == 1) {
+            self.read_data.completion = xev.Completion{
+                .op = .{ .read = .{
+                    .fd = self.socket,
+                    .buffer = xev.ReadBuffer{
+                        .slice = self.read_data.buffer,
+                    },
+                } },
+                .userdata = self,
+                .callback = readCallback,
+            };
+            loop.add(&self.read_data.completion);
+            self.retry_timer_timeout_ms = self.rto;
+        } else if (self.request_sent_count == Configuration.request_count) {
+            self.failed_timer.run(
+                loop,
+                &self.failed_timer_completion,
+                self.rto * Configuration.last_request_factor,
+                CandidateContext,
+                self,
+                failedTimerCallback,
+            );
+            return;
+        } else {
+            self.retry_timer_timeout_ms = self.retry_timer_timeout_ms * 2;
+        }
+
+        self.retry_timer.run(
+            loop,
+            &self.retry_timer_completion,
+            self.retry_timer_timeout_ms,
+            CandidateContext,
+            self,
+            retryTimerCallback,
+        );
+    }
+
+    fn handleReadCallback(self: *CandidateContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) void {
+        const bytes_read = result.read catch |err| {
+            if (err != error.Canceled) {
+                std.log.err("Got {} with candidate \"{}\" while reading from socket", .{ err, self.address });
+            }
+            self.status = .failed;
+            return;
+        };
+        _ = loop;
+
+        const raw_message_buffer = c.op.read.buffer.slice[0..bytes_read];
+
+        var buffer: [4096]u8 = undefined;
+        var allocator_state = std.heap.FixedBufferAllocator.init(&buffer);
+        var allocator = allocator_state.allocator();
+        const message: ztun.Message = blk: {
+            var stream = std.io.fixedBufferStream(raw_message_buffer);
+            break :blk ztun.Message.readAlloc(stream.reader(), allocator) catch unreachable;
+        };
+        defer message.deinit(allocator);
+
+        self.status = .done;
+        std.log.debug("Gathering done for candidate \"{}\"", .{self.address});
+
+        const candidate_gathering_context = self.parent_context.?;
+        if (getServerReflexiveAddressFromStunMessage(message)) |transport_address| {
+            candidate_gathering_context.result_candidates.append(candidate_gathering_context.allocator, Candidate{
+                .type = .server_reflexive,
+                .transport_address = transport_address,
+                .base_address = self.address,
+            }) catch unreachable;
+        }
+    }
+
+    fn handleRetryTimerCallback(self: *CandidateContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) void {
+        if (self.status == .done or self.status == .failed) return;
+
+        _ = result catch |err| {
+            std.log.err("Got {} with candidate \"{}\" while waiting for timer", .{ err, self.address });
+            self.status = .failed;
+            return;
+        };
+        _ = c;
+
+        std.debug.assert(self.status == .checking);
+
+        std.log.debug("STUN request {}/{} from candidate \"{}\" timed out", .{ self.request_sent_count, Configuration.request_count, self.address });
+
+        const message_size = blk: {
+            var buffer: [4096]u8 = undefined;
+            var allocator_state = std.heap.FixedBufferAllocator.init(&buffer);
+            var allocator = allocator_state.allocator();
+            const request_message = makeRequest(allocator) catch unreachable;
+            defer request_message.deinit(allocator);
+
+            var stream = std.io.fixedBufferStream(self.message_data.buffer);
+            request_message.write(stream.writer()) catch unreachable;
+            break :blk stream.getWritten().len;
+        };
+
+        const address = switch (self.address.any.family) {
+            std.os.AF.INET => Configuration.stun_address_ipv4,
+            std.os.AF.INET6 => Configuration.stun_address_ipv6,
+            else => unreachable,
+        };
+        self.message_data.setFrom(&address, message_size);
+
+        self.message_data.completion = xev.Completion{
+            .op = .{
+                .sendmsg = .{
+                    .fd = self.socket,
+                    .msghdr = &self.message_data.message_header,
+                    .buffer = null,
+                },
+            },
+            .userdata = self,
+            .callback = sendCallback,
+        };
+        loop.add(&self.message_data.completion);
+    }
+
+    fn handleFailedTimerCallback(self: *CandidateContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) void {
+        _ = c;
+        if (self.status == .done or self.status == .failed) return;
+
+        std.debug.assert(self.status == .checking);
+        if (result) |_| {
+            std.log.debug("Gathering timed out for candidate \"{}\"", .{self.address});
+        } else |err| {
+            std.log.err("Got {} with candidate \"{}\" while waiting for timer", .{ err, self.address });
+        }
+
+        self.read_data.cancel_completion = xev.Completion{
+            .op = .{
+                .cancel = .{ .c = &self.read_data.completion },
+            },
+        };
+        loop.add(&self.read_data.cancel_completion);
+    }
 };
 
 pub const CandidateGatheringContext = struct {
     allocator: std.mem.Allocator,
     userdata: ?*anyopaque,
-    callback: *const fn (userdata: ?*anyopaque, result: CandidateGatheringError!CandidateGatheringResult) void,
+    callback: *const fn (userdata: ?*anyopaque, result: CandidateGatheringError![]Candidate) void,
 
     main_timer: xev.Timer,
     main_timer_completion: xev.Completion = .{},
@@ -160,14 +323,18 @@ pub const CandidateGatheringContext = struct {
     completion: Worker.Completion = .{},
 
     candidate_contexts: []CandidateContext = &.{},
+
     result_candidates: std.ArrayListUnmanaged(Candidate) = .{},
+    result_error: ?CandidateGatheringError = null,
+
+    completed: bool = false,
 
     pub fn init(
         sockets: []const std.os.fd_t,
         addresses: []const std.net.Address,
         allocator: std.mem.Allocator,
         userdata: ?*anyopaque,
-        callback: *const fn (userdata: ?*anyopaque, result: CandidateGatheringError!CandidateGatheringResult) void,
+        callback: *const fn (userdata: ?*anyopaque, result: CandidateGatheringError![]Candidate) void,
     ) !CandidateGatheringContext {
         var main_timer = try xev.Timer.init();
         errdefer main_timer.deinit();
@@ -206,69 +373,90 @@ pub const CandidateGatheringContext = struct {
         return null;
     }
 
+    fn perform(self: *CandidateGatheringContext) void {
+        // NOTE(Corendos): This is not supposed to happen.
+        std.debug.assert(!self.completed);
+        self.completed = true;
+
+        const result: CandidateGatheringError![]Candidate = self.result_error orelse self.result_candidates.toOwnedSlice(self.allocator);
+
+        self.callback(self.userdata, result);
+    }
+
     inline fn isDone(self: *const CandidateGatheringContext) bool {
+        var checking_count: usize = 0;
+        var new_count: usize = 0;
         for (self.candidate_contexts) |ctx| {
-            if (ctx.status == .new or ctx.status == .checking) return false;
+            if (ctx.status == .checking) checking_count += 1;
+            if (ctx.status == .new) new_count += 1;
         }
-        return true;
+
+        // If we encountered an error
+        if (self.result_error != null) {
+            // We are done only if there is no check in flight.
+            return checking_count == 0;
+        }
+
+        // Otherwise, we are done if all candiates have been checked
+        return new_count == 0 and checking_count == 0;
+    }
+
+    fn handleMainTimerCallback(self: *CandidateGatheringContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) void {
+        _ = result catch |err| {
+            std.log.err("{}", .{err});
+            self.result_error = error.Unexpected;
+            return;
+        };
+
+        std.debug.assert(self.candidate_contexts.len != 0);
+
+        // Get a candidate still in the .new state or disarm the timer.
+        const candidate_index = self.getUncheckedCandidate() orelse return;
+
+        const candidate_context_ptr = &self.candidate_contexts[candidate_index];
+
+        // Set the candidate in the .checking state
+        candidate_context_ptr.status = .checking;
+
+        std.log.debug("Sending message for candidate \"{}\"", .{candidate_context_ptr.address});
+        const message_size = blk: {
+            var buffer: [4096]u8 = undefined;
+            var allocator_state = std.heap.FixedBufferAllocator.init(&buffer);
+            var allocator = allocator_state.allocator();
+            const request_message = makeRequest(allocator) catch unreachable;
+            defer request_message.deinit(allocator);
+
+            var stream = std.io.fixedBufferStream(candidate_context_ptr.message_data.buffer);
+            request_message.write(stream.writer()) catch unreachable;
+            break :blk stream.getWritten().len;
+        };
+
+        const address = switch (candidate_context_ptr.address.any.family) {
+            std.os.AF.INET => Configuration.stun_address_ipv4,
+            std.os.AF.INET6 => Configuration.stun_address_ipv6,
+            else => unreachable,
+        };
+
+        // TODO(Corendos): Maybe the size can be set elsewhere ?
+        candidate_context_ptr.message_data.setFrom(&address, message_size);
+
+        candidate_context_ptr.message_data.completion = xev.Completion{
+            .op = .{
+                .sendmsg = .{
+                    .fd = candidate_context_ptr.socket,
+                    .msghdr = &candidate_context_ptr.message_data.message_header,
+                    .buffer = null,
+                },
+            },
+            .userdata = candidate_context_ptr,
+            .callback = sendCallback,
+        };
+        loop.add(&candidate_context_ptr.message_data.completion);
+
+        // Rearm the timer
+        self.main_timer.run(loop, c, Configuration.new_transaction_interval_ms, CandidateGatheringContext, self, mainTimerCallback);
     }
 };
-
-//const GatheringContext = struct {
-//    const Self = GatheringContext;
-//
-//    candidate_contexts: []CandidateGatheringContext,
-//    candidate_list: *std.ArrayList(Candidate),
-//
-//    main_timer: xev.Timer,
-//
-//    pub fn init(allocator: std.mem.Allocator, sockets: []net.Socket, candidates: []const Candidate, candidate_list: *std.ArrayList(Candidate)) !Self {
-//        const count = candidates.len;
-//
-//        var candidate_gathering_contexts = try allocator.alloc(CandidateGatheringContext, count);
-//        errdefer allocator.free(candidate_gathering_contexts);
-//
-//        const initial_timeout = Configuration.computeRtoMs(candidates.len);
-//        for (candidate_gathering_contexts, 0..) |*ctx, i| {
-//            ctx.* = try CandidateGatheringContext.init(candidates[i], sockets[i], initial_timeout, candidate_list, allocator);
-//        }
-//        errdefer for (candidate_gathering_contexts) |*ctx| {
-//            ctx.deinit(allocator);
-//        };
-//
-//        const main_timer = try xev.Timer.init();
-//        errdefer main_timer.deinit();
-//
-//        return Self{
-//            .candidate_contexts = candidate_gathering_contexts,
-//            .candidate_list = candidate_list,
-//            .main_timer = main_timer,
-//        };
-//    }
-//
-//    pub fn deinit(self: GatheringContext, allocator: std.mem.Allocator) void {
-//        self.main_timer.deinit();
-//
-//        for (self.candidate_contexts) |*ctx| ctx.deinit(allocator);
-//        allocator.free(self.candidate_contexts);
-//    }
-//
-//    pub fn findCandidateToCheck(self: Self) ?usize {
-//        for (self.candidate_contexts, 0..) |ctx, i| {
-//            if (ctx.status == .new) {
-//                return i;
-//            }
-//        }
-//        return null;
-//    }
-//
-//    pub inline fn done(self: Self) bool {
-//        for (self.candidate_contexts) |ctx| {
-//            if (ctx.status == .new or ctx.status == .checking) return false;
-//        }
-//        return true;
-//    }
-//};
 
 pub fn makeRequest(allocator: std.mem.Allocator) !ztun.Message {
     var message_builder = ztun.MessageBuilder.init(allocator);
@@ -278,17 +466,6 @@ pub fn makeRequest(allocator: std.mem.Allocator) !ztun.Message {
     message_builder.setClass(ztun.Class.request);
     message_builder.setMethod(ztun.Method.binding);
     message_builder.randomTransactionId();
-
-    // Authentication attributes.
-    // const username_attribute = ztun.attr.common.Username{ .value = "anon" };
-    // const attribute = try username_attribute.toAttribute(allocator);
-    // errdefer allocator.free(attribute.data);
-    // try message_builder.addAttribute(attribute);
-
-    // const authentication = ztun.auth.Authentication{ .short_term = ztun.auth.ShortTermAuthentication{ .password = "password" } };
-
-    // message_builder.addMessageIntegrity(authentication);
-    // message_builder.addMessageIntegritySha256(authentication);
 
     // Add a fingerprint for validity check.
     message_builder.addFingerprint();
@@ -319,233 +496,68 @@ pub fn getServerReflexiveAddressFromStunMessage(message: ztun.Message) ?std.net.
 
 fn failedTimerCallback(userdata: ?*CandidateContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
     const candidate_context_ptr = userdata.?;
-    if (candidate_context_ptr.status == .done) return .disarm;
-    std.debug.assert(candidate_context_ptr.status == .checking);
-    _ = result catch unreachable;
-    _ = c;
+    candidate_context_ptr.handleFailedTimerCallback(loop, c, result);
 
-    std.log.debug("Gathering timed out for candidate \"{}\"", .{candidate_context_ptr.address});
+    const context = candidate_context_ptr.parent_context.?;
 
-    candidate_context_ptr.status = .failed;
-
-    candidate_context_ptr.read_data.cancel_completion = xev.Completion{
-        .op = .{
-            .cancel = .{ .c = &candidate_context_ptr.read_data.completion },
-        },
-    };
-    loop.add(&candidate_context_ptr.read_data.cancel_completion);
-
-    const candidate_gathering_context = candidate_context_ptr.parent_context.?;
-    if (candidate_gathering_context.isDone()) {
-        var candidates = candidate_gathering_context.result_candidates.toOwnedSlice(candidate_gathering_context.allocator) catch |e| {
-            candidate_gathering_context.cleanup();
-            candidate_gathering_context.callback(candidate_gathering_context.userdata, e);
-            return .disarm;
-        };
-
-        candidate_gathering_context.callback(candidate_gathering_context.userdata, .{ .candidates = candidates });
+    if (context.isDone()) {
+        context.perform();
     }
-
     return .disarm;
 }
 
 fn retryTimerCallback(userdata: ?*CandidateContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
-    _ = result catch unreachable;
-    _ = c;
-    const candidate_context_ptr = userdata.?;
-    if (candidate_context_ptr.status == .done or candidate_context_ptr.status == .failed) return .disarm;
+    var candidate_context_ptr = userdata.?;
+    candidate_context_ptr.handleRetryTimerCallback(loop, c, result);
 
-    std.debug.assert(candidate_context_ptr.status == .checking);
+    const context = candidate_context_ptr.parent_context.?;
 
-    std.log.debug("STUN request {}/{} from candidate \"{}\" timed out", .{ candidate_context_ptr.request_sent_count, Configuration.request_count, candidate_context_ptr.address });
-
-    const message_size = blk: {
-        var buffer: [4096]u8 = undefined;
-        var allocator_state = std.heap.FixedBufferAllocator.init(&buffer);
-        var allocator = allocator_state.allocator();
-        const request_message = makeRequest(allocator) catch unreachable;
-        defer request_message.deinit(allocator);
-
-        var stream = std.io.fixedBufferStream(candidate_context_ptr.message_data.buffer);
-        request_message.write(stream.writer()) catch unreachable;
-        break :blk stream.getWritten().len;
-    };
-
-    const address = switch (candidate_context_ptr.address.any.family) {
-        std.os.AF.INET => Configuration.stun_address_ipv4,
-        std.os.AF.INET6 => Configuration.stun_address_ipv6,
-        else => unreachable,
-    };
-    candidate_context_ptr.message_data.setFrom(&address, message_size);
-
-    candidate_context_ptr.message_data.completion = xev.Completion{
-        .op = .{
-            .sendmsg = .{
-                .fd = candidate_context_ptr.socket,
-                .msghdr = &candidate_context_ptr.message_data.message_header,
-                .buffer = null,
-            },
-        },
-        .userdata = candidate_context_ptr,
-        .callback = sendMsgCallback,
-    };
-    loop.add(&candidate_context_ptr.message_data.completion);
+    if (context.isDone()) {
+        context.perform();
+    }
 
     return .disarm;
 }
 
 fn readCallback(userdata: ?*anyopaque, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) xev.CallbackAction {
     const candidate_context_ptr = @ptrCast(*CandidateContext, @alignCast(8, userdata.?));
+    candidate_context_ptr.handleReadCallback(loop, c, result);
 
-    const bytes_read = result.read catch |err| {
-        std.log.err("Got {} with candidate \"{}\" while reading from socket", .{ err, candidate_context_ptr.address });
-        candidate_context_ptr.status = .failed;
-        return .disarm;
-    };
-    _ = loop;
+    const context = candidate_context_ptr.parent_context.?;
 
-    const raw_message_buffer = c.op.read.buffer.slice[0..bytes_read];
-
-    var buffer: [4096]u8 = undefined;
-    var allocator_state = std.heap.FixedBufferAllocator.init(&buffer);
-    var allocator = allocator_state.allocator();
-    const message: ztun.Message = blk: {
-        var stream = std.io.fixedBufferStream(raw_message_buffer);
-        break :blk ztun.Message.readAlloc(stream.reader(), allocator) catch unreachable;
-    };
-    defer message.deinit(allocator);
-
-    candidate_context_ptr.status = .done;
-    std.log.debug("Gathering done for candidate \"{}\"", .{candidate_context_ptr.address});
-
-    const candidate_gathering_context = candidate_context_ptr.parent_context.?;
-    if (getServerReflexiveAddressFromStunMessage(message)) |transport_address| {
-        candidate_gathering_context.result_candidates.append(candidate_gathering_context.allocator, Candidate{
-            .type = .server_reflexive,
-            .transport_address = transport_address,
-            .base_address = candidate_context_ptr.address,
-        }) catch unreachable;
-    }
-
-    if (candidate_gathering_context.isDone()) {
-        var candidates = candidate_gathering_context.result_candidates.toOwnedSlice(candidate_gathering_context.allocator) catch |e| {
-            candidate_gathering_context.cleanup();
-            candidate_gathering_context.callback(candidate_gathering_context.userdata, e);
-            return .disarm;
-        };
-
-        candidate_gathering_context.callback(candidate_gathering_context.userdata, .{ .candidates = candidates });
+    if (context.isDone()) {
+        context.perform();
     }
 
     return .disarm;
 }
 
-fn sendMsgCallback(userdata: ?*anyopaque, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) xev.CallbackAction {
+fn sendCallback(userdata: ?*anyopaque, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) xev.CallbackAction {
     const candidate_context_ptr = @ptrCast(*CandidateContext, @alignCast(8, userdata.?));
+    candidate_context_ptr.handleSendCallback(loop, c, result);
 
-    _ = result.sendmsg catch |err| {
-        std.log.err("Got {} with candidate \"{}\" while writing to socket", .{ err, candidate_context_ptr.address });
-        candidate_context_ptr.status = .failed;
-        return .disarm;
-    };
-    _ = c;
+    const context = candidate_context_ptr.parent_context.?;
 
-    candidate_context_ptr.request_sent_count += 1;
-    std.log.debug("STUN request sent for candidate \"{}\"", .{candidate_context_ptr.address});
-
-    if (candidate_context_ptr.request_sent_count == 1) {
-        candidate_context_ptr.read_data.completion = xev.Completion{
-            .op = .{ .read = .{
-                .fd = candidate_context_ptr.socket,
-                .buffer = xev.ReadBuffer{
-                    .slice = candidate_context_ptr.read_data.buffer,
-                },
-            } },
-            .userdata = candidate_context_ptr,
-            .callback = readCallback,
-        };
-        loop.add(&candidate_context_ptr.read_data.completion);
-        candidate_context_ptr.retry_timer_timeout_ms = candidate_context_ptr.rto;
-    } else if (candidate_context_ptr.request_sent_count == Configuration.request_count) {
-        candidate_context_ptr.failed_timer.run(
-            loop,
-            &candidate_context_ptr.failed_timer_completion,
-            candidate_context_ptr.rto * Configuration.last_request_factor,
-            CandidateContext,
-            candidate_context_ptr,
-            failedTimerCallback,
-        );
-        return .disarm;
-    } else {
-        candidate_context_ptr.retry_timer_timeout_ms = candidate_context_ptr.retry_timer_timeout_ms * 2;
+    if (context.isDone()) {
+        context.perform();
     }
-
-    candidate_context_ptr.retry_timer.run(
-        loop,
-        &candidate_context_ptr.retry_timer_completion,
-        candidate_context_ptr.retry_timer_timeout_ms,
-        CandidateContext,
-        candidate_context_ptr,
-        retryTimerCallback,
-    );
 
     return .disarm;
 }
 
 fn mainTimerCallback(userdata: ?*CandidateGatheringContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
     var context = userdata.?;
-    _ = result catch unreachable;
+    context.handleMainTimerCallback(loop, c, result);
 
-    std.debug.assert(context.candidate_contexts.len != 0);
-
-    const candidate_index = context.getUncheckedCandidate() orelse {
-        return .disarm;
-    };
-    const candidate_context_ptr = &context.candidate_contexts[candidate_index];
-
-    context.main_timer.run(loop, c, Configuration.new_transaction_interval_ms, CandidateGatheringContext, context, mainTimerCallback);
-
-    const candidate_address = candidate_context_ptr.address;
-    std.log.debug("Sending message from candidate \"{}\"", .{candidate_address});
-
-    candidate_context_ptr.status = .checking;
-
-    const message_size = blk: {
-        var buffer: [4096]u8 = undefined;
-        var allocator_state = std.heap.FixedBufferAllocator.init(&buffer);
-        var allocator = allocator_state.allocator();
-        const request_message = makeRequest(allocator) catch unreachable;
-        defer request_message.deinit(allocator);
-
-        var stream = std.io.fixedBufferStream(candidate_context_ptr.message_data.buffer);
-        request_message.write(stream.writer()) catch unreachable;
-        break :blk stream.getWritten().len;
-    };
-
-    const address = switch (candidate_address.any.family) {
-        std.os.AF.INET => Configuration.stun_address_ipv4,
-        std.os.AF.INET6 => Configuration.stun_address_ipv6,
-        else => unreachable,
-    };
-    candidate_context_ptr.message_data.setFrom(&address, message_size);
-
-    candidate_context_ptr.message_data.completion = xev.Completion{
-        .op = .{
-            .sendmsg = .{
-                .fd = candidate_context_ptr.socket,
-                .msghdr = &candidate_context_ptr.message_data.message_header,
-                .buffer = null,
-            },
-        },
-        .userdata = candidate_context_ptr,
-        .callback = sendMsgCallback,
-    };
-    loop.add(&candidate_context_ptr.message_data.completion);
+    if (context.isDone()) {
+        context.perform();
+    }
 
     return .disarm;
 }
 
 pub fn makeCandidates(context: *CandidateGatheringContext, worker: *Worker) void {
+    // TODO(Corendos): Better handling of error there.
     for (context.candidate_contexts) |ctx| {
         context.result_candidates.append(context.allocator, Candidate{
             .type = .host,
@@ -582,7 +594,5 @@ pub fn makeCandidates(context: *CandidateGatheringContext, worker: *Worker) void
 }
 
 test {
-    _ = net;
-    _ = platform;
     _ = Worker;
 }

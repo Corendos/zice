@@ -87,13 +87,11 @@ pub fn main() !void {
     const context = try Context.initFromAddresses(addresses, allocator);
     defer context.deinit(allocator);
 
-    std.log.debug("{any}", .{context});
-
-    const CandidateFuture = Future(zice.CandidateGatheringError!zice.CandidateGatheringResult);
+    const CandidateFuture = Future(zice.CandidateGatheringError![]zice.Candidate);
     var candidates_future = CandidateFuture{};
 
     var candidate_gathering_context = try zice.CandidateGatheringContext.init(context.sockets, context.addresses, allocator, &candidates_future, (struct {
-        pub fn callback(userdata: ?*anyopaque, result: zice.CandidateGatheringError!zice.CandidateGatheringResult) void {
+        pub fn callback(userdata: ?*anyopaque, result: zice.CandidateGatheringError![]zice.Candidate) void {
             const candidates_future_ptr = @ptrCast(*CandidateFuture, @alignCast(@alignOf(CandidateFuture), userdata.?));
             candidates_future_ptr.setValue(result);
         }
@@ -102,9 +100,10 @@ pub fn main() !void {
 
     zice.makeCandidates(&candidate_gathering_context, &worker);
 
-    const candidate_result = try candidates_future.getValue();
-    defer allocator.free(candidate_result.candidates);
-    for (candidate_result.candidates) |c| {
+    const candidates = try candidates_future.getValue();
+    defer allocator.free(candidates);
+
+    for (candidates) |c| {
         std.log.debug("{any}", .{c});
     }
 }
