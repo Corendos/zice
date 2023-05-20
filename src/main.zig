@@ -82,16 +82,17 @@ pub const MessageData = struct {
     buffer: []u8 = &.{},
     iovec: std.os.iovec_const = undefined,
     message_header: std.os.msghdr_const = undefined,
+    pub fn setFrom(self: *MessageData, address: std.net.Address, size: usize) void {
+        self.address = address;
 
-    pub fn setFrom(self: *MessageData, address: *const std.net.Address, size: usize) void {
         self.iovec = .{
             .iov_base = self.buffer.ptr,
             .iov_len = size,
         };
 
         self.message_header = .{
-            .name = &address.any,
-            .namelen = address.getOsSockLen(),
+            .name = &self.address.any,
+            .namelen = self.address.getOsSockLen(),
             .control = null,
             .controllen = 0,
             .iov = @ptrCast([*]const std.os.iovec_const, &self.iovec),
@@ -276,7 +277,7 @@ pub const CandidateContext = struct {
             std.os.AF.INET6 => Configuration.stun_address_ipv6,
             else => unreachable,
         };
-        self.message_data.setFrom(&address, message_size);
+        self.message_data.setFrom(address, message_size);
 
         self.message_data.completion = xev.Completion{
             .op = .{
@@ -438,7 +439,7 @@ pub const CandidateGatheringContext = struct {
         };
 
         // TODO(Corendos): Maybe the size can be set elsewhere ?
-        candidate_context_ptr.message_data.setFrom(&address, message_size);
+        candidate_context_ptr.message_data.setFrom(address, message_size);
 
         candidate_context_ptr.message_data.completion = xev.Completion{
             .op = .{
@@ -520,7 +521,7 @@ fn retryTimerCallback(userdata: ?*CandidateContext, loop: *xev.Loop, c: *xev.Com
 }
 
 fn readCallback(userdata: ?*anyopaque, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) xev.CallbackAction {
-    const candidate_context_ptr = @ptrCast(*CandidateContext, @alignCast(8, userdata.?));
+    const candidate_context_ptr = @ptrCast(*CandidateContext, @alignCast(@alignOf(CandidateContext), userdata.?));
     candidate_context_ptr.handleReadCallback(loop, c, result);
 
     const context = candidate_context_ptr.parent_context.?;
@@ -533,7 +534,7 @@ fn readCallback(userdata: ?*anyopaque, loop: *xev.Loop, c: *xev.Completion, resu
 }
 
 fn sendCallback(userdata: ?*anyopaque, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) xev.CallbackAction {
-    const candidate_context_ptr = @ptrCast(*CandidateContext, @alignCast(8, userdata.?));
+    const candidate_context_ptr = @ptrCast(*CandidateContext, @alignCast(@alignOf(CandidateContext), userdata.?));
     candidate_context_ptr.handleSendCallback(loop, c, result);
 
     const context = candidate_context_ptr.parent_context.?;
