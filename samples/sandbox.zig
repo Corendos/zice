@@ -96,7 +96,7 @@ pub fn main() !void {
             candidates_future_ptr.setValue(result);
         }
     }).callback);
-    defer candidate_gathering_context.cleanup();
+    defer candidate_gathering_context.deinit();
 
     zice.makeCandidates(&candidate_gathering_context, &worker);
 

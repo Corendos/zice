@@ -77,11 +77,20 @@ const RetryTimerContext = struct {
     request_sent_count: usize = 0,
 };
 
+/// Stores data required to properly send a message through the socket.
 pub const MessageData = struct {
+    /// The associated xev.Completion.
     completion: xev.Completion = .{},
+    /// The buffer where the message is stored before sending.
     buffer: []u8 = &.{},
+    /// The iovec used in sendmsg.
     iovec: std.os.iovec_const = undefined,
+    /// The message_header used in sendmsg.
     message_header: std.os.msghdr_const = undefined,
+    /// The address used in sendmsg.
+    address: std.net.Address = undefined,
+
+    /// Fill the iovec and message_header field using the given paramters.
     pub fn setFrom(self: *MessageData, address: std.net.Address, size: usize) void {
         self.address = address;
 
@@ -102,37 +111,58 @@ pub const MessageData = struct {
     }
 };
 
+/// Stores data required to properly read data from the socket.
 pub const ReadData = struct {
+    /// The associated xev.Completion.
     completion: xev.Completion = .{},
+    /// The xev.Completion used to cancel the read.
     cancel_completion: xev.Completion = .{},
+    /// The buffer where incoming data will be put.
     buffer: []u8 = &.{},
 };
 
+/// Gathering process errors.
 pub const CandidateGatheringError = error{
     OutOfMemory,
     Unexpected,
 };
 
+/// Context for a candidate during the gathering process.
 pub const CandidateContext = struct {
+    /// The socket associated with the candidate.
     socket: std.os.fd_t,
+    /// The local address associated with the candidate.
     address: std.net.Address,
+
+    /// The status of this candidate.
     status: GatheringStatus = .new,
 
+    /// The data required to send a message.
     message_data: MessageData = undefined,
+    /// The data required to read a message.
     read_data: ReadData = undefined,
 
+    /// The timer that is used for retry.
     retry_timer: xev.Timer,
+    /// The associated xev.Completion.
     retry_timer_completion: xev.Completion = .{},
+    /// The current timeout for the retry timer.
     retry_timer_timeout_ms: u64 = 0,
 
+    /// The timer that is used to handle failure.
     failed_timer: xev.Timer,
+    /// The associated xev.Completion.
     failed_timer_completion: xev.Completion = .{},
 
+    /// Counts the number of request sent.
     request_sent_count: u64 = 0,
+    /// The current RTO (see RFC).
     rto: u64,
 
+    /// The associated gathering context.
     parent_context: ?*CandidateGatheringContext = null,
 
+    /// Initialize a Candidate context from the given socket, address and rto.
     pub fn init(socket: std.os.fd_t, address: std.net.Address, rto: u64, allocator: std.mem.Allocator) !CandidateContext {
         const retry_timer = try xev.Timer.init();
         errdefer retry_timer.deinit();
@@ -157,12 +187,15 @@ pub const CandidateContext = struct {
         };
     }
 
+    /// Deinitialize a candidate context.
     pub fn deinit(self: *CandidateContext, allocator: std.mem.Allocator) void {
         allocator.free(self.message_data.buffer);
         allocator.free(self.read_data.buffer);
         self.failed_timer.deinit();
         self.retry_timer.deinit();
     }
+
+    // Callbacks for various xev.Completion
 
     fn handleSendCallback(self: *CandidateContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) void {
         _ = result.sendmsg catch |err| {
@@ -313,23 +346,35 @@ pub const CandidateContext = struct {
     }
 };
 
+/// The context used while gathering candidates.
 pub const CandidateGatheringContext = struct {
+    /// The allocator to use for allocations.
     allocator: std.mem.Allocator,
+    /// Opaque data.
     userdata: ?*anyopaque,
+    /// Callback.
     callback: *const fn (userdata: ?*anyopaque, result: CandidateGatheringError![]Candidate) void,
 
+    /// The timer that fires when a new candidate can be checked.
     main_timer: xev.Timer,
+    /// The associated xev.Completion.
     main_timer_completion: xev.Completion = .{},
 
+    /// The Worker completion
     completion: Worker.Completion = .{},
 
+    /// The context for every candidates.
     candidate_contexts: []CandidateContext = &.{},
 
+    /// Stores the result for each candidate.
     result_candidates: std.ArrayListUnmanaged(Candidate) = .{},
+    /// Stores an error if there was one during gathring.
     result_error: ?CandidateGatheringError = null,
 
+    /// Has this gathering already been completed ?
     completed: bool = false,
 
+    /// Initialize a gathering context.
     pub fn init(
         sockets: []const std.os.fd_t,
         addresses: []const std.net.Address,
@@ -358,13 +403,15 @@ pub const CandidateGatheringContext = struct {
         };
     }
 
-    pub fn cleanup(self: *CandidateGatheringContext) void {
+    /// Deinitialize a gathering context.
+    pub fn deinit(self: *CandidateGatheringContext) void {
         for (self.candidate_contexts) |*ctx| ctx.deinit(self.allocator);
         self.allocator.free(self.candidate_contexts);
         self.main_timer.deinit();
         self.result_candidates.deinit(self.allocator);
     }
 
+    /// Return the index of a candidate that has not been checked yet or null.
     fn getUncheckedCandidate(self: *const CandidateGatheringContext) ?usize {
         for (self.candidate_contexts, 0..) |ctx, i| {
             if (ctx.status == .new) {
@@ -374,6 +421,8 @@ pub const CandidateGatheringContext = struct {
         return null;
     }
 
+    /// Call the callbacks with the gathering result.
+    /// This MUST be calles once only.
     fn perform(self: *CandidateGatheringContext) void {
         // NOTE(Corendos): This is not supposed to happen.
         std.debug.assert(!self.completed);
@@ -384,7 +433,8 @@ pub const CandidateGatheringContext = struct {
         self.callback(self.userdata, result);
     }
 
-    inline fn isDone(self: *const CandidateGatheringContext) bool {
+    /// Returns true if the gathering is done and we can call the callback with a valid result.
+    fn isDone(self: *const CandidateGatheringContext) bool {
         var checking_count: usize = 0;
         var new_count: usize = 0;
         for (self.candidate_contexts) |ctx| {
@@ -402,6 +452,7 @@ pub const CandidateGatheringContext = struct {
         return new_count == 0 and checking_count == 0;
     }
 
+    /// Callbacks for the main timer.
     fn handleMainTimerCallback(self: *CandidateGatheringContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) void {
         _ = result catch |err| {
             std.log.err("{}", .{err});
@@ -558,15 +609,15 @@ fn mainTimerCallback(userdata: ?*CandidateGatheringContext, loop: *xev.Loop, c: 
 }
 
 pub fn makeCandidates(context: *CandidateGatheringContext, worker: *Worker) void {
-    // TODO(Corendos): Better handling of error there.
     for (context.candidate_contexts) |ctx| {
         context.result_candidates.append(context.allocator, Candidate{
             .type = .host,
             .base_address = ctx.address,
             .transport_address = ctx.address,
         }) catch |e| {
-            context.cleanup();
-            context.callback(context.userdata, e);
+            context.result_error = e;
+            context.perform();
+            return;
         };
     }
 
