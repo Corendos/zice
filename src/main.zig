@@ -23,7 +23,18 @@ pub const CandidateType = enum {
     server_reflexive,
     peer_reflexive,
     relay,
+
+    pub inline fn preference(self: CandidateType) u32 {
+        return switch (self) {
+            .host => 126,
+            .server_reflexive => 100,
+            .peer_reflexive => 110,
+            .relay => 0,
+        };
+    }
 };
+
+// TODO(Corentin): Implement https://www.rfc-editor.org/rfc/rfc8421#section-4 for local preference computation
 
 /// Represents an ICE candidate.
 pub const Candidate = struct {
@@ -33,7 +44,32 @@ pub const Candidate = struct {
     transport_address: std.net.Address,
     /// The candidate base address.
     base_address: std.net.Address,
+
+    // TODO(Corendos): multiple component ID support
+
+    /// The component ID associated to the candidate.
+    component_id: u8 = 1,
+
+    pub inline fn computePriority(self: Candidate, local_preference: u32) u32 {
+        return (self.type.preference() << 24) | (local_preference << 8) | (256 - @as(u32, self.component_id));
+    }
 };
+
+test "candidate priority" {
+    const candidate_1 = Candidate{
+        .type = .host,
+        .transport_address = undefined,
+        .base_address = undefined,
+    };
+    const candidate_2 = Candidate{
+        .type = .server_reflexive,
+        .transport_address = undefined,
+        .base_address = undefined,
+    };
+
+    try std.testing.expectEqual(@as(u32, 2_113_929_471), candidate_1.computePriority(0));
+    try std.testing.expectEqual(@as(u32, 1_677_721_855), candidate_2.computePriority(0));
+}
 
 /// ICE protocol configuration.
 pub const Configuration = struct {
