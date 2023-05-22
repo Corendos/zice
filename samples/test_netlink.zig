@@ -53,59 +53,109 @@ pub fn readCallback(
     return .disarm;
 }
 
-pub const SignalContext = struct {
-    fd: std.os.fd_t = -1,
-    completion: xev.Completion = undefined,
-    read_buffer: [@sizeOf(std.os.linux.signalfd_siginfo)]u8 = undefined,
+const StopHandler = struct {
+    storage: [@sizeOf(std.os.linux.signalfd_siginfo)]u8,
+    fd: std.os.fd_t,
+    mask: std.os.sigset_t,
+    completion: xev.Completion = .{},
 
-    pub fn callback(
-        userdata: ?*anyopaque,
-        loop: *xev.Loop,
-        completion: *xev.Completion,
-        result: xev.Result,
-    ) xev.CallbackAction {
-        var context = @ptrCast(*SignalContext, @alignCast(@alignOf(SignalContext), userdata.?));
-        _ = context;
-        _ = completion;
-        std.log.debug("Received signal", .{});
-        const bytes_read = result.read catch unreachable;
-        _ = bytes_read;
-        loop.stop();
-        return .disarm;
+    pub fn init() !StopHandler {
+        var self: StopHandler = undefined;
+        self.mask = m: {
+            var mask = std.os.empty_sigset;
+            std.os.linux.sigaddset(&mask, std.os.SIG.INT);
+            break :m mask;
+        };
+        self.fd = try std.os.signalfd(-1, &self.mask, 0);
+        errdefer std.os.close(self);
+
+        return self;
     }
-};
 
-pub fn setupSignalHandling(event_loop: *xev.Loop, context: *SignalContext) !void {
-    var new_mask = std.os.empty_sigset;
-    var old_mask = std.os.empty_sigset;
-    std.os.linux.sigaddset(&new_mask, std.os.linux.SIG.INT);
-    // Add SIGINT to list of blocked signals
-    std.os.sigprocmask(std.os.linux.SIG.BLOCK, &new_mask, &old_mask);
+    pub fn deinit(self: StopHandler) void {
+        std.os.close(self.fd);
+    }
 
-    // Create a fd monitoring SIGINT
-    context.fd = try std.os.signalfd(-1, &new_mask, 0);
-
-    context.completion = xev.Completion{
-        .op = .{
-            .read = .{
-                .fd = context.fd,
-                .buffer = .{
-                    .slice = &context.read_buffer,
+    pub fn register(self: *StopHandler, loop: *xev.Loop) void {
+        self.completion = xev.Completion{
+            .op = .{
+                .read = .{
+                    .fd = self.fd,
+                    .buffer = .{ .slice = &self.storage },
                 },
             },
-        },
-        .userdata = context,
-        .callback = SignalContext.callback,
-    };
-    event_loop.add(&context.completion);
-}
+            .callback = (struct {
+                fn callback(
+                    _: ?*anyopaque,
+                    l: *xev.Loop,
+                    _: *xev.Completion,
+                    _: xev.Result,
+                ) xev.CallbackAction {
+                    std.log.info("Received SIGINT", .{});
+                    l.stop();
+                    return .disarm;
+                }
+            }).callback,
+            .userdata = null,
+        };
+        loop.add(&self.completion);
+        std.os.sigprocmask(std.os.SIG.BLOCK, &self.mask, null);
+    }
+};
 
 pub fn main() !void {
     var event_loop = try xev.Loop.init(.{});
     defer event_loop.deinit();
 
-    var signal_context = SignalContext{};
-    try setupSignalHandling(&event_loop, &signal_context);
+    var stop_handler = try StopHandler.init();
+    defer stop_handler.deinit();
+
+    stop_handler.register(&event_loop);
+
+    const nl_socket = try std.os.socket(std.os.linux.AF.NETLINK, std.os.linux.SOCK.RAW, std.os.linux.NETLINK.ROUTE);
+    defer std.os.close(nl_socket);
+
+    const address = std.os.linux.sockaddr.nl{
+        .pid = 0,
+        .groups = 1,
+    };
+    try std.os.bind(nl_socket, @ptrCast(*const std.os.sockaddr, &address), @sizeOf(std.os.linux.sockaddr.nl));
+
+    var buffer: [4096]u8 align(4) = undefined;
+    var completion = xev.Completion{
+        .op = .{
+            .read = .{
+                .fd = nl_socket,
+                .buffer = .{ .slice = &buffer },
+            },
+        },
+        .callback = (struct {
+            fn callback(
+                _: ?*anyopaque,
+                _: *xev.Loop,
+                c: *xev.Completion,
+                result: xev.Result,
+            ) xev.CallbackAction {
+                const bytes_read = result.read catch return .rearm;
+                const data = @alignCast(4, c.op.read.buffer.slice[0..bytes_read]);
+                var it = zice.netlink.MessageIterator.init(data);
+                while (it.next()) |message| {
+                    if (message.type == .RTM_NEWLINK or message.type == .RTM_DELLINK) {
+                        const link_message = zice.netlink.LinkMessage.from(message.data);
+                        std.log.debug("Received: {any}", .{link_message});
+
+                        var attribute_it = zice.netlink.AttributeIterator.init(link_message.raw_attributes);
+                        while (attribute_it.next()) |attribute| {
+                            std.log.debug("    Attribute: {any}", .{attribute});
+                        }
+                    }
+                }
+                return .rearm;
+            }
+        }).callback,
+        .userdata = null,
+    };
+    event_loop.add(&completion);
 
     //var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     //defer arena_state.deinit();

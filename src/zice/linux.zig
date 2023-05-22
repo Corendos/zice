@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-const netlink = @import("linux/netlink.zig");
+pub const netlink = @import("linux/netlink.zig");
 const zice = @import("../main.zig");
 const net = zice.net;
 
@@ -98,4 +98,8 @@ pub fn getAddressesFromInterfaces(allocator: std.mem.Allocator, worker: *zice.Wo
     }
 
     return address_list.toOwnedSlice();
+}
+
+test {
+    _ = netlink;
 }

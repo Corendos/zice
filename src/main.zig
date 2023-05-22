@@ -9,10 +9,12 @@ const xev = @import("xev");
 
 pub const net = @import("net.zig");
 
-pub usingnamespace switch (builtin.os.tag) {
+const platform = switch (builtin.os.tag) {
     .linux => @import("zice/linux.zig"),
     else => @compileError("\"" ++ @tagName(builtin.os.tag) ++ "\" platform not supported"),
 };
+
+pub usingnamespace platform;
 
 pub const Intrusive = @import("queue.zig").Intrusive;
 pub const Worker = @import("zice/Worker.zig");
@@ -683,4 +685,7 @@ pub fn makeCandidates(context: *CandidateGatheringContext, worker: *Worker) void
 
 test {
     _ = Worker;
+    _ = Intrusive;
+    _ = platform;
+    _ = net;
 }

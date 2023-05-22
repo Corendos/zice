@@ -9,7 +9,7 @@ pub fn module(b: *std.Build) *std.Build.Module {
     const ztun_module = ztun_build.module(b);
     const xev_module = xev_build.module(b);
 
-    return b.addModule("zice", std.Build.CreateModuleOptions{
+    return b.createModule(std.Build.CreateModuleOptions{
         .source_file = .{ .path = thisDir() ++ "/src/main.zig" },
         .dependencies = &.{
             .{ .name = "ztun", .module = ztun_module },
@@ -18,7 +18,7 @@ pub fn module(b: *std.Build) *std.Build.Module {
     });
 }
 
-pub fn buildSamples(b: *std.build.Builder, mode: std.builtin.Mode, target: std.zig.CrossTarget) !void {
+pub fn buildSamples(b: *std.build.Builder, zice_module: *std.Build.Module, mode: std.builtin.Mode, target: std.zig.CrossTarget) !void {
     var arena_state = std.heap.ArenaAllocator.init(b.allocator);
     defer arena_state.deinit();
 
@@ -41,7 +41,8 @@ pub fn buildSamples(b: *std.build.Builder, mode: std.builtin.Mode, target: std.z
             .target = target,
             .optimize = mode,
         });
-        sample_executable.addModule("zice", b.modules.get("zice").?);
+        sample_executable.addModule("zice", zice_module);
+        sample_executable.addModule("xev", zice_module.dependencies.get("xev").?);
 
         b.installArtifact(sample_executable);
 
@@ -74,7 +75,7 @@ pub fn build(b: *std.build.Builder) void {
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_main_tests.step);
 
-    buildSamples(b, mode, target) catch unreachable;
+    buildSamples(b, zice_module, mode, target) catch unreachable;
 }
 
 inline fn thisDir() []const u8 {

@@ -10,6 +10,25 @@ const linux = std.os.linux;
 
 pub const Cache = @import("netlink/cache.zig").Cache;
 
+// From rtnetlink.h
+pub const RTMGRP = struct {
+    pub const LINK = 1;
+    pub const NOTIFY = 2;
+    pub const NEIGH = 4;
+    pub const TC = 8;
+    pub const IPV4_IFADDR = 0x10;
+    pub const IPV4_MROUTE = 0x20;
+    pub const IPV4_ROUTE = 0x40;
+    pub const IPV4_RULE = 0x80;
+    pub const IPV6_IFADDR = 0x100;
+    pub const IPV6_MROUTE = 0x200;
+    pub const IPV6_ROUTE = 0x400;
+    pub const IPV6_IFINFO = 0x800;
+    pub const DECnet_IFADDR = 0x1000;
+    pub const DECnet_ROUTE = 0x4000;
+    pub const IPV6_PREFIX = 0x20000;
+};
+
 pub const ARPHRD = struct {
     pub const NETROM = 0;
     pub const ETHER = 1;
@@ -79,6 +98,12 @@ pub const ARPHRD = struct {
     pub const VSOCKMON = 826;
 };
 
+pub const rtattr = extern struct {
+    len: c_ushort,
+    type: c_ushort,
+};
+
+/// rtattr handling convenience
 pub const rta_align_to: u32 = 4;
 
 pub inline fn rta_align(len: u32) u32 {
@@ -86,7 +111,7 @@ pub inline fn rta_align(len: u32) u32 {
 }
 
 pub inline fn rta_length(len: u32) u32 {
-    return rta_align(@sizeOf(rtattr) + len);
+    return rta_align(@sizeOf(rtattr)) + len;
 }
 
 pub inline fn rta_space(len: u32) u32 {
@@ -114,7 +139,62 @@ pub inline fn rta_payload(rta: *const rtattr, len: u32) u32 {
     return rta.len - rta_length(len);
 }
 
-// TODO(Corendos): Add tests
+test "rta_align" {
+    try std.testing.expectEqual(@as(u32, 4), rta_align(3));
+    try std.testing.expectEqual(@as(u32, 4), rta_align(4));
+}
+
+test "rta_length" {
+    try std.testing.expectEqual(@as(u32, 7), rta_length(3));
+    try std.testing.expectEqual(@as(u32, 8), rta_length(4));
+}
+
+test "rta_space" {
+    try std.testing.expectEqual(@as(u32, 8), rta_space(3));
+    try std.testing.expectEqual(@as(u32, 8), rta_space(4));
+}
+
+test "rta_data" {
+    var buffer align(@alignOf(rtattr)) = [_]u8{0xBA} ** rta_space(3);
+    const attr = @ptrCast(*rtattr, &buffer);
+    attr.len = rta_length(3);
+
+    const data = rta_data(attr);
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xBA, 0xBA, 0xBA }, data);
+}
+
+test "rta_next and rta_ok" {
+    const rtattr_align = @alignOf(rtattr);
+    var buffer = try std.testing.allocator.alignedAlloc(u8, rtattr_align, nlmsg_space(3) + nlmsg_space(0));
+    defer std.testing.allocator.free(buffer);
+
+    const attr1 = @ptrCast(*rtattr, buffer);
+    attr1.len = rta_length(3);
+    attr1.type = 1;
+
+    const attr2 = @ptrCast(*rtattr, @alignCast(rtattr_align, buffer[rta_space(3)..]));
+    attr2.len = rta_length(0);
+    attr2.type = 2;
+
+    var len: u32 = @intCast(u32, buffer.len);
+    const second_attr = rta_next(attr1, &len);
+    try std.testing.expect(rta_ok(second_attr, len));
+    try std.testing.expectEqual(@as(u32, 2), second_attr.type);
+
+    const next_attr = rta_next(second_attr, &len);
+    try std.testing.expect(!rta_ok(next_attr, len));
+}
+
+pub const Attribute = struct {
+    len: u16,
+    type: u16,
+    data: []const u8,
+
+    pub inline fn as(self: Attribute, comptime T: type) T {
+        return @intToEnum(T, self.type);
+    }
+};
 
 pub const AttributeIterator = struct {
     const Self = @This();
@@ -129,12 +209,48 @@ pub const AttributeIterator = struct {
         return Self{ .buffer = buffer, .len = @intCast(u32, buffer.len), .current = current };
     }
 
-    pub fn next(self: *Self) ?*const rtattr {
+    pub fn next(self: *Self) ?Attribute {
         if (!rta_ok(self.current, self.len)) return null;
         defer self.current = rta_next(self.current, &self.len);
-        return self.current;
+        return Attribute{
+            .len = self.current.len,
+            .type = self.current.type,
+            .data = rta_data(self.current),
+        };
     }
 };
+
+test "AttributeIterator" {
+    const rtattr_align = @alignOf(rtattr);
+    var buffer = try std.testing.allocator.alignedAlloc(u8, rtattr_align, nlmsg_space(3) + nlmsg_space(0));
+    defer std.testing.allocator.free(buffer);
+    @memset(buffer, 0xBA);
+
+    const attr1 = @ptrCast(*rtattr, buffer);
+    attr1.len = rta_length(3);
+    attr1.type = 1;
+
+    const attr2 = @ptrCast(*rtattr, @alignCast(rtattr_align, buffer[rta_space(3)..]));
+    attr2.len = rta_length(0);
+    attr2.type = 2;
+
+    var it = AttributeIterator.init(buffer);
+    var next = it.next() orelse unreachable;
+    try std.testing.expectEqual(rta_length(3), next.len);
+    try std.testing.expectEqual(@as(u16, 1), next.type);
+    try std.testing.expectEqualSlices(u8, &.{ 0xBA, 0xBA, 0xBA }, next.data);
+
+    next = it.next() orelse unreachable;
+    try std.testing.expectEqual(rta_length(0), next.len);
+    try std.testing.expectEqual(@as(u16, 2), next.type);
+    try std.testing.expectEqualSlices(u8, &.{}, next.data);
+}
+
+test "AttributeIterator empty" {
+    var buffer: []align(@alignOf(rtattr)) u8 = &.{};
+    var it = AttributeIterator.init(buffer);
+    try std.testing.expect(it.next() == null);
+}
 
 pub const nlmsg_align_to: u32 = 4;
 pub const nlmsg_hdrlen: u32 = nlmsg_align(@as(u32, @sizeOf(linux.nlmsghdr)));
@@ -173,23 +289,23 @@ pub inline fn nlmsg_payload(nlh: *const linux.nlmsghdr, len: u32) u32 {
     return nlh.len - nlmsg_space(len);
 }
 
-test "HDRLEN value" {
+test "nlmsg_hdr" {
     try std.testing.expectEqual(@as(u32, 16), nlmsg_hdrlen);
 }
 
-test "ALIGN" {
+test "nlmsg_align" {
     try std.testing.expectEqual(@as(u32, 4), nlmsg_align(@as(u32, 3)));
 }
 
-test "LENGTH" {
+test "nlmsg_length" {
     try std.testing.expectEqual(@as(u32, 19), nlmsg_length(@as(u32, 3)));
 }
 
-test "SPACE" {
+test "nlmsg_space" {
     try std.testing.expectEqual(@as(u32, 20), nlmsg_space(@as(u32, 3)));
 }
 
-test "DATA" {
+test "nlmsg_data" {
     var buffer align(@alignOf(linux.nlmsghdr)) = [_]u8{0xBA} ** nlmsg_length(3);
     const nlh = @ptrCast(*linux.nlmsghdr, &buffer);
     nlh.len = nlmsg_length(3);
@@ -199,21 +315,37 @@ test "DATA" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xBA, 0xBA, 0xBA }, data);
 }
 
-test "NEXT" {
-    var buffer align(@alignOf(linux.nlmsghdr)) = [_]u8{0} ** (nlmsg_space(3) + nlmsg_space(0));
-    const nlh1 = @ptrCast(*linux.nlmsghdr, &buffer);
+test "nlmsg_next and nlmsg_ok" {
+    const nlmsghdr_align = @alignOf(linux.nlmsghdr);
+    var buffer = try std.testing.allocator.alignedAlloc(u8, nlmsghdr_align, nlmsg_space(3) + nlmsg_space(0));
+    defer std.testing.allocator.free(buffer);
+    @memset(buffer, 0xBA);
+
+    const nlh1 = @ptrCast(*linux.nlmsghdr, buffer);
     nlh1.len = nlmsg_length(3);
     nlh1.seq = 1;
 
-    const nlh2 = @ptrCast(*linux.nlmsghdr, @alignCast(@alignOf(linux.nlmsghdr), buffer[nlmsg_space(3)..]));
-    nlh2.len = nlmsg_length(3);
+    const nlh2 = @ptrCast(*linux.nlmsghdr, @alignCast(nlmsghdr_align, buffer[nlmsg_space(3)..]));
+    nlh2.len = nlmsg_length(0);
     nlh2.seq = 2;
 
-    var len: u32 = buffer.len;
+    var len: u32 = @intCast(u32, buffer.len);
+    const second_nlh = nlmsg_next(nlh1, &len);
+    try std.testing.expect(nlmsg_ok(second_nlh, len));
+    try std.testing.expectEqual(@as(u32, 2), second_nlh.seq);
 
-    const next_nlh = nlmsg_next(nlh1, &len);
-    try std.testing.expectEqual(@as(u32, 2), next_nlh.seq);
+    const next = nlmsg_next(second_nlh, &len);
+    try std.testing.expect(!nlmsg_ok(next, len));
 }
+
+pub const Message = struct {
+    len: u32,
+    type: std.os.linux.NetlinkMessageType,
+    flags: u16,
+    sequence: u32,
+    pid: u32,
+    data: []const u8,
+};
 
 pub const MessageIterator = struct {
     const Self = @This();
@@ -228,19 +360,98 @@ pub const MessageIterator = struct {
         return Self{ .buffer = buffer, .len = @intCast(u32, buffer.len), .current = current };
     }
 
-    pub fn next(self: *Self) ?*const linux.nlmsghdr {
+    pub fn next(self: *Self) ?Message {
         if (!nlmsg_ok(self.current, self.len)) return null;
         defer self.current = nlmsg_next(self.current, &self.len);
-        return self.current;
+        return Message{
+            .len = self.current.len,
+            .type = self.current.type,
+            .flags = self.current.flags,
+            .sequence = self.current.seq,
+            .pid = self.current.pid,
+            .data = nlmsg_data(self.current),
+        };
     }
 };
 
-pub const rtattr = extern struct {
-    len: c_ushort,
-    type: c_ushort,
+test "MessageIterator" {
+    const nlmsghdr_align = @alignOf(linux.nlmsghdr);
+    var buffer = try std.testing.allocator.alignedAlloc(u8, nlmsghdr_align, nlmsg_space(3) + nlmsg_space(0));
+    defer std.testing.allocator.free(buffer);
+    @memset(buffer, 0xBA);
 
-    pub fn as(comptime T: type, value: rtattr) T {
-        return @intToEnum(T, value.type);
+    const nlh1 = @ptrCast(*linux.nlmsghdr, buffer);
+    nlh1.len = nlmsg_length(3);
+    nlh1.seq = 1;
+
+    const nlh2 = @ptrCast(*linux.nlmsghdr, @alignCast(nlmsghdr_align, buffer[nlmsg_space(3)..]));
+    nlh2.len = nlmsg_length(0);
+    nlh2.seq = 2;
+
+    var it = MessageIterator.init(buffer);
+
+    var next = it.next() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, nlmsg_length(3)), next.len);
+    try std.testing.expectEqual(@as(u32, 1), next.sequence);
+
+    next = it.next() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, nlmsg_length(0)), next.len);
+    try std.testing.expectEqual(@as(u32, 2), next.sequence);
+}
+
+test "MessageIterator empty" {
+    var buffer: []align(@alignOf(linux.nlmsghdr)) u8 = &.{};
+    var it = MessageIterator.init(buffer);
+    try std.testing.expect(it.next() == null);
+}
+
+pub const LinkMessage = struct {
+    family: u8,
+    type: u16,
+    index: i32,
+    flags: u32,
+    change: u32,
+    raw_attributes: []align(@alignOf(rtattr)) const u8,
+
+    pub fn from(data: []const u8) LinkMessage {
+        const msg = @ptrCast(*const linux.ifinfomsg, @alignCast(@alignOf(linux.ifinfomsg), data.ptr));
+        return LinkMessage{
+            .family = msg.family,
+            .type = msg.type,
+            .index = msg.index,
+            .flags = msg.flags,
+            .change = msg.change,
+            .raw_attributes = @alignCast(@alignOf(rtattr), data[@sizeOf(linux.ifinfomsg)..]),
+        };
+    }
+};
+
+pub const ifaddrmsg = extern struct {
+    family: u8,
+    prefixlen: u8,
+    flags: u8,
+    scope: u8,
+    index: c_uint,
+};
+
+pub const AddressMessage = struct {
+    family: u8,
+    prefix_length: u8,
+    flags: u8,
+    scope: u8,
+    index: u32,
+    raw_attributes: []align(@alignOf(rtattr)) const u8,
+
+    pub fn from(data: []const u8) AddressMessage {
+        const msg = @ptrCast(*const ifaddrmsg, @alignCast(@alignOf(ifaddrmsg), data.ptr));
+        return AddressMessage{
+            .family = msg.family,
+            .prefix_length = msg.prefixlen,
+            .flags = msg.flags,
+            .scope = msg.scope,
+            .index = msg.index,
+            .raw_attributes = @alignCast(@alignOf(rtattr), data[@sizeOf(ifaddrmsg)..]),
+        };
     }
 };
 
@@ -261,14 +472,6 @@ pub const IFA = enum(c_ushort) {
 pub const nlmsgerr = extern struct {
     @"error": i32,
     msg: linux.nlmsghdr,
-};
-
-pub const ifaddrmsg = extern struct {
-    family: u8,
-    prefixlen: u8,
-    flags: u8,
-    scope: u8,
-    index: c_uint,
 };
 
 fn formatMacAddress(value: [6]u8, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) @TypeOf(writer).Error!void {
@@ -405,41 +608,39 @@ fn processLinkMessage(message_it: *MessageIterator, context: *ListLinkContext) !
             done = true;
         }
 
-        const message_payload = nlmsg_data(message);
         switch (message.type) {
             linux.NetlinkMessageType.DONE => {
                 done = true;
             },
             linux.NetlinkMessageType.RTM_NEWLINK => {
-                const link_info = @ptrCast(*const linux.ifinfomsg, @alignCast(@alignOf(linux.ifinfomsg), message_payload.ptr));
+                const link_message = LinkMessage.from(message.data);
                 var link = Link{
-                    .device_type = @intCast(u16, link_info.type),
-                    .interface_index = @bitCast(u32, link_info.index),
-                    .device_flags = @bitCast(u32, link_info.flags),
+                    .device_type = link_message.type,
+                    .interface_index = @bitCast(u32, link_message.index),
+                    .device_flags = link_message.flags,
                 };
 
-                var attribute_it = AttributeIterator.init(@alignCast(@alignOf(rtattr), message_payload[@sizeOf(linux.ifinfomsg)..]));
+                var attribute_it = AttributeIterator.init(link_message.raw_attributes);
                 while (attribute_it.next()) |attribute| {
-                    const attribute_data = rta_data(attribute);
-                    switch (rtattr.as(linux.IFLA, attribute.*)) {
+                    switch (attribute.as(linux.IFLA)) {
                         linux.IFLA.IFNAME => {
-                            const name = @ptrCast([:0]const u8, attribute_data);
+                            const name = @ptrCast([:0]const u8, attribute.data);
                             link.name = try context.result_storage.?.allocator().dupe(u8, name);
                         },
                         linux.IFLA.ADDRESS => {
-                            link.address = attribute_data[0..6].*;
+                            link.address = attribute.data[0..6].*;
                         },
                         linux.IFLA.BROADCAST => {
-                            link.broadcast = attribute_data[0..6].*;
+                            link.broadcast = attribute.data[0..6].*;
                         },
                         linux.IFLA.MTU => {
-                            link.mtu = @intCast(u32, @ptrCast(*const c_uint, @alignCast(4, attribute_data.ptr)).*);
+                            link.mtu = @intCast(u32, @ptrCast(*const c_uint, @alignCast(4, attribute.data.ptr)).*);
                         },
                         linux.IFLA.LINK => {
-                            link.link_type = @bitCast(u32, @ptrCast(*const c_int, @alignCast(4, attribute_data.ptr)).*);
+                            link.link_type = @bitCast(u32, @ptrCast(*const c_int, @alignCast(4, attribute.data.ptr)).*);
                         },
                         linux.IFLA.QDISC => {
-                            const qdisc = @ptrCast([:0]const u8, attribute_data);
+                            const qdisc = @ptrCast([:0]const u8, attribute.data);
                             link.queueing_discipline = try context.result_storage.?.allocator().dupe(u8, qdisc);
                         },
                         else => {},
@@ -449,7 +650,7 @@ fn processLinkMessage(message_it: *MessageIterator, context: *ListLinkContext) !
                 try context.result_links_list.append(context.allocator, link);
             },
             linux.NetlinkMessageType.ERROR => {
-                const nl_error = @ptrCast(*const nlmsgerr, @alignCast(@alignOf(nlmsgerr), message_payload.ptr));
+                const nl_error = @ptrCast(*const nlmsgerr, @alignCast(@alignOf(nlmsgerr), message.data.ptr));
                 std.log.err("Got error:\n{}", .{nl_error});
             },
             else => {},
@@ -676,40 +877,38 @@ fn processAddressMessage(message_it: *MessageIterator, context: *ListAddressCont
             done = true;
         }
 
-        const message_payload = nlmsg_data(message);
         switch (message.type) {
             linux.NetlinkMessageType.DONE => {
                 done = true;
             },
             linux.NetlinkMessageType.RTM_NEWADDR => {
-                const addr_info = @ptrCast(*const ifaddrmsg, @alignCast(@alignOf(ifaddrmsg), message_payload.ptr));
+                const address_message = AddressMessage.from(message.data);
 
                 var address = Address{
-                    .family = addr_info.family,
-                    .prefix_length = addr_info.prefixlen,
-                    .flags = addr_info.flags,
-                    .scope = addr_info.scope,
-                    .interface_index = @intCast(u32, addr_info.index),
+                    .family = address_message.family,
+                    .prefix_length = address_message.prefix_length,
+                    .flags = address_message.flags,
+                    .scope = address_message.scope,
+                    .interface_index = address_message.index,
                 };
 
-                var attribute_it = AttributeIterator.init(@alignCast(@alignOf(rtattr), message_payload[@sizeOf(ifaddrmsg)..]));
+                var attribute_it = AttributeIterator.init(address_message.raw_attributes);
                 while (attribute_it.next()) |attribute| {
-                    const attribute_data = rta_data(attribute);
-                    switch (rtattr.as(IFA, attribute.*)) {
+                    switch (attribute.as(IFA)) {
                         IFA.IFA_ADDRESS => {
-                            address.interface_address = toSockaddr(address.family, address.interface_index, attribute_data);
+                            address.interface_address = toSockaddr(address.family, address.interface_index, attribute.data);
                         },
                         IFA.IFA_LOCAL => {
-                            address.local_address = toSockaddr(address.family, address.interface_index, attribute_data);
+                            address.local_address = toSockaddr(address.family, address.interface_index, attribute.data);
                         },
                         IFA.IFA_BROADCAST => {
-                            address.broadcast_address = toSockaddr(address.family, address.interface_index, attribute_data);
+                            address.broadcast_address = toSockaddr(address.family, address.interface_index, attribute.data);
                         },
                         IFA.IFA_ANYCAST => {
-                            address.anycast_address = toSockaddr(address.family, address.interface_index, attribute_data);
+                            address.anycast_address = toSockaddr(address.family, address.interface_index, attribute.data);
                         },
                         IFA.IFA_LABEL => {
-                            const label = @ptrCast([:0]const u8, attribute_data);
+                            const label = @ptrCast([:0]const u8, attribute.data);
                             address.label = try context.result_storage.?.allocator().dupe(u8, label);
                         },
                         else => {},
@@ -719,7 +918,7 @@ fn processAddressMessage(message_it: *MessageIterator, context: *ListAddressCont
                 try context.result_addresses_list.append(context.allocator, address);
             },
             linux.NetlinkMessageType.ERROR => {
-                const nl_error = @ptrCast(*const nlmsgerr, @alignCast(@alignOf(nlmsgerr), message_payload.ptr));
+                const nl_error = @ptrCast(*const nlmsgerr, @alignCast(@alignOf(nlmsgerr), message.data.ptr));
                 std.log.err("Got error:\n{}", .{nl_error});
             },
             else => {},
