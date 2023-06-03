@@ -27,7 +27,7 @@ pub fn buildSamples(b: *std.build.Builder, zice_module: *std.Build.Module, mode:
     var iterable_dir = try std.fs.openIterableDirAbsolute(sample_directory_path, .{});
     var sample_iterator = iterable_dir.iterate();
     while (try sample_iterator.next()) |entry| {
-        if (entry.kind != .File) continue;
+        if (entry.kind != .file) continue;
         const extension = std.fs.path.extension(entry.name);
         if (!std.mem.eql(u8, extension, ".zig")) continue;
 

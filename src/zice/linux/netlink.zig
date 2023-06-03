@@ -29,6 +29,7 @@ pub const RTMGRP = struct {
     pub const IPV6_PREFIX = 0x20000;
 };
 
+// TODO(Corendos): make that an enum ?
 pub const ARPHRD = struct {
     pub const NETROM = 0;
     pub const ETHER = 1;
@@ -405,26 +406,130 @@ test "MessageIterator empty" {
     try std.testing.expect(it.next() == null);
 }
 
-pub const LinkMessage = struct {
-    family: u8,
-    type: u16,
-    index: i32,
-    flags: u32,
-    change: u32,
-    raw_attributes: []align(@alignOf(rtattr)) const u8,
+pub const IflaAttribute = union(linux.IFLA) {
+    UNSPEC: []const u8,
+    ADDRESS: [6]u8,
+    BROADCAST: [6]u8,
+    IFNAME: [:0]const u8,
+    MTU: u32,
+    LINK: u32,
+    QDISC: [:0]const u8,
+    STATS: linux.rtnl_link_stats,
 
-    pub fn from(data: []const u8) LinkMessage {
-        const msg = @ptrCast(*const linux.ifinfomsg, @alignCast(@alignOf(linux.ifinfomsg), data.ptr));
-        return LinkMessage{
-            .family = msg.family,
-            .type = msg.type,
-            .index = msg.index,
-            .flags = msg.flags,
-            .change = msg.change,
-            .raw_attributes = @alignCast(@alignOf(rtattr), data[@sizeOf(linux.ifinfomsg)..]),
+    // TODO(Corendos): Switch to correct type for remaining values.
+    COST: void,
+    PRIORITY: void,
+    MASTER: void,
+
+    /// Wireless Extension event
+    WIRELESS: void,
+
+    /// Protocol specific information for a link
+    PROTINFO: void,
+
+    TXQLEN: void,
+    MAP: void,
+    WEIGHT: void,
+    OPERSTATE: void,
+    LINKMODE: void,
+    LINKINFO: void,
+    NET_NS_PID: void,
+    IFALIAS: void,
+
+    /// Number of VFs if device is SR-IOV PF
+    NUM_VF: void,
+
+    VFINFO_LIST: void,
+    STATS64: void,
+    VF_PORTS: void,
+    PORT_SELF: void,
+    AF_SPEC: void,
+
+    /// Group the device belongs to
+    GROUP: void,
+
+    NET_NS_FD: void,
+
+    /// Extended info mask, VFs, etc
+    EXT_MASK: void,
+
+    /// Promiscuity count: > 0 means acts PROMISC
+    PROMISCUITY: void,
+
+    NUM_TX_QUEUES: void,
+    NUM_RX_QUEUES: void,
+    CARRIER: void,
+    PHYS_PORT_ID: void,
+    CARRIER_CHANGES: void,
+    PHYS_SWITCH_ID: void,
+    LINK_NETNSID: void,
+    PHYS_PORT_NAME: void,
+    PROTO_DOWN: void,
+    GSO_MAX_SEGS: void,
+    GSO_MAX_SIZE: void,
+    PAD: void,
+    XDP: void,
+    EVENT: void,
+
+    NEW_NETNSID: void,
+    IF_NETNSID: void,
+
+    CARRIER_UP_COUNT: void,
+    CARRIER_DOWN_COUNT: void,
+    NEW_IFINDEX: void,
+    MIN_MTU: void,
+    MAX_MTU: void,
+
+    pub fn from(attribute: Attribute) IflaAttribute {
+        return switch (attribute.as(std.os.linux.IFLA)) {
+            .ADDRESS => .{ .ADDRESS = attribute.data[0..6].* },
+            .BROADCAST => .{ .BROADCAST = attribute.data[0..6].* },
+            .IFNAME => .{ .IFNAME = @ptrCast([:0]const u8, attribute.data) },
+            .MTU => .{ .MTU = @intCast(u32, std.mem.bytesToValue(c_uint, attribute.data[0..@sizeOf(c_uint)])) },
+            .LINK => .{ .LINK = @intCast(u32, std.mem.bytesToValue(c_int, attribute.data[0..@sizeOf(c_int)])) },
+            .QDISC => .{ .QDISC = @ptrCast([:0]const u8, attribute.data) },
+            .STATS => .{ .STATS = std.mem.bytesToValue(linux.rtnl_link_stats, attribute.data[0..@sizeOf(linux.rtnl_link_stats)]) },
+            else => .{ .UNSPEC = attribute.data },
         };
     }
 };
+
+test "IflaAttribute: unspec" {
+    var raw_attribute = Attribute{
+        .len = 7,
+        .type = @enumToInt(std.os.linux.IFLA.UNSPEC),
+        .data = &.{ 0x01, 0x02, 0x03 },
+    };
+
+    const attribute = IflaAttribute.from(raw_attribute);
+    try std.testing.expectEqual(linux.IFLA.UNSPEC, attribute);
+    try std.testing.expectEqualSlices(u8, raw_attribute.data, attribute.UNSPEC);
+}
+
+test "IflaAttribute: address" {
+    var raw_attribute = Attribute{
+        .len = 10,
+        .type = @enumToInt(std.os.linux.IFLA.ADDRESS),
+        .data = &.{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 },
+    };
+
+    const attribute = IflaAttribute.from(raw_attribute);
+    try std.testing.expectEqual(linux.IFLA.ADDRESS, attribute);
+    try std.testing.expectEqual(raw_attribute.data[0..6].*, attribute.ADDRESS);
+}
+
+test "IflaAttribute: interface_name" {
+    const interface_name: [:0]const u8 = "eth0";
+    var raw_attribute = Attribute{
+        .len = rta_length(interface_name.len),
+        .type = @enumToInt(std.os.linux.IFLA.IFNAME),
+        .data = interface_name,
+    };
+
+    const attribute = IflaAttribute.from(raw_attribute);
+    try std.testing.expectEqual(linux.IFLA.IFNAME, attribute);
+    try std.testing.expectEqualStrings("eth0", attribute.IFNAME);
+}
 
 pub const ifaddrmsg = extern struct {
     family: u8,
@@ -432,27 +537,6 @@ pub const ifaddrmsg = extern struct {
     flags: u8,
     scope: u8,
     index: c_uint,
-};
-
-pub const AddressMessage = struct {
-    family: u8,
-    prefix_length: u8,
-    flags: u8,
-    scope: u8,
-    index: u32,
-    raw_attributes: []align(@alignOf(rtattr)) const u8,
-
-    pub fn from(data: []const u8) AddressMessage {
-        const msg = @ptrCast(*const ifaddrmsg, @alignCast(@alignOf(ifaddrmsg), data.ptr));
-        return AddressMessage{
-            .family = msg.family,
-            .prefix_length = msg.prefixlen,
-            .flags = msg.flags,
-            .scope = msg.scope,
-            .index = msg.index,
-            .raw_attributes = @alignCast(@alignOf(rtattr), data[@sizeOf(ifaddrmsg)..]),
-        };
-    }
 };
 
 pub const IFA = enum(c_ushort) {
@@ -473,540 +557,3 @@ pub const nlmsgerr = extern struct {
     @"error": i32,
     msg: linux.nlmsghdr,
 };
-
-fn formatMacAddress(value: [6]u8, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) @TypeOf(writer).Error!void {
-    _ = options;
-    _ = fmt;
-    try writer.print("{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
-        value[0],
-        value[1],
-        value[2],
-        value[3],
-        value[4],
-        value[5],
-    });
-}
-
-pub const MacAddressFormatter = std.fmt.Formatter(formatMacAddress);
-
-fn formatFlags(value: anytype, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) @TypeOf(writer).Error!void {
-    const type_info = @typeInfo(@TypeOf(value));
-    const width = type_info.Int.bits;
-    const flag_fmt = comptime std.fmt.comptimePrint("{{b:0>{}}}", .{width});
-    try writer.print(flag_fmt, .{value});
-    _ = options;
-    _ = fmt;
-}
-
-pub fn FlagsFormatter(comptime T: type) type {
-    return struct {
-        flag: T,
-        pub fn format(
-            self: @This(),
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
-            writer: anytype,
-        ) @TypeOf(writer).Error!void {
-            try formatFlags(self.flag, fmt, options, writer);
-        }
-    };
-}
-
-pub const Link = struct {
-    device_type: u16 = undefined,
-    interface_index: u32 = undefined,
-    device_flags: u32 = undefined,
-    address: ?[6]u8 = null,
-    broadcast: ?[6]u8 = null,
-    name: ?[]const u8 = null,
-    mtu: ?u32 = null,
-    link_type: ?u32 = null,
-    queueing_discipline: ?[]const u8 = null,
-
-    pub fn deinit(self: Link, allocator: std.mem.Allocator) void {
-        if (self.name) |name| allocator.free(name);
-        if (self.queueing_discipline) |queueing_discipline| allocator.free(queueing_discipline);
-    }
-
-    pub fn format(value: Link, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = options;
-        _ = fmt;
-        try writer.print(
-            "Link{{ .device_type = {}, interface_index = {}, .device_flags = {}",
-            .{ value.device_type, value.interface_index, FlagsFormatter(u32){ .flag = value.device_flags } },
-        );
-        if (value.address) |a| {
-            try writer.print(", address = {}", .{MacAddressFormatter{ .data = a }});
-        }
-        if (value.broadcast) |a| {
-            try writer.print(", broadcast = {}", .{MacAddressFormatter{ .data = a }});
-        }
-        if (value.name) |name| {
-            try writer.print(", name = {s}", .{name});
-        }
-        try writer.writeAll(" }");
-    }
-};
-
-pub const ListLinkError = error{ Unexpected, OutOfMemory };
-
-pub const ListLinkResult = struct {
-    links: []Link,
-    storage: std.heap.ArenaAllocator,
-};
-
-pub const ListLinkContext = struct {
-    socket: std.os.fd_t,
-    allocator: std.mem.Allocator,
-    userdata: ?*anyopaque,
-    callback: *const fn (userdata: ?*anyopaque, result: ListLinkError!ListLinkResult) void,
-
-    completion: xev.Completion = .{},
-    buffer: [4096]u8 = undefined,
-
-    result_links_list: std.ArrayListUnmanaged(Link) = .{},
-    result_storage: ?std.heap.ArenaAllocator = null,
-
-    pub fn cleanup(self: *ListLinkContext) void {
-        self.result_links_list.deinit(self.allocator);
-        if (self.result_storage) |storage| storage.deinit();
-    }
-};
-
-pub fn listLinkAsyncWriteCallback(
-    userdata: ?*anyopaque,
-    loop: *xev.Loop,
-    completion: *xev.Completion,
-    result: xev.Result,
-) xev.CallbackAction {
-    const context = @ptrCast(*ListLinkContext, @alignCast(@alignOf(ListLinkContext), userdata.?));
-    _ = result.write catch {
-        context.cleanup();
-        context.callback(context.userdata, error.Unexpected);
-        return .disarm;
-    };
-
-    completion.* = xev.Completion{
-        .op = .{
-            .read = .{
-                .fd = context.socket,
-                .buffer = .{ .slice = &context.buffer },
-            },
-        },
-        .userdata = context,
-        .callback = listLinkAsyncReadCallback,
-    };
-    loop.add(&context.completion);
-
-    return .disarm;
-}
-
-fn processLinkMessage(message_it: *MessageIterator, context: *ListLinkContext) !bool {
-    var done = false;
-    while (message_it.next()) |message| {
-        if (message.flags & linux.NLM_F_MULTI == 0) {
-            done = true;
-        }
-
-        switch (message.type) {
-            linux.NetlinkMessageType.DONE => {
-                done = true;
-            },
-            linux.NetlinkMessageType.RTM_NEWLINK => {
-                const link_message = LinkMessage.from(message.data);
-                var link = Link{
-                    .device_type = link_message.type,
-                    .interface_index = @bitCast(u32, link_message.index),
-                    .device_flags = link_message.flags,
-                };
-
-                var attribute_it = AttributeIterator.init(link_message.raw_attributes);
-                while (attribute_it.next()) |attribute| {
-                    switch (attribute.as(linux.IFLA)) {
-                        linux.IFLA.IFNAME => {
-                            const name = @ptrCast([:0]const u8, attribute.data);
-                            link.name = try context.result_storage.?.allocator().dupe(u8, name);
-                        },
-                        linux.IFLA.ADDRESS => {
-                            link.address = attribute.data[0..6].*;
-                        },
-                        linux.IFLA.BROADCAST => {
-                            link.broadcast = attribute.data[0..6].*;
-                        },
-                        linux.IFLA.MTU => {
-                            link.mtu = @intCast(u32, @ptrCast(*const c_uint, @alignCast(4, attribute.data.ptr)).*);
-                        },
-                        linux.IFLA.LINK => {
-                            link.link_type = @bitCast(u32, @ptrCast(*const c_int, @alignCast(4, attribute.data.ptr)).*);
-                        },
-                        linux.IFLA.QDISC => {
-                            const qdisc = @ptrCast([:0]const u8, attribute.data);
-                            link.queueing_discipline = try context.result_storage.?.allocator().dupe(u8, qdisc);
-                        },
-                        else => {},
-                    }
-                }
-
-                try context.result_links_list.append(context.allocator, link);
-            },
-            linux.NetlinkMessageType.ERROR => {
-                const nl_error = @ptrCast(*const nlmsgerr, @alignCast(@alignOf(nlmsgerr), message.data.ptr));
-                std.log.err("Got error:\n{}", .{nl_error});
-            },
-            else => {},
-        }
-    }
-
-    return done;
-}
-
-fn listLinkAsyncReadCallback(
-    userdata: ?*anyopaque,
-    loop: *xev.Loop,
-    completion: *xev.Completion,
-    c_result: xev.Result,
-) xev.CallbackAction {
-    _ = loop;
-    const context = @ptrCast(*ListLinkContext, @alignCast(@alignOf(ListLinkContext), userdata.?));
-    _ = completion;
-
-    if (context.result_storage == null) {
-        context.result_storage = std.heap.ArenaAllocator.init(context.allocator);
-    }
-
-    const bytes_read = c_result.read catch {
-        context.cleanup();
-        context.callback(context.userdata, error.Unexpected);
-        return .disarm;
-    };
-    const response = context.buffer[0..bytes_read];
-
-    var message_it = MessageIterator.init(@alignCast(@alignOf(linux.nlmsghdr), response));
-    const done = processLinkMessage(&message_it, context) catch {
-        context.cleanup();
-        context.callback(context.userdata, error.Unexpected);
-        return .disarm;
-    };
-
-    if (done) {
-        var links = context.result_links_list.toOwnedSlice(context.allocator) catch |e| {
-            context.cleanup();
-            context.callback(context.userdata, e);
-            return .disarm;
-        };
-
-        const result = ListLinkResult{ .links = links, .storage = context.result_storage.? };
-        context.callback(context.userdata, result);
-        return .disarm;
-    }
-
-    return .rearm;
-}
-
-pub fn listLinkAsync(context: *ListLinkContext, worker: *zice.Worker) !void {
-    const raw_request = blk: {
-        var stream = std.io.fixedBufferStream(&context.buffer);
-        var writer = stream.writer();
-
-        const request_header = linux.nlmsghdr{
-            .len = nlmsg_length(@sizeOf(linux.ifinfomsg)),
-            .type = linux.NetlinkMessageType.RTM_GETLINK,
-            .flags = linux.NLM_F_DUMP | linux.NLM_F_REQUEST,
-            .seq = 1,
-            .pid = 0,
-        };
-
-        const request_payload = linux.ifinfomsg{
-            .family = linux.AF.UNSPEC,
-            .type = 0,
-            .index = 0,
-            .flags = 0,
-            .change = 0xFFFFFFFF,
-        };
-
-        try writer.writeStruct(request_header);
-        try writer.writeStruct(request_payload);
-
-        break :blk stream.getWritten();
-    };
-
-    context.completion = xev.Completion{
-        .op = .{
-            .write = .{
-                .fd = context.socket,
-                .buffer = .{ .slice = raw_request },
-            },
-        },
-        .userdata = context,
-        .callback = listLinkAsyncWriteCallback,
-    };
-    worker.postCompletion(&context.completion);
-}
-
-pub const Address = struct {
-    family: u8 = undefined,
-    prefix_length: u8 = undefined,
-    flags: u8 = undefined,
-    scope: u8 = undefined,
-    interface_index: u32 = undefined,
-    interface_address: ?linux.sockaddr.storage = null,
-    local_address: ?linux.sockaddr.storage = null,
-    label: ?[]const u8 = null,
-    broadcast_address: ?linux.sockaddr.storage = null,
-    anycast_address: ?linux.sockaddr.storage = null,
-
-    pub fn deinit(self: Link, allocator: std.mem.Allocator) void {
-        if (self.label) |label| allocator.free(label);
-    }
-
-    pub fn format(value: Address, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = options;
-        _ = fmt;
-        try writer.print(
-            "Address{{ .family = {}, .prefix_length = {}, .flags = {}, .scope = {}, .interface_index = {}",
-            .{
-                value.family,
-                value.prefix_length,
-                FlagsFormatter(u32){ .flag = value.flags },
-                value.scope,
-                value.interface_index,
-            },
-        );
-        if (value.interface_address) |interface_address| {
-            const address = std.net.Address.initPosix(@ptrCast(*const linux.sockaddr, &interface_address));
-            try writer.print(", .interface_address = {}", .{address});
-        }
-        if (value.local_address) |local_address| {
-            const address = std.net.Address.initPosix(@ptrCast(*const linux.sockaddr, &local_address));
-            try writer.print(", .local_address = {}", .{address});
-        }
-        if (value.label) |label| {
-            try writer.print(", .label = {s}", .{label});
-        }
-        if (value.broadcast_address) |broadcast_address| {
-            const address = std.net.Address.initPosix(@ptrCast(*const linux.sockaddr, &broadcast_address));
-            try writer.print(", .broadcast_address = {}", .{address});
-        }
-        if (value.anycast_address) |anycast_address| {
-            const address = std.net.Address.initPosix(@ptrCast(*const linux.sockaddr, &anycast_address));
-            try writer.print(", .anycast_address = {}", .{address});
-        }
-        try writer.writeAll(" }");
-    }
-};
-
-pub const ListAddressError = error{ Unexpected, OutOfMemory };
-
-pub const ListAddressResult = struct {
-    addresses: []Address,
-    storage: std.heap.ArenaAllocator,
-};
-
-pub const ListAddressContext = struct {
-    socket: std.os.fd_t,
-    allocator: std.mem.Allocator,
-    userdata: ?*anyopaque,
-    callback: *const fn (userdata: ?*anyopaque, result: ListAddressError!ListAddressResult) void,
-
-    completion: xev.Completion = .{},
-    buffer: [16 * 1024]u8 = undefined,
-
-    result_addresses_list: std.ArrayListUnmanaged(Address) = .{},
-    result_storage: ?std.heap.ArenaAllocator = null,
-
-    pub fn cleanup(self: *ListAddressContext) void {
-        self.result_addresses_list.deinit(self.allocator);
-        if (self.result_storage) |storage| storage.deinit();
-    }
-};
-
-pub fn listAddressAsyncWriteCallback(
-    userdata: ?*anyopaque,
-    loop: *xev.Loop,
-    completion: *xev.Completion,
-    result: xev.Result,
-) xev.CallbackAction {
-    const context = @ptrCast(*ListAddressContext, @alignCast(@alignOf(ListAddressContext), userdata.?));
-    _ = result.write catch {
-        context.cleanup();
-        context.callback(context.userdata, error.Unexpected);
-        return .disarm;
-    };
-
-    completion.* = xev.Completion{
-        .op = .{
-            .read = .{
-                .fd = context.socket,
-                .buffer = .{ .slice = &context.buffer },
-            },
-        },
-        .userdata = context,
-        .callback = listAddressAsyncReadCallback,
-    };
-    loop.add(&context.completion);
-
-    return .disarm;
-}
-
-fn toSockaddr(family: u8, index: u32, raw: []const u8) linux.sockaddr.storage {
-    return switch (family) {
-        linux.AF.INET => blk: {
-            const a align(8) = linux.sockaddr.in{
-                .port = 0,
-                .addr = @bitCast(u32, raw[0..4].*),
-            };
-            break :blk @ptrCast(*const linux.sockaddr.storage, &a).*;
-        },
-        linux.AF.INET6 => blk: {
-            const a align(8) = linux.sockaddr.in6{
-                .port = 0,
-                .flowinfo = 0,
-                .addr = raw[0..16].*,
-                .scope_id = index,
-            };
-            break :blk @ptrCast(*const linux.sockaddr.storage, &a).*;
-        },
-        else => @panic("Unsupported family"),
-    };
-}
-
-fn processAddressMessage(message_it: *MessageIterator, context: *ListAddressContext) !bool {
-    var done = false;
-    while (message_it.next()) |message| {
-        if (message.flags & linux.NLM_F_MULTI == 0) {
-            done = true;
-        }
-
-        switch (message.type) {
-            linux.NetlinkMessageType.DONE => {
-                done = true;
-            },
-            linux.NetlinkMessageType.RTM_NEWADDR => {
-                const address_message = AddressMessage.from(message.data);
-
-                var address = Address{
-                    .family = address_message.family,
-                    .prefix_length = address_message.prefix_length,
-                    .flags = address_message.flags,
-                    .scope = address_message.scope,
-                    .interface_index = address_message.index,
-                };
-
-                var attribute_it = AttributeIterator.init(address_message.raw_attributes);
-                while (attribute_it.next()) |attribute| {
-                    switch (attribute.as(IFA)) {
-                        IFA.IFA_ADDRESS => {
-                            address.interface_address = toSockaddr(address.family, address.interface_index, attribute.data);
-                        },
-                        IFA.IFA_LOCAL => {
-                            address.local_address = toSockaddr(address.family, address.interface_index, attribute.data);
-                        },
-                        IFA.IFA_BROADCAST => {
-                            address.broadcast_address = toSockaddr(address.family, address.interface_index, attribute.data);
-                        },
-                        IFA.IFA_ANYCAST => {
-                            address.anycast_address = toSockaddr(address.family, address.interface_index, attribute.data);
-                        },
-                        IFA.IFA_LABEL => {
-                            const label = @ptrCast([:0]const u8, attribute.data);
-                            address.label = try context.result_storage.?.allocator().dupe(u8, label);
-                        },
-                        else => {},
-                    }
-                }
-
-                try context.result_addresses_list.append(context.allocator, address);
-            },
-            linux.NetlinkMessageType.ERROR => {
-                const nl_error = @ptrCast(*const nlmsgerr, @alignCast(@alignOf(nlmsgerr), message.data.ptr));
-                std.log.err("Got error:\n{}", .{nl_error});
-            },
-            else => {},
-        }
-    }
-
-    return done;
-}
-
-fn listAddressAsyncReadCallback(
-    userdata: ?*anyopaque,
-    loop: *xev.Loop,
-    completion: *xev.Completion,
-    c_result: xev.Result,
-) xev.CallbackAction {
-    _ = loop;
-    const context = @ptrCast(*ListAddressContext, @alignCast(@alignOf(ListAddressContext), userdata.?));
-    _ = completion;
-
-    if (context.result_storage == null) {
-        context.result_storage = std.heap.ArenaAllocator.init(context.allocator);
-    }
-
-    const bytes_read = c_result.read catch {
-        context.cleanup();
-        context.callback(context.userdata, error.Unexpected);
-        return .disarm;
-    };
-    const response = context.buffer[0..bytes_read];
-
-    var message_it = MessageIterator.init(@alignCast(@alignOf(linux.nlmsghdr), response));
-    const done = processAddressMessage(&message_it, context) catch {
-        context.cleanup();
-        context.callback(context.userdata, error.Unexpected);
-        return .disarm;
-    };
-
-    if (done) {
-        var addresses = context.result_addresses_list.toOwnedSlice(context.allocator) catch |e| {
-            context.cleanup();
-            context.callback(context.userdata, e);
-            return .disarm;
-        };
-
-        const result = ListAddressResult{ .addresses = addresses, .storage = context.result_storage.? };
-        context.callback(context.userdata, result);
-        return .disarm;
-    }
-
-    return .rearm;
-}
-
-pub fn listAddressAsync(context: *ListAddressContext, worker: *zice.Worker) !void {
-    const raw_request = blk: {
-        var stream = std.io.fixedBufferStream(&context.buffer);
-        var writer = stream.writer();
-
-        const request_header = linux.nlmsghdr{
-            .len = nlmsg_length(@sizeOf(ifaddrmsg)),
-            .type = linux.NetlinkMessageType.RTM_GETADDR,
-            .flags = linux.NLM_F_DUMP | linux.NLM_F_REQUEST,
-            .seq = 1,
-            .pid = 0,
-        };
-
-        const request_payload = ifaddrmsg{
-            .family = linux.AF.UNSPEC,
-            .prefixlen = 0,
-            .flags = 0,
-            .scope = 0,
-            .index = 0,
-        };
-
-        try writer.writeStruct(request_header);
-        try writer.writeStruct(request_payload);
-
-        break :blk stream.getWritten();
-    };
-
-    context.completion = xev.Completion{
-        .op = .{
-            .write = .{
-                .fd = context.socket,
-                .buffer = .{ .slice = raw_request },
-            },
-        },
-        .userdata = context,
-        .callback = listAddressAsyncWriteCallback,
-    };
-    worker.postCompletion(&context.completion);
-}

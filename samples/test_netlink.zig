@@ -45,12 +45,25 @@ pub fn readCallback(
     completion: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    var context = @ptrCast(*Context, @alignCast(@alignOf(Context), userdata.?));
-    _ = completion;
     _ = loop;
-    const bytes_read = result.read catch unreachable;
-    std.log.debug("{any}", .{context.read_buffer[0..bytes_read]});
-    return .disarm;
+    _ = userdata;
+    const bytes_read = result.read catch return .rearm;
+    const data = @alignCast(4, completion.op.read.buffer.slice[0..bytes_read]);
+    var it = zice.netlink.MessageIterator.init(data);
+    while (it.next()) |message| {
+        if (message.type == .RTM_NEWLINK or message.type == .RTM_DELLINK) {
+            const interface_info_msg = @ptrCast(*const std.os.linux.ifinfomsg, @alignCast(@alignOf(std.os.linux.ifinfomsg), message.data.ptr));
+
+            const raw_attributes = @alignCast(@alignOf(std.os.linux.rtattr), message.data[@sizeOf(std.os.linux.ifinfomsg)..]);
+            std.log.debug("Received: {any}", .{interface_info_msg});
+
+            var attribute_it = zice.netlink.AttributeIterator.init(raw_attributes);
+            while (attribute_it.next()) |attribute| {
+                std.log.debug("    Attribute: {any}", .{zice.netlink.IflaAttribute.from(attribute)});
+            }
+        }
+    }
+    return .rearm;
 }
 
 const StopHandler = struct {
@@ -121,97 +134,54 @@ pub fn main() !void {
     };
     try std.os.bind(nl_socket, @ptrCast(*const std.os.sockaddr, &address), @sizeOf(std.os.linux.sockaddr.nl));
 
-    var buffer: [4096]u8 align(4) = undefined;
-    var completion = xev.Completion{
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+
+    var arena = arena_state.allocator();
+
+    var context = Context{
+        .socket = nl_socket,
+        .read_buffer = try arena.alloc(u8, 4096),
+    };
+
+    const request_header = std.os.linux.nlmsghdr{
+        .len = zice.netlink.nlmsg_length(@sizeOf(std.os.linux.ifinfomsg)),
+        .type = std.os.linux.NetlinkMessageType.RTM_GETLINK,
+        .flags = std.os.linux.NLM_F_DUMP | std.os.linux.NLM_F_REQUEST,
+        .seq = 1,
+        .pid = 0,
+    };
+
+    const request_payload = std.os.linux.ifinfomsg{
+        .family = std.os.linux.AF.UNSPEC,
+        .type = 0,
+        .index = 0,
+        .flags = 0,
+        .change = 0xFFFFFFFF,
+    };
+
+    const request_buffer = blk: {
+        var buffer = try arena.alloc(u8, zice.netlink.nlmsg_space(@sizeOf(std.os.linux.ifinfomsg)));
+
+        var stream = std.io.fixedBufferStream(buffer);
+        var writer = stream.writer();
+        try writer.writeStruct(request_header);
+        try writer.writeStruct(request_payload);
+
+        break :blk buffer;
+    };
+
+    context.write_c = xev.Completion{
         .op = .{
-            .read = .{
+            .write = .{
                 .fd = nl_socket,
-                .buffer = .{ .slice = &buffer },
+                .buffer = .{ .slice = request_buffer },
             },
         },
-        .callback = (struct {
-            fn callback(
-                _: ?*anyopaque,
-                _: *xev.Loop,
-                c: *xev.Completion,
-                result: xev.Result,
-            ) xev.CallbackAction {
-                const bytes_read = result.read catch return .rearm;
-                const data = @alignCast(4, c.op.read.buffer.slice[0..bytes_read]);
-                var it = zice.netlink.MessageIterator.init(data);
-                while (it.next()) |message| {
-                    if (message.type == .RTM_NEWLINK or message.type == .RTM_DELLINK) {
-                        const link_message = zice.netlink.LinkMessage.from(message.data);
-                        std.log.debug("Received: {any}", .{link_message});
-
-                        var attribute_it = zice.netlink.AttributeIterator.init(link_message.raw_attributes);
-                        while (attribute_it.next()) |attribute| {
-                            std.log.debug("    Attribute: {any}", .{attribute});
-                        }
-                    }
-                }
-                return .rearm;
-            }
-        }).callback,
-        .userdata = null,
+        .userdata = &context,
+        .callback = writeCallback,
     };
-    event_loop.add(&completion);
-
-    //var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    //defer arena_state.deinit();
-
-    //var arena = arena_state.allocator();
-
-    //const socket = try std.os.socket(std.os.linux.AF.NETLINK, std.os.SOCK.RAW, std.os.linux.NETLINK.ROUTE);
-    //defer std.os.close(socket);
-
-    //const address = std.os.linux.sockaddr.nl{ .pid = 0, .groups = 0 };
-
-    //try std.os.bind(socket, @ptrCast(*const std.os.linux.sockaddr, &address), @sizeOf(std.os.linux.sockaddr.nl));
-
-    //var context = Context{
-    //    .socket = socket,
-    //    .read_buffer = try arena.alloc(u8, 4096),
-    //};
-
-    //const request_header = std.os.linux.nlmsghdr{
-    //    .len = zice.nl.nlmsg_length(@sizeOf(std.os.linux.ifinfomsg)),
-    //    .type = std.os.linux.NetlinkMessageType.RTM_GETLINK,
-    //    .flags = std.os.linux.NLM_F_DUMP | std.os.linux.NLM_F_REQUEST,
-    //    .seq = 1,
-    //    .pid = 0,
-    //};
-
-    //const request_payload = std.os.linux.ifinfomsg{
-    //    .family = std.os.linux.AF.UNSPEC,
-    //    .type = 0,
-    //    .index = 0,
-    //    .flags = 0,
-    //    .change = 0xFFFFFFFF,
-    //};
-
-    //const request_buffer = blk: {
-    //    var buffer = try arena.alloc(u8, zice.nl.nlmsg_space(@sizeOf(std.os.linux.ifinfomsg)));
-
-    //    var stream = std.io.fixedBufferStream(buffer);
-    //    var writer = stream.writer();
-    //    try writer.writeStruct(request_header);
-    //    try writer.writeStruct(request_payload);
-
-    //    break :blk buffer;
-    //};
-
-    //context.write_c = xev.Completion{
-    //    .op = .{
-    //        .write = .{
-    //            .fd = socket,
-    //            .buffer = .{ .slice = request_buffer },
-    //        },
-    //    },
-    //    .userdata = &context,
-    //    .callback = writeCallback,
-    //};
-    //event_loop.add(&context.write_c);
+    event_loop.add(&context.write_c);
 
     try event_loop.run(.until_done);
 }
