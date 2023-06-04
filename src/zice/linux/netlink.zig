@@ -12,10 +12,10 @@ pub const Cache = @import("netlink/cache.zig").Cache;
 
 // From rtnetlink.h
 pub const RTMGRP = struct {
-    pub const LINK = 1;
-    pub const NOTIFY = 2;
-    pub const NEIGH = 4;
-    pub const TC = 8;
+    pub const LINK = 0x01;
+    pub const NOTIFY = 0x02;
+    pub const NEIGH = 0x04;
+    pub const TC = 0x08;
     pub const IPV4_IFADDR = 0x10;
     pub const IPV4_MROUTE = 0x20;
     pub const IPV4_ROUTE = 0x40;
@@ -29,74 +29,74 @@ pub const RTMGRP = struct {
     pub const IPV6_PREFIX = 0x20000;
 };
 
-// TODO(Corendos): make that an enum ?
-pub const ARPHRD = struct {
-    pub const NETROM = 0;
-    pub const ETHER = 1;
-    pub const EETHER = 2;
-    pub const AX25 = 3;
-    pub const PRONET = 4;
-    pub const CHAOS = 5;
-    pub const IEEE802 = 65;
-    pub const ARCNET = 7;
-    pub const APPLETLK = 8;
-    pub const DLCI = 15;
-    pub const ATM = 19;
-    pub const METRICOM = 23;
-    pub const IEEE1394 = 24;
-    pub const EUI64 = 27;
-    pub const INFINIBAND = 32;
-    pub const SLIP = 256;
-    pub const CSLIP = 257;
-    pub const SLIP6 = 258;
-    pub const CSLIP6 = 259;
-    pub const RSRVD = 260;
-    pub const ADAPT = 264;
-    pub const ROSE = 270;
-    pub const X25 = 271;
-    pub const HWX25 = 272;
-    pub const CAN = 280;
-    pub const MCTP = 290;
-    pub const PPP = 512;
-    pub const CISCO = 513;
-    pub const HDLC = CISCO;
-    pub const LAPB = 516;
-    pub const DDCMP = 517;
-    pub const RAWHDLC = 518;
-    pub const RAWIP = 519;
-    pub const TUNNEL = 768;
-    pub const TUNNEL6 = 769;
-    pub const FRAD = 770;
-    pub const SKIP = 771;
-    pub const LOOPBACK = 772;
-    pub const LOCALTLK = 773;
-    pub const FDDI = 774;
-    pub const BIF = 775;
-    pub const SIT = 776;
-    pub const IPDDP = 777;
-    pub const IPGRE = 778;
-    pub const PIMREG = 779;
-    pub const HIPPI = 780;
-    pub const ASH = 781;
-    pub const ECONET = 782;
-    pub const IRDA = 783;
-    pub const FCPP = 784;
-    pub const FCAL = 785;
-    pub const FCPL = 786;
-    pub const FCFABRIC = 787;
-    pub const IEEE802_TR = 800;
-    pub const IEEE80211 = 801;
-    pub const IEEE80211_PRISM = 802;
-    pub const IEEE80211_RADIOTAP = 803;
-    pub const IEEE802154 = 804;
-    pub const IEEE802154_MONITOR = 805;
-    pub const PHONET = 820;
-    pub const PHONET_PIPE = 821;
-    pub const CAIF = 822;
-    pub const IP6GRE = 823;
-    pub const NETLINK = 824;
-    pub const @"6LOWPAN" = 825;
-    pub const VSOCKMON = 826;
+pub const ARPHRD = enum(c_ushort) {
+    NETROM = 0,
+    ETHER = 1,
+    EETHER = 2,
+    AX25 = 3,
+    PRONET = 4,
+    CHAOS = 5,
+    IEEE802 = 65,
+    ARCNET = 7,
+    APPLETLK = 8,
+    DLCI = 15,
+    ATM = 19,
+    METRICOM = 23,
+    IEEE1394 = 24,
+    EUI64 = 27,
+    INFINIBAND = 32,
+    SLIP = 256,
+    CSLIP = 257,
+    SLIP6 = 258,
+    CSLIP6 = 259,
+    RSRVD = 260,
+    ADAPT = 264,
+    ROSE = 270,
+    X25 = 271,
+    HWX25 = 272,
+    CAN = 280,
+    MCTP = 290,
+    PPP = 512,
+    CISCO = 513,
+    LAPB = 516,
+    DDCMP = 517,
+    RAWHDLC = 518,
+    RAWIP = 519,
+    TUNNEL = 768,
+    TUNNEL6 = 769,
+    FRAD = 770,
+    SKIP = 771,
+    LOOPBACK = 772,
+    LOCALTLK = 773,
+    FDDI = 774,
+    BIF = 775,
+    SIT = 776,
+    IPDDP = 777,
+    IPGRE = 778,
+    PIMREG = 779,
+    HIPPI = 780,
+    ASH = 781,
+    ECONET = 782,
+    IRDA = 783,
+    FCPP = 784,
+    FCAL = 785,
+    FCPL = 786,
+    FCFABRIC = 787,
+    IEEE802_TR = 800,
+    IEEE80211 = 801,
+    IEEE80211_PRISM = 802,
+    IEEE80211_RADIOTAP = 803,
+    IEEE802154 = 804,
+    IEEE802154_MONITOR = 805,
+    PHONET = 820,
+    PHONET_PIPE = 821,
+    CAIF = 822,
+    IP6GRE = 823,
+    NETLINK = 824,
+    @"6LOWPAN" = 825,
+    VSOCKMON = 826,
+
+    pub const HDLC = .CISCO;
 };
 
 pub const rtattr = extern struct {
@@ -540,17 +540,42 @@ pub const ifaddrmsg = extern struct {
 };
 
 pub const IFA = enum(c_ushort) {
-    IFA_UNSPEC,
-    IFA_ADDRESS,
-    IFA_LOCAL,
-    IFA_LABEL,
-    IFA_BROADCAST,
-    IFA_ANYCAST,
-    IFA_CACHEINFO,
-    IFA_MULTICAST,
-    IFA_FLAGS,
-    IFA_RT_PRIORITY,
-    IFA_TARGET_NETNSID,
+    UNSPEC,
+    ADDRESS,
+    LOCAL,
+    LABEL,
+    BROADCAST,
+    ANYCAST,
+    CACHEINFO,
+    MULTICAST,
+    FLAGS,
+    RT_PRIORITY,
+    TARGET_NETNSID,
+};
+
+pub const IfaAttribute = union(IFA) {
+    UNSPEC: []const u8,
+    ADDRESS: []const u8,
+    LOCAL: []const u8,
+    LABEL: [:0]const u8,
+    BROADCAST: []const u8,
+    ANYCAST: []const u8,
+    CACHEINFO,
+    MULTICAST,
+    FLAGS,
+    RT_PRIORITY,
+    TARGET_NETNSID,
+
+    pub fn from(attribute: Attribute) IfaAttribute {
+        return switch (attribute.as(IFA)) {
+            .ADDRESS => .{ .ADDRESS = attribute.data },
+            .LOCAL => .{ .LOCAL = attribute.data },
+            .LABEL => .{ .LABEL = @ptrCast([:0]const u8, attribute.data) },
+            .BROADCAST => .{ .BROADCAST = attribute.data },
+            .ANYCAST => .{ .ANYCAST = attribute.data },
+            else => .{ .UNSPEC = attribute.data },
+        };
+    }
 };
 
 pub const nlmsgerr = extern struct {

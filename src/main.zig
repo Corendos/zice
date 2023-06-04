@@ -683,6 +683,73 @@ pub fn makeCandidates(context: *CandidateGatheringContext, worker: *Worker) void
     worker.post(&context.completion);
 }
 
+const NetworkInterface = struct {
+    name: []const u8,
+    index: u32,
+};
+
+const InterfaceAddress = struct {
+    interface_index: u32,
+    address: std.net.Address,
+};
+
+pub const Context = struct {
+    allocator: std.mem.Allocator,
+    network_interface_map: std.AutoArrayHashMapUnmanaged(u32, NetworkInterface) = .{},
+    interface_addresses: std.ArrayListUnmanaged(InterfaceAddress) = .{},
+
+    string_storage: std.heap.ArenaAllocator,
+
+    pub fn init(allocator: std.mem.Allocator) !Context {
+        return Context{
+            .allocator = allocator,
+            .string_storage = std.heap.ArenaAllocator.init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Context) void {
+        self.network_interface_map.deinit(self.allocator);
+        self.interface_addresses.deinit(self.allocator);
+        self.string_storage.deinit();
+    }
+
+    pub fn addNetworkInterface(self: *Context, index: u32, name: []const u8) !void {
+        const gop = try self.network_interface_map.getOrPut(self.allocator, index);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = NetworkInterface{
+                .name = try self.string_storage.allocator().dupe(u8, name),
+                .index = index,
+            };
+        }
+    }
+
+    pub fn deleteNetworkInterface(self: *Context, index: u32) void {
+        _ = self.network_interface_map.swapRemove(index);
+    }
+
+    fn searchAddress(self: *Context, interface_index: u32, address: std.net.Address) ?usize {
+        return for (self.interface_addresses.items, 0..) |item, i| {
+            if (item.interface_index == interface_index and item.address.eql(address)) {
+                return i;
+            }
+        } else null;
+    }
+
+    pub fn addInterfaceAddress(self: *Context, interface_index: u32, address: std.net.Address) !void {
+        if (self.searchAddress(interface_index, address) != null) return;
+
+        try self.interface_addresses.append(self.allocator, .{
+            .interface_index = interface_index,
+            .address = address,
+        });
+    }
+
+    pub fn deleteInterfaceAddress(self: *Context, interface_index: u32, address: std.net.Address) void {
+        const index = self.searchAddress(interface_index, address) orelse return;
+        _ = self.interface_addresses.swapRemove(index);
+    }
+};
+
 test {
     _ = Worker;
     _ = Intrusive;

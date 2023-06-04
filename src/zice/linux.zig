@@ -67,7 +67,7 @@ fn FlagsFormatter(comptime T: type) type {
 }
 
 const Link = struct {
-    device_type: u16 = undefined,
+    device_type: netlink.ARPHRD = undefined,
     interface_index: u32 = undefined,
     device_flags: u32 = undefined,
     address: ?[6]u8 = null,
@@ -169,7 +169,7 @@ fn processLinkMessage(message_it: *netlink.MessageIterator, context: *ListLinkCo
             linux.NetlinkMessageType.RTM_NEWLINK => {
                 const interface_info_msg = @ptrCast(*const linux.ifinfomsg, @alignCast(@alignOf(linux.ifinfomsg), message.data.ptr));
                 var link = Link{
-                    .device_type = interface_info_msg.type,
+                    .device_type = @intToEnum(netlink.ARPHRD, interface_info_msg.type),
                     .interface_index = @bitCast(u32, interface_info_msg.index),
                     .device_flags = interface_info_msg.flags,
                 };
@@ -450,19 +450,19 @@ fn processAddressMessage(message_it: *netlink.MessageIterator, context: *ListAdd
                 var attribute_it = netlink.AttributeIterator.init(raw_attributes);
                 while (attribute_it.next()) |attribute| {
                     switch (attribute.as(netlink.IFA)) {
-                        netlink.IFA.IFA_ADDRESS => {
+                        netlink.IFA.ADDRESS => {
                             address.interface_address = toSockaddr(address.family, address.interface_index, attribute.data);
                         },
-                        netlink.IFA.IFA_LOCAL => {
+                        netlink.IFA.LOCAL => {
                             address.local_address = toSockaddr(address.family, address.interface_index, attribute.data);
                         },
-                        netlink.IFA.IFA_BROADCAST => {
+                        netlink.IFA.BROADCAST => {
                             address.broadcast_address = toSockaddr(address.family, address.interface_index, attribute.data);
                         },
-                        netlink.IFA.IFA_ANYCAST => {
+                        netlink.IFA.ANYCAST => {
                             address.anycast_address = toSockaddr(address.family, address.interface_index, attribute.data);
                         },
-                        netlink.IFA.IFA_LABEL => {
+                        netlink.IFA.LABEL => {
                             const label = @ptrCast([:0]const u8, attribute.data);
                             address.label = try context.result_storage.?.allocator().dupe(u8, label);
                         },
