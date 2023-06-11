@@ -1,2 +1,7 @@
 zig-cache/
 zig-out/
+
+.vscode/
+
+# Local notes
+NOTES.md

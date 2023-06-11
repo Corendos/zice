@@ -120,7 +120,7 @@ pub inline fn rta_space(len: u32) u32 {
 }
 
 pub inline fn rta_data(rta: *const rtattr) []const u8 {
-    const data = @ptrCast([*]const u8, rta)[0..rta.len];
+    const data = @as([*]const u8, @ptrCast(rta))[0..rta.len];
     return data[rta_length(0)..];
 }
 
@@ -128,8 +128,8 @@ pub inline fn rta_next(rta: *const rtattr, len: *u32) *const rtattr {
     const attribute_length = rta_align(rta.len);
     defer len.* -= attribute_length;
 
-    const data = @ptrCast([*]const u8, rta)[0..len.*];
-    return @ptrCast(*const rtattr, @alignCast(@alignOf(rtattr), data[attribute_length..].ptr));
+    const data = @as([*]const u8, @ptrCast(rta))[0..len.*];
+    return @as(*const rtattr, @ptrCast(@alignCast(data[attribute_length..].ptr)));
 }
 
 pub inline fn rta_ok(rta: *const rtattr, len: u32) bool {
@@ -157,7 +157,7 @@ test "rta_space" {
 
 test "rta_data" {
     var buffer align(@alignOf(rtattr)) = [_]u8{0xBA} ** rta_space(3);
-    const attr = @ptrCast(*rtattr, &buffer);
+    const attr = @as(*rtattr, @ptrCast(&buffer));
     attr.len = rta_length(3);
 
     const data = rta_data(attr);
@@ -170,15 +170,15 @@ test "rta_next and rta_ok" {
     var buffer = try std.testing.allocator.alignedAlloc(u8, rtattr_align, nlmsg_space(3) + nlmsg_space(0));
     defer std.testing.allocator.free(buffer);
 
-    const attr1 = @ptrCast(*rtattr, buffer);
+    const attr1 = @as(*rtattr, @ptrCast(buffer));
     attr1.len = rta_length(3);
     attr1.type = 1;
 
-    const attr2 = @ptrCast(*rtattr, @alignCast(rtattr_align, buffer[rta_space(3)..]));
+    const attr2 = @as(*rtattr, @ptrCast(@alignCast(buffer[rta_space(3)..])));
     attr2.len = rta_length(0);
     attr2.type = 2;
 
-    var len: u32 = @intCast(u32, buffer.len);
+    var len: u32 = @as(u32, @intCast(buffer.len));
     const second_attr = rta_next(attr1, &len);
     try std.testing.expect(rta_ok(second_attr, len));
     try std.testing.expectEqual(@as(u32, 2), second_attr.type);
@@ -193,7 +193,7 @@ pub const Attribute = struct {
     data: []const u8,
 
     pub inline fn as(self: Attribute, comptime T: type) T {
-        return @intToEnum(T, self.type);
+        return @as(T, @enumFromInt(self.type));
     }
 };
 
@@ -206,8 +206,8 @@ pub const AttributeIterator = struct {
     current: *const rtattr,
 
     pub fn init(buffer: []align(rtattr_alignment) const u8) Self {
-        const current = @ptrCast(*const rtattr, buffer);
-        return Self{ .buffer = buffer, .len = @intCast(u32, buffer.len), .current = current };
+        const current = @as(*const rtattr, @ptrCast(buffer));
+        return Self{ .buffer = buffer, .len = @as(u32, @intCast(buffer.len)), .current = current };
     }
 
     pub fn next(self: *Self) ?Attribute {
@@ -227,11 +227,11 @@ test "AttributeIterator" {
     defer std.testing.allocator.free(buffer);
     @memset(buffer, 0xBA);
 
-    const attr1 = @ptrCast(*rtattr, buffer);
+    const attr1 = @as(*rtattr, @ptrCast(buffer));
     attr1.len = rta_length(3);
     attr1.type = 1;
 
-    const attr2 = @ptrCast(*rtattr, @alignCast(rtattr_align, buffer[rta_space(3)..]));
+    const attr2 = @as(*rtattr, @ptrCast(@alignCast(buffer[rta_space(3)..])));
     attr2.len = rta_length(0);
     attr2.type = 2;
 
@@ -269,7 +269,7 @@ pub inline fn nlmsg_space(len: u32) u32 {
 }
 
 pub inline fn nlmsg_data(nlh: *const linux.nlmsghdr) []const u8 {
-    const nlh_data = @ptrCast([*]const u8, nlh)[0..nlh.len];
+    const nlh_data = @as([*]const u8, @ptrCast(nlh))[0..nlh.len];
     return nlh_data[nlmsg_hdrlen..];
 }
 
@@ -277,8 +277,8 @@ pub inline fn nlmsg_next(nlh: *const linux.nlmsghdr, len: *u32) *const linux.nlm
     const message_length = nlmsg_align(nlh.len);
     defer len.* -= message_length;
 
-    const nlh_data = @ptrCast([*]const u8, nlh)[0..len.*];
-    return @ptrCast(*const linux.nlmsghdr, @alignCast(@alignOf(linux.nlmsghdr), nlh_data[message_length..].ptr));
+    const nlh_data = @as([*]const u8, @ptrCast(nlh))[0..len.*];
+    return @as(*const linux.nlmsghdr, @ptrCast(@alignCast(nlh_data[message_length..].ptr)));
 }
 
 pub inline fn nlmsg_ok(nlh: *const linux.nlmsghdr, len: u32) bool {
@@ -308,7 +308,7 @@ test "nlmsg_space" {
 
 test "nlmsg_data" {
     var buffer align(@alignOf(linux.nlmsghdr)) = [_]u8{0xBA} ** nlmsg_length(3);
-    const nlh = @ptrCast(*linux.nlmsghdr, &buffer);
+    const nlh = @as(*linux.nlmsghdr, @ptrCast(&buffer));
     nlh.len = nlmsg_length(3);
 
     const data = nlmsg_data(nlh);
@@ -322,15 +322,15 @@ test "nlmsg_next and nlmsg_ok" {
     defer std.testing.allocator.free(buffer);
     @memset(buffer, 0xBA);
 
-    const nlh1 = @ptrCast(*linux.nlmsghdr, buffer);
+    const nlh1 = @as(*linux.nlmsghdr, @ptrCast(buffer));
     nlh1.len = nlmsg_length(3);
     nlh1.seq = 1;
 
-    const nlh2 = @ptrCast(*linux.nlmsghdr, @alignCast(nlmsghdr_align, buffer[nlmsg_space(3)..]));
+    const nlh2 = @as(*linux.nlmsghdr, @ptrCast(@alignCast(buffer[nlmsg_space(3)..])));
     nlh2.len = nlmsg_length(0);
     nlh2.seq = 2;
 
-    var len: u32 = @intCast(u32, buffer.len);
+    var len: u32 = @as(u32, @intCast(buffer.len));
     const second_nlh = nlmsg_next(nlh1, &len);
     try std.testing.expect(nlmsg_ok(second_nlh, len));
     try std.testing.expectEqual(@as(u32, 2), second_nlh.seq);
@@ -357,8 +357,8 @@ pub const MessageIterator = struct {
     current: *const linux.nlmsghdr,
 
     pub fn init(buffer: []align(nlmsghdr_alignment) const u8) Self {
-        const current = @ptrCast(*const linux.nlmsghdr, buffer);
-        return Self{ .buffer = buffer, .len = @intCast(u32, buffer.len), .current = current };
+        const current = @as(*const linux.nlmsghdr, @ptrCast(buffer));
+        return Self{ .buffer = buffer, .len = @as(u32, @intCast(buffer.len)), .current = current };
     }
 
     pub fn next(self: *Self) ?Message {
@@ -381,11 +381,11 @@ test "MessageIterator" {
     defer std.testing.allocator.free(buffer);
     @memset(buffer, 0xBA);
 
-    const nlh1 = @ptrCast(*linux.nlmsghdr, buffer);
+    const nlh1 = @as(*linux.nlmsghdr, @ptrCast(buffer));
     nlh1.len = nlmsg_length(3);
     nlh1.seq = 1;
 
-    const nlh2 = @ptrCast(*linux.nlmsghdr, @alignCast(nlmsghdr_align, buffer[nlmsg_space(3)..]));
+    const nlh2 = @as(*linux.nlmsghdr, @ptrCast(@alignCast(buffer[nlmsg_space(3)..])));
     nlh2.len = nlmsg_length(0);
     nlh2.seq = 2;
 
@@ -484,10 +484,10 @@ pub const IflaAttribute = union(linux.IFLA) {
         return switch (attribute.as(std.os.linux.IFLA)) {
             .ADDRESS => .{ .ADDRESS = attribute.data[0..6].* },
             .BROADCAST => .{ .BROADCAST = attribute.data[0..6].* },
-            .IFNAME => .{ .IFNAME = @ptrCast([:0]const u8, attribute.data) },
-            .MTU => .{ .MTU = @intCast(u32, std.mem.bytesToValue(c_uint, attribute.data[0..@sizeOf(c_uint)])) },
-            .LINK => .{ .LINK = @intCast(u32, std.mem.bytesToValue(c_int, attribute.data[0..@sizeOf(c_int)])) },
-            .QDISC => .{ .QDISC = @ptrCast([:0]const u8, attribute.data) },
+            .IFNAME => .{ .IFNAME = @as([:0]const u8, @ptrCast(attribute.data)) },
+            .MTU => .{ .MTU = @as(u32, @intCast(std.mem.bytesToValue(c_uint, attribute.data[0..@sizeOf(c_uint)]))) },
+            .LINK => .{ .LINK = @as(u32, @intCast(std.mem.bytesToValue(c_int, attribute.data[0..@sizeOf(c_int)]))) },
+            .QDISC => .{ .QDISC = @as([:0]const u8, @ptrCast(attribute.data)) },
             .STATS => .{ .STATS = std.mem.bytesToValue(linux.rtnl_link_stats, attribute.data[0..@sizeOf(linux.rtnl_link_stats)]) },
             else => .{ .UNSPEC = attribute.data },
         };
@@ -497,7 +497,7 @@ pub const IflaAttribute = union(linux.IFLA) {
 test "IflaAttribute: unspec" {
     var raw_attribute = Attribute{
         .len = 7,
-        .type = @enumToInt(std.os.linux.IFLA.UNSPEC),
+        .type = @intFromEnum(std.os.linux.IFLA.UNSPEC),
         .data = &.{ 0x01, 0x02, 0x03 },
     };
 
@@ -509,7 +509,7 @@ test "IflaAttribute: unspec" {
 test "IflaAttribute: address" {
     var raw_attribute = Attribute{
         .len = 10,
-        .type = @enumToInt(std.os.linux.IFLA.ADDRESS),
+        .type = @intFromEnum(std.os.linux.IFLA.ADDRESS),
         .data = &.{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 },
     };
 
@@ -522,7 +522,7 @@ test "IflaAttribute: interface_name" {
     const interface_name: [:0]const u8 = "eth0";
     var raw_attribute = Attribute{
         .len = rta_length(interface_name.len),
-        .type = @enumToInt(std.os.linux.IFLA.IFNAME),
+        .type = @intFromEnum(std.os.linux.IFLA.IFNAME),
         .data = interface_name,
     };
 
@@ -570,7 +570,7 @@ pub const IfaAttribute = union(IFA) {
         return switch (attribute.as(IFA)) {
             .ADDRESS => .{ .ADDRESS = attribute.data },
             .LOCAL => .{ .LOCAL = attribute.data },
-            .LABEL => .{ .LABEL = @ptrCast([:0]const u8, attribute.data) },
+            .LABEL => .{ .LABEL = @as([:0]const u8, @ptrCast(attribute.data)) },
             .BROADCAST => .{ .BROADCAST = attribute.data },
             .ANYCAST => .{ .ANYCAST = attribute.data },
             else => .{ .UNSPEC = attribute.data },

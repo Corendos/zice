@@ -133,7 +133,7 @@ fn listLinkAsyncWriteCallback(
     completion: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    const context = @ptrCast(*ListLinkContext, @alignCast(@alignOf(ListLinkContext), userdata.?));
+    const context = @as(*ListLinkContext, @ptrCast(@alignCast(userdata.?)));
     _ = result.write catch {
         context.cleanup();
         context.callback(context.userdata, error.Unexpected);
@@ -167,14 +167,14 @@ fn processLinkMessage(message_it: *netlink.MessageIterator, context: *ListLinkCo
                 done = true;
             },
             linux.NetlinkMessageType.RTM_NEWLINK => {
-                const interface_info_msg = @ptrCast(*const linux.ifinfomsg, @alignCast(@alignOf(linux.ifinfomsg), message.data.ptr));
+                const interface_info_msg = @as(*const linux.ifinfomsg, @ptrCast(@alignCast(message.data.ptr)));
                 var link = Link{
-                    .device_type = @intToEnum(netlink.ARPHRD, interface_info_msg.type),
-                    .interface_index = @bitCast(u32, interface_info_msg.index),
+                    .device_type = @as(netlink.ARPHRD, @enumFromInt(interface_info_msg.type)),
+                    .interface_index = @as(u32, @bitCast(interface_info_msg.index)),
                     .device_flags = interface_info_msg.flags,
                 };
 
-                const raw_attributes = @alignCast(@alignOf(linux.rtattr), message.data[@sizeOf(linux.ifinfomsg)..]);
+                const raw_attributes = @as(linux.rtattr, @alignCast(message.data[@sizeOf(linux.ifinfomsg)..]));
                 var attribute_it = netlink.AttributeIterator.init(raw_attributes);
                 while (attribute_it.next()) |attribute| {
                     const ifla_attribute = netlink.IflaAttribute.from(attribute);
@@ -204,7 +204,7 @@ fn processLinkMessage(message_it: *netlink.MessageIterator, context: *ListLinkCo
                 try context.result_links_list.append(context.allocator, link);
             },
             linux.NetlinkMessageType.ERROR => {
-                const nl_error = @ptrCast(*const netlink.nlmsgerr, @alignCast(@alignOf(netlink.nlmsgerr), message.data.ptr));
+                const nl_error = @as(*const netlink.nlmsgerr, @ptrCast(@alignCast(message.data.ptr)));
                 std.log.err("Got error:\n{}", .{nl_error});
             },
             else => {},
@@ -221,7 +221,7 @@ fn listLinkAsyncReadCallback(
     c_result: xev.Result,
 ) xev.CallbackAction {
     _ = loop;
-    const context = @ptrCast(*ListLinkContext, @alignCast(@alignOf(ListLinkContext), userdata.?));
+    const context = @as(*ListLinkContext, @ptrCast(@alignCast(userdata.?)));
     _ = completion;
 
     if (context.result_storage == null) {
@@ -235,7 +235,7 @@ fn listLinkAsyncReadCallback(
     };
     const response = context.buffer[0..bytes_read];
 
-    var message_it = netlink.MessageIterator.init(@alignCast(@alignOf(linux.nlmsghdr), response));
+    var message_it = netlink.MessageIterator.init(@alignCast(response));
     const done = processLinkMessage(&message_it, context) catch {
         context.cleanup();
         context.callback(context.userdata, error.Unexpected);
@@ -327,22 +327,22 @@ const Address = struct {
             },
         );
         if (value.interface_address) |interface_address| {
-            const address = std.net.Address.initPosix(@ptrCast(*const linux.sockaddr, &interface_address));
+            const address = std.net.Address.initPosix(@as(*const linux.sockaddr, @ptrCast(&interface_address)));
             try writer.print(", .interface_address = {}", .{address});
         }
         if (value.local_address) |local_address| {
-            const address = std.net.Address.initPosix(@ptrCast(*const linux.sockaddr, &local_address));
+            const address = std.net.Address.initPosix(@as(*const linux.sockaddr, @ptrCast(&local_address)));
             try writer.print(", .local_address = {}", .{address});
         }
         if (value.label) |label| {
             try writer.print(", .label = {s}", .{label});
         }
         if (value.broadcast_address) |broadcast_address| {
-            const address = std.net.Address.initPosix(@ptrCast(*const linux.sockaddr, &broadcast_address));
+            const address = std.net.Address.initPosix(@as(*const linux.sockaddr, @ptrCast(&broadcast_address)));
             try writer.print(", .broadcast_address = {}", .{address});
         }
         if (value.anycast_address) |anycast_address| {
-            const address = std.net.Address.initPosix(@ptrCast(*const linux.sockaddr, &anycast_address));
+            const address = std.net.Address.initPosix(@as(*const linux.sockaddr, @ptrCast(&anycast_address)));
             try writer.print(", .anycast_address = {}", .{address});
         }
         try writer.writeAll(" }");
@@ -380,7 +380,7 @@ fn listAddressAsyncWriteCallback(
     completion: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    const context = @ptrCast(*ListAddressContext, @alignCast(@alignOf(ListAddressContext), userdata.?));
+    const context = @as(*ListAddressContext, @ptrCast(@alignCast(userdata.?)));
     _ = result.write catch {
         context.cleanup();
         context.callback(context.userdata, error.Unexpected);
@@ -407,9 +407,9 @@ fn toSockaddr(family: u8, index: u32, raw: []const u8) linux.sockaddr.storage {
         linux.AF.INET => blk: {
             const a align(8) = linux.sockaddr.in{
                 .port = 0,
-                .addr = @bitCast(u32, raw[0..4].*),
+                .addr = @as(u32, @bitCast(raw[0..4].*)),
             };
-            break :blk @ptrCast(*const linux.sockaddr.storage, &a).*;
+            break :blk @as(*const linux.sockaddr.storage, @ptrCast(&a)).*;
         },
         linux.AF.INET6 => blk: {
             const a align(8) = linux.sockaddr.in6{
@@ -418,7 +418,7 @@ fn toSockaddr(family: u8, index: u32, raw: []const u8) linux.sockaddr.storage {
                 .addr = raw[0..16].*,
                 .scope_id = index,
             };
-            break :blk @ptrCast(*const linux.sockaddr.storage, &a).*;
+            break :blk @as(*const linux.sockaddr.storage, @ptrCast(&a)).*;
         },
         else => @panic("Unsupported family"),
     };
@@ -436,7 +436,7 @@ fn processAddressMessage(message_it: *netlink.MessageIterator, context: *ListAdd
                 done = true;
             },
             linux.NetlinkMessageType.RTM_NEWADDR => {
-                const interface_address_msg = @ptrCast(*const netlink.ifaddrmsg, @alignCast(@alignOf(netlink.ifaddrmsg), message.data.ptr));
+                const interface_address_msg = @as(*const netlink.ifaddrmsg, @ptrCast(@alignCast(message.data.ptr)));
 
                 var address = Address{
                     .family = interface_address_msg.family,
@@ -446,7 +446,7 @@ fn processAddressMessage(message_it: *netlink.MessageIterator, context: *ListAdd
                     .interface_index = interface_address_msg.index,
                 };
 
-                const raw_attributes = @alignCast(@alignOf(linux.rtattr), message.data[@sizeOf(netlink.ifaddrmsg)..]);
+                const raw_attributes = @as(*linux.rtattr, @alignCast(message.data[@sizeOf(netlink.ifaddrmsg)..]));
                 var attribute_it = netlink.AttributeIterator.init(raw_attributes);
                 while (attribute_it.next()) |attribute| {
                     switch (attribute.as(netlink.IFA)) {
@@ -463,7 +463,7 @@ fn processAddressMessage(message_it: *netlink.MessageIterator, context: *ListAdd
                             address.anycast_address = toSockaddr(address.family, address.interface_index, attribute.data);
                         },
                         netlink.IFA.LABEL => {
-                            const label = @ptrCast([:0]const u8, attribute.data);
+                            const label = @as([:0]const u8, @ptrCast(attribute.data));
                             address.label = try context.result_storage.?.allocator().dupe(u8, label);
                         },
                         else => {},
@@ -473,7 +473,7 @@ fn processAddressMessage(message_it: *netlink.MessageIterator, context: *ListAdd
                 try context.result_addresses_list.append(context.allocator, address);
             },
             linux.NetlinkMessageType.ERROR => {
-                const nl_error = @ptrCast(*const netlink.nlmsgerr, @alignCast(@alignOf(netlink.nlmsgerr), message.data.ptr));
+                const nl_error = @as(*const netlink.nlmsgerr, @ptrCast(@alignCast(message.data.ptr)));
                 std.log.err("Got error:\n{}", .{nl_error});
             },
             else => {},
@@ -490,7 +490,7 @@ fn listAddressAsyncReadCallback(
     c_result: xev.Result,
 ) xev.CallbackAction {
     _ = loop;
-    const context = @ptrCast(*ListAddressContext, @alignCast(@alignOf(ListAddressContext), userdata.?));
+    const context = @as(*ListAddressContext, @ptrCast(@alignCast(userdata.?)));
     _ = completion;
 
     if (context.result_storage == null) {
@@ -504,7 +504,7 @@ fn listAddressAsyncReadCallback(
     };
     const response = context.buffer[0..bytes_read];
 
-    var message_it = netlink.MessageIterator.init(@alignCast(@alignOf(linux.nlmsghdr), response));
+    var message_it = netlink.MessageIterator.init(@alignCast(response));
     const done = processAddressMessage(&message_it, context) catch {
         context.cleanup();
         context.callback(context.userdata, error.Unexpected);
@@ -577,7 +577,7 @@ pub fn getAddressesFromInterfaces(allocator: std.mem.Allocator, worker: *zice.Wo
         const socket = try std.os.socket(linux.AF.NETLINK, linux.SOCK.RAW, linux.NETLINK.ROUTE);
 
         const address = linux.sockaddr.nl{ .pid = 0, .groups = 0 };
-        try std.os.bind(socket, @ptrCast(*const linux.sockaddr, &address), @sizeOf(linux.sockaddr.nl));
+        try std.os.bind(socket, @as(*const linux.sockaddr, @ptrCast(&address)), @sizeOf(linux.sockaddr.nl));
         break :s socket;
     };
     defer std.os.close(socket);
@@ -591,7 +591,7 @@ pub fn getAddressesFromInterfaces(allocator: std.mem.Allocator, worker: *zice.Wo
         .userdata = &links_future,
         .callback = (struct {
             pub fn callback(userdata: ?*anyopaque, r: ListLinkError!ListLinkResult) void {
-                var future = @ptrCast(*ListLinkResultFuture, @alignCast(@alignOf(ListLinkResultFuture), userdata.?));
+                var future = @as(*ListLinkResultFuture, @ptrCast(@alignCast(userdata.?)));
                 future.setValue(r);
             }
         }).callback,
@@ -613,7 +613,7 @@ pub fn getAddressesFromInterfaces(allocator: std.mem.Allocator, worker: *zice.Wo
         .userdata = &addresses_future,
         .callback = (struct {
             pub fn callback(userdata: ?*anyopaque, r: ListAddressError!ListAddressResult) void {
-                var future = @ptrCast(*ListAddressResultFuture, @alignCast(@alignOf(ListAddressResultFuture), userdata.?));
+                var future = @as(*ListAddressResultFuture, @ptrCast(@alignCast(userdata.?)));
                 future.setValue(r);
             }
         }).callback,
@@ -629,7 +629,7 @@ pub fn getAddressesFromInterfaces(allocator: std.mem.Allocator, worker: *zice.Wo
         const associated_link = links_map.get(nl_address.interface_index) orelse continue;
         if (associated_link.device_type == netlink.ARPHRD.LOOPBACK) continue;
 
-        const posix_address = @ptrCast(*const std.os.sockaddr, &interface_address);
+        const posix_address = @as(*const std.os.sockaddr, @ptrCast(&interface_address));
         const inet_address = std.net.Address.initPosix(posix_address);
 
         if (inet_address.any.family == std.os.AF.INET6 and (net.isSiteLocalIpv6(inet_address.in6) or net.isIpv4CompatibleIpv6(inet_address.in6) or net.isIpv4MappedIpv6(inet_address.in6))) continue;

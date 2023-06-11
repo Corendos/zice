@@ -160,7 +160,7 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
         const bytes_read = try std.os.read(netlink_socket, response_buffer);
         const response = response_buffer[0..bytes_read];
 
-        var message_it = nl.MessageIterator.init(@alignCast(@alignOf(linux.nlmsghdr), response));
+        var message_it = nl.MessageIterator.init(@alignCast(response));
 
         while (message_it.next()) |message| {
             if (message.flags & linux.NLM_F_MULTI == 0) {
@@ -173,16 +173,16 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
                     done = true;
                 },
                 linux.NetlinkMessageType.RTM_NEWADDR => {
-                    const addr_info = @ptrCast(*const nl.ifaddrmsg, @alignCast(@alignOf(nl.ifaddrmsg), message_payload.ptr));
+                    const addr_info = @as(*const nl.ifaddrmsg, @ptrCast(@alignCast(message_payload.ptr)));
                     var address = nl.Address{
                         .family = addr_info.family,
                         .prefix_length = addr_info.prefixlen,
                         .flags = addr_info.flags,
                         .scope = addr_info.scope,
-                        .interface_index = @intCast(u8, addr_info.index),
+                        .interface_index = @as(u8, @intCast(addr_info.index)),
                     };
 
-                    var attribute_it = nl.AttributeIterator.init(@alignCast(@alignOf(nl.rtattr), message_payload[@sizeOf(nl.ifaddrmsg)..]));
+                    var attribute_it = nl.AttributeIterator.init(@alignCast(message_payload[@sizeOf(nl.ifaddrmsg)..]));
                     while (attribute_it.next()) |attribute| {
                         const attribute_data = nl.rta_data(attribute);
                         switch (nl.rtattr.as(nl.IFA, attribute.*)) {
@@ -191,9 +191,9 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
                                     linux.AF.INET => {
                                         const a align(8) = linux.sockaddr.in{
                                             .port = 0,
-                                            .addr = @bitCast(u32, attribute_data[0..4].*),
+                                            .addr = @as(u32, @bitCast(attribute_data[0..4].*)),
                                         };
-                                        address.local_address = @ptrCast(*const linux.sockaddr.storage, &a).*;
+                                        address.local_address = @as(*const linux.sockaddr.storage, @ptrCast(&a)).*;
                                     },
                                     linux.AF.INET6 => {
                                         const a align(8) = linux.sockaddr.in6{
@@ -202,7 +202,7 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
                                             .addr = attribute_data[0..16].*,
                                             .scope_id = addr_info.index,
                                         };
-                                        address.local_address = @ptrCast(*const linux.sockaddr.storage, &a).*;
+                                        address.local_address = @as(*const linux.sockaddr.storage, @ptrCast(&a)).*;
                                     },
                                     else => return error.UnknownFamily,
                                 }
@@ -214,7 +214,7 @@ pub fn listAddress(netlink_socket: i32, allocator: std.mem.Allocator, storage: s
                     try address_list.append(address);
                 },
                 linux.NetlinkMessageType.ERROR => {
-                    const nl_error = @ptrCast(*const nl.nlmsgerr, @alignCast(@alignOf(nl.nlmsgerr), message_payload.ptr));
+                    const nl_error = @as(*const nl.nlmsgerr, @ptrCast(@alignCast(message_payload.ptr)));
                     std.log.err("Got error:\n{}", .{nl_error});
                 },
                 else => {},
