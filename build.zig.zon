@@ -1,0 +1,14 @@
+.{
+    .name = "zice",
+    .version = "0.0.1",
+    .dependencies = .{
+        .ztun = .{
+            .url = "https://github.com/Corendos/ztun/archive/42d59bc86d488d5823de954e165d943e994e454b.tar.gz",
+            .hash = "1220ff25d66fd932e7978ae86a27b28f09a517362ddf5f171d2c984df63361904697",
+        },
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/813b7c98be88e12d13cbc934a9279fa4bf8bb4e8.tar.gz",
+            .hash = "12201678092cd7f00a9f497894774ebb60a7341a44572ad2f78c4aec6f9c5c796cdf",
+        },
+    },
+}

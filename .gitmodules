@@ -1,6 +1,0 @@
-[submodule "ztun"]
-	path = deps/ztun
-	url = git@github.com:Corendos/ztun.git
-[submodule "xev"]
-	path = deps/libxev
-	url = https://github.com/mitchellh/libxev

@@ -2,23 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
-const ztun_build = @import("deps/ztun/build.zig");
-const xev_build = @import("deps/libxev/build.zig");
 
-pub fn module(b: *std.Build) *std.Build.Module {
-    const ztun_module = ztun_build.module(b);
-    const xev_module = xev_build.module(b);
-
-    return b.createModule(std.Build.CreateModuleOptions{
-        .source_file = .{ .path = thisDir() ++ "/src/main.zig" },
-        .dependencies = &.{
-            .{ .name = "ztun", .module = ztun_module },
-            .{ .name = "xev", .module = xev_module },
-        },
-    });
-}
-
-pub fn buildSamples(b: *std.build.Builder, zice_module: *std.Build.Module, mode: std.builtin.Mode, target: std.zig.CrossTarget) !void {
+pub fn buildSamples(b: *std.build.Builder, optimize: std.builtin.Mode, target: std.zig.CrossTarget) !void {
     var arena_state = std.heap.ArenaAllocator.init(b.allocator);
     defer arena_state.deinit();
 
@@ -39,10 +24,10 @@ pub fn buildSamples(b: *std.build.Builder, zice_module: *std.Build.Module, mode:
             .name = executable_name,
             .root_source_file = executable_source,
             .target = target,
-            .optimize = mode,
+            .optimize = optimize,
         });
-        sample_executable.addModule("zice", zice_module);
-        sample_executable.addModule("xev", zice_module.dependencies.get("xev").?);
+        sample_executable.addModule("zice", b.modules.get("zice").?);
+        sample_executable.addModule("xev", b.dependency("libxev", .{}).module("xev"));
 
         b.installArtifact(sample_executable);
 
@@ -57,25 +42,40 @@ pub fn build(b: *std.build.Builder) void {
     // Standard release options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const target = b.standardTargetOptions(.{});
-    const mode = b.standardOptimizeOption(.{});
+    const optimize = b.standardOptimizeOption(.{});
 
-    const zice_module = module(b);
+    const ztun_module = b.dependency("ztun", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("ztun");
+    const xev_module = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("xev");
+
+    _ = b.addModule("zice", std.Build.CreateModuleOptions{
+        .source_file = .{ .path = thisDir() ++ "/src/main.zig" },
+        .dependencies = &.{
+            .{ .name = "ztun", .module = ztun_module },
+            .{ .name = "xev", .module = xev_module },
+        },
+    });
 
     const main_tests = b.addTest(.{
         .name = "zice_test",
         .root_source_file = std.Build.FileSource.relative("src/main.zig"),
         .target = target,
-        .optimize = mode,
+        .optimize = optimize,
     });
-    main_tests.addModule("ztun", zice_module.dependencies.get("ztun").?);
-    main_tests.addModule("xev", zice_module.dependencies.get("xev").?);
+    main_tests.addModule("ztun", ztun_module);
+    main_tests.addModule("xev", xev_module);
 
     const run_main_tests = b.addRunArtifact(main_tests);
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_main_tests.step);
 
-    buildSamples(b, zice_module, mode, target) catch unreachable;
+    buildSamples(b, optimize, target) catch unreachable;
 }
 
 inline fn thisDir() []const u8 {
