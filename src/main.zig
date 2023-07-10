@@ -380,6 +380,18 @@ const NetlinkContext = struct {
     }
 
     pub fn start(self: *NetlinkContext, loop: *xev.Loop) !void {
+        self.read_completion = xev.Completion{
+            .op = .{
+                .read = .{
+                    .fd = self.socket,
+                    .buffer = .{ .slice = self.read_buffer },
+                },
+            },
+            .userdata = self,
+            .callback = NetlinkContext.readCallback,
+        };
+        loop.add(&self.read_completion);
+
         self.requestInterfaces(loop);
     }
 
@@ -464,20 +476,8 @@ const NetlinkContext = struct {
         result: xev.Result,
     ) xev.CallbackAction {
         var self = @as(*NetlinkContext, @ptrCast(@alignCast(userdata.?)));
-        _ = result.write catch |err| return self.writeError(err, loop);
+        _ = result.write catch |err| self.writeError(err, loop);
         _ = completion;
-
-        self.read_completion = xev.Completion{
-            .op = .{
-                .read = .{
-                    .fd = self.socket,
-                    .buffer = .{ .slice = self.read_buffer },
-                },
-            },
-            .userdata = self,
-            .callback = NetlinkContext.readCallback,
-        };
-        loop.add(&self.read_completion);
 
         return .disarm;
     }
@@ -489,60 +489,44 @@ const NetlinkContext = struct {
         result: xev.Result,
     ) xev.CallbackAction {
         var self = @as(*NetlinkContext, @ptrCast(@alignCast(userdata.?)));
-        const bytes_read = result.read catch |err| return self.readError(err, loop);
+        if (result.read) |bytes_read| {
+            if (self.handleNetlinkMessage(completion.op.read.buffer.slice[0..bytes_read])) |done| {
+                if (done) {
+                    switch (self.state) {
+                        .initial_interfaces => {
+                            self.state = .initial_addresses;
+                            self.requestAddresses(loop);
+                        },
+                        .initial_addresses => {
+                            self.state = .idle;
+                        },
+                        else => {},
+                    }
+                }
+            } else |err| self.readError(err, loop);
+        } else |err| self.readError(err, loop);
 
-        const done = self.handleNetlinkMessage(completion.op.read.buffer.slice[0..bytes_read]) catch |err| return self.readError(err, loop);
+        return .rearm;
+    }
 
-        if (!done) return .rearm;
+    fn writeError(self: *NetlinkContext, err: anyerror, loop: *xev.Loop) void {
+        std.log.err("Got {} while writing in {s} state, retrying...", .{ err, @tagName(self.state) });
 
         switch (self.state) {
-            .initial_interfaces => {
-                self.state = .initial_addresses;
-                self.requestAddresses(loop);
-                return .disarm;
-            },
-            .initial_addresses => {
-                self.state = .idle;
-                return .rearm;
-            },
-            else => return .rearm,
+            .initial_interfaces => self.requestInterfaces(loop),
+            .initial_addresses => self.requestAddresses(loop),
+            else => unreachable,
         }
     }
 
-    fn writeError(self: *NetlinkContext, err: anyerror, loop: *xev.Loop) xev.CallbackAction {
-        std.log.err("Got {} while writing in {s} state, retrying...", .{ err, @tagName(self.state) });
-
-        const action: xev.CallbackAction = switch (self.state) {
-            .initial_interfaces => a: {
-                self.requestInterfaces(loop);
-                break :a .disarm;
-            },
-            .initial_addresses => a: {
-                self.requestAddresses(loop);
-                break :a .disarm;
-            },
-            else => unreachable,
-        };
-
-        return action;
-    }
-
-    fn readError(self: *NetlinkContext, err: anyerror, loop: *xev.Loop) xev.CallbackAction {
+    fn readError(self: *NetlinkContext, err: anyerror, loop: *xev.Loop) void {
         std.log.err("Got {} while reading in {s} state, retrying...", .{ err, @tagName(self.state) });
 
-        const action: xev.CallbackAction = switch (self.state) {
-            .initial_interfaces => a: {
-                self.requestInterfaces(loop);
-                break :a .disarm;
-            },
-            .initial_addresses => a: {
-                self.requestAddresses(loop);
-                break :a .disarm;
-            },
-            else => .rearm,
-        };
-
-        return action;
+        switch (self.state) {
+            .initial_interfaces => self.requestInterfaces(loop),
+            .initial_addresses => self.requestAddresses(loop),
+            else => {},
+        }
     }
 
     fn handleNetlinkMessage(self: *NetlinkContext, data: []const u8) !bool {
