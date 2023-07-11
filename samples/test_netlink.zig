@@ -56,13 +56,6 @@ const StopHandler = struct {
     }
 };
 
-//pub fn dummyCallback(userdata: ?*anyopaque, result: zice.Result) void {
-//    const zice_context = @as(*zice.Context, @ptrCast(@alignCast(userdata.?)));
-//    const candidates = result.gather_candidates catch return;
-//    std.log.debug("Candidates: {any}", .{candidates});
-//    zice_context.allocator.free(candidates);
-//}
-
 pub fn dummyCandidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
     _ = userdata;
     std.log.debug("Agent {} new candidate: {any}", .{ agent_index, result });
@@ -90,7 +83,7 @@ pub fn main() !void {
 
     try zice_context.start(&event_loop);
 
-    const AGENT_COUNT = 1;
+    const AGENT_COUNT = 10;
 
     var agents = [_]u32{0} ** AGENT_COUNT;
 
@@ -111,7 +104,9 @@ pub fn main() !void {
             inner_agents: *[AGENT_COUNT]u32,
         ) !void {
             std.time.sleep(1_000_000_000);
-            for (inner_agents) |i| try inner_zice_context.gatherCandidates(i);
+            for (inner_agents) |i| {
+                try inner_zice_context.gatherCandidates(i);
+            }
         }
     }).callback, .{
         &zice_context,
