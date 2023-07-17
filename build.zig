@@ -7,34 +7,41 @@ pub fn buildSamples(b: *std.build.Builder, optimize: std.builtin.Mode, target: s
     var arena_state = std.heap.ArenaAllocator.init(b.allocator);
     defer arena_state.deinit();
 
-    const sample_directory_path = try b.build_root.join(arena_state.allocator(), &[_][]const u8{"samples"});
+    const directory_path = try b.build_root.join(arena_state.allocator(), &[_][]const u8{"samples"});
 
-    var iterable_dir = try std.fs.openIterableDirAbsolute(sample_directory_path, .{});
-    var sample_iterator = iterable_dir.iterate();
-    while (try sample_iterator.next()) |entry| {
+    var iterable_dir = try std.fs.openIterableDirAbsolute(directory_path, .{});
+    var iterator = iterable_dir.iterate();
+    while (try iterator.next()) |entry| {
         if (entry.kind != .file) continue;
         const extension = std.fs.path.extension(entry.name);
         if (!std.mem.eql(u8, extension, ".zig")) continue;
 
         const executable_name = std.fs.path.stem(entry.name);
 
-        const executable_source = std.Build.FileSource{ .path = try std.fs.path.join(arena_state.allocator(), &[_][]const u8{ sample_directory_path, entry.name }) };
+        const executable_source = std.Build.FileSource{ .path = try std.fs.path.join(arena_state.allocator(), &[_][]const u8{ directory_path, entry.name }) };
 
-        const sample_executable = b.addExecutable(.{
+        const executable = b.addExecutable(.{
             .name = executable_name,
             .root_source_file = executable_source,
             .target = target,
             .optimize = optimize,
         });
-        sample_executable.addModule("zice", b.modules.get("zice").?);
-        sample_executable.addModule("xev", b.dependency("libxev", .{}).module("xev"));
+        executable.addModule("zice", b.modules.get("zice").?);
+        executable.addModule("xev", b.dependency("libxev", .{}).module("xev"));
+        const install_executable = b.addInstallArtifact(executable);
 
-        b.installArtifact(sample_executable);
+        const build_step_description = std.fmt.allocPrint(b.allocator, "Build the \"{s}\" executable", .{executable_name}) catch unreachable;
+        const build_step = b.step(executable_name, build_step_description);
+        build_step.dependOn(&install_executable.step);
 
-        const sample_run_command = b.addRunArtifact(sample_executable);
+        const run_command = b.addRunArtifact(executable);
 
-        const sample_run_step = b.step(executable_name, "Run the sample");
-        sample_run_step.dependOn(&sample_run_command.step);
+        const run_step_description = std.fmt.allocPrint(b.allocator, "Run the \"{s}\" executable", .{executable_name}) catch unreachable;
+        const run_step_name = std.fmt.allocPrint(b.allocator, "run_{s}", .{executable_name}) catch unreachable;
+        const run_step = b.step(run_step_name, run_step_description);
+        run_step.dependOn(&run_command.step);
+
+        b.installArtifact(executable);
     }
 }
 
