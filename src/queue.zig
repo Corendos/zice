@@ -11,12 +11,8 @@ pub fn Intrusive(comptime T: type) type {
         head: ?*T = null,
         tail: ?*T = null,
 
-        mutex: std.Thread.Mutex = .{},
-
         /// Enqueue a new element to the back of the queue.
         pub fn push(self: *Self, v: *T) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
             std.debug.assert(v.next == null);
 
             if (self.tail) |tail| {
@@ -32,9 +28,6 @@ pub fn Intrusive(comptime T: type) type {
 
         /// Dequeue the next element from the queue.
         pub fn pop(self: *Self) ?*T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
             // The next element is in "head".
             const next = self.head orelse return null;
 
@@ -54,8 +47,6 @@ pub fn Intrusive(comptime T: type) type {
 
         /// Returns true if the queue is empty.
         pub fn empty(self: *const Self) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
             return self.head == null;
         }
     };
