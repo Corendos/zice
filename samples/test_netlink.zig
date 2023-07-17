@@ -83,7 +83,7 @@ pub fn main() !void {
 
     try zice_context.start(&event_loop);
 
-    const AGENT_COUNT = 10;
+    const AGENT_COUNT = 1;
 
     var agents = [_]u32{0} ** AGENT_COUNT;
 
@@ -103,7 +103,6 @@ pub fn main() !void {
             inner_zice_context: *zice.Context,
             inner_agents: *[AGENT_COUNT]u32,
         ) !void {
-            std.time.sleep(1_000_000_000);
             for (inner_agents) |i| {
                 try inner_zice_context.gatherCandidates(i);
             }
