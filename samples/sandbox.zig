@@ -9,7 +9,7 @@ const zice = @import("zice");
 pub const std_options = struct {
     pub const log_scope_levels = &.{
         //std.log.ScopeLevel{ .scope = .default, .level = .info },
-        std.log.ScopeLevel{ .scope = .zice, .level = .info },
+        std.log.ScopeLevel{ .scope = .zice, .level = .debug },
     };
 };
 
@@ -66,7 +66,7 @@ const StopHandler = struct {
 pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
     if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.transport_address.address });
+        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation().as_number(), result.candidate.transport_address });
         context.controlling_agent_candidates.append(result.candidate) catch unreachable;
     }
 }
@@ -76,14 +76,15 @@ pub fn controllingStateChangeCallback(userdata: ?*anyopaque, agent_index: u32, s
     std.log.info("Agent {} new gathering state: {any}", .{ agent_index, state });
 
     if (state == .done) {
-        context.zice_context.setRemoteCandidates(&context.controlled_set_remote_candidate_completion, context.controlled_agent, context.controlling_agent_candidates.items) catch unreachable;
+        const parameters = zice.RemoteCandidateParameters{ .candidates = context.controlling_agent_candidates.items, .username_fragment = context.controlling_agent_username, .password = context.controlling_agent_password };
+        context.zice_context.setRemoteCandidates(&context.controlled_set_remote_candidate_completion, context.controlled_agent, parameters) catch unreachable;
     }
 }
 
 pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
     if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.transport_address.address });
+        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation().as_number(), result.candidate.transport_address });
         context.controlled_agent_candidates.append(result.candidate) catch unreachable;
     }
 }
@@ -93,7 +94,8 @@ pub fn controlledStateChangeCallback(userdata: ?*anyopaque, agent_index: u32, st
     std.log.info("Agent {} new gathering state: {any}", .{ agent_index, state });
 
     if (state == .done) {
-        context.zice_context.setRemoteCandidates(&context.controlling_set_remote_candidate_completion, context.controlling_agent, context.controlling_agent_candidates.items) catch unreachable;
+        const parameters = zice.RemoteCandidateParameters{ .candidates = context.controlled_agent_candidates.items, .username_fragment = context.controlled_agent_username, .password = context.controlled_agent_password };
+        context.zice_context.setRemoteCandidates(&context.controlling_set_remote_candidate_completion, context.controlling_agent, parameters) catch unreachable;
     }
 }
 
@@ -107,6 +109,12 @@ const Context = struct {
 
     controlling_agent_candidates: std.ArrayList(zice.Candidate),
     controlled_agent_candidates: std.ArrayList(zice.Candidate),
+
+    controlling_agent_username: [8]u8 = undefined,
+    controlling_agent_password: [24]u8 = undefined,
+
+    controlled_agent_username: [8]u8 = undefined,
+    controlled_agent_password: [24]u8 = undefined,
 };
 
 pub fn main() !void {
@@ -146,6 +154,9 @@ pub fn main() !void {
         .on_state_change_callback = controllingStateChangeCallback,
     });
     defer zice_context.deleteAgent(controlling_agent);
+    const controlling_agent_result = try zice_context.getAgentUsernameAndPassword(controlling_agent);
+    context.controlling_agent_username = controlling_agent_result.username;
+    context.controlling_agent_password = controlling_agent_result.password;
 
     var controlled_agent = try zice_context.newAgent(zice.CreateAgentOptions{
         .userdata = &context,
@@ -153,6 +164,9 @@ pub fn main() !void {
         .on_state_change_callback = controlledStateChangeCallback,
     });
     defer zice_context.deleteAgent(controlled_agent);
+    const controlled_agent_result = try zice_context.getAgentUsernameAndPassword(controlled_agent);
+    context.controlled_agent_username = controlled_agent_result.username;
+    context.controlled_agent_password = controlled_agent_result.password;
 
     context.controlling_agent = controlling_agent;
     context.controlled_agent = controlled_agent;

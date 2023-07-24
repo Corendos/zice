@@ -40,6 +40,7 @@ pub fn buildSamples(b: *std.build.Builder, optimize: std.builtin.Mode, target: s
         const run_step_name = std.fmt.allocPrint(b.allocator, "run_{s}", .{executable_name}) catch unreachable;
         const run_step = b.step(run_step_name, run_step_description);
         run_step.dependOn(&run_command.step);
+        run_step.dependOn(&install_executable.step);
 
         b.installArtifact(executable);
     }
