@@ -152,14 +152,18 @@ pub const Configuration = struct {
 };
 
 /// Convenience to build a basic STUN request.
-fn makeBasicBindingRequest(allocator: std.mem.Allocator) !ztun.Message {
+fn makeBasicBindingRequest(allocator: std.mem.Allocator, transaction_id: ?u96) !ztun.Message {
     var message_builder = ztun.MessageBuilder.init(allocator);
     defer message_builder.deinit();
 
     // Binding request with random transaction ID.
     message_builder.setClass(ztun.Class.request);
     message_builder.setMethod(ztun.Method.binding);
-    message_builder.randomTransactionId();
+    if (transaction_id) |v| {
+        message_builder.transactionId(v);
+    } else {
+        message_builder.randomTransactionId();
+    }
 
     // Add a fingerprint for validity check.
     message_builder.addFingerprint();
@@ -352,13 +356,25 @@ fn noopCandidateCallback(_: ?*anyopaque, _: u32, _: CandidateResult) void {}
 pub const OnStateChangeCallback = *const fn (userdata: ?*anyopaque, agent_id: u32, state: GatheringState) void;
 fn noopStateChangeCallback(_: ?*anyopaque, _: u32, _: GatheringState) void {}
 
+pub const TransactionError = error{
+    Canceled,
+    Timeout,
+    Unexpected,
+};
+
+pub const TransactionResult = TransactionError!void;
+
+const TransactionCallback = *const fn (userdata: ?*anyopaque, transaction_context: *TransactionContext, result: TransactionResult) void;
+fn noopTransactionCallback(_: ?*anyopaque, _: *TransactionContext, _: TransactionResult) void {}
+
 pub const TransactionContext = struct {
     /// The index of associated agent.
     agent_id: u32,
-    /// The index of the associated socket.
-    socket_index: u32,
     /// Our own index.
     index: u32,
+
+    socket_context: *SocketContext,
+    server_address: std.net.Address,
 
     /// The timer that is used for retry and failure.
     timer: xev.Timer,
@@ -377,6 +393,8 @@ pub const TransactionContext = struct {
     write_data: WriteData = undefined,
     /// The associated xev.Completion.
     write_completion: xev.Completion = .{},
+    /// The completion to cancel the write.
+    write_cancel_completion: xev.Completion = .{},
     /// The transaction id of the request being sent to the STUN server.
     transaction_id: ?u96 = null,
 
@@ -384,6 +402,12 @@ pub const TransactionContext = struct {
     request_sent_count: u64 = 0,
     /// The current RTO (see RFC).
     rto: u64,
+
+    canceled: bool = false,
+
+    userdata: ?*anyopaque = null,
+    callback: TransactionCallback = noopTransactionCallback,
+    result: ?TransactionResult = null,
 
     /// Initialize a Candidate context from the given socket, address and rto.
     pub fn init(agent_id: u32, index: u32, socket_index: u32, write_buffer: []u8, rto: u64) !TransactionContext {
@@ -405,11 +429,229 @@ pub const TransactionContext = struct {
         self.timer.deinit();
     }
 
-    /// Returns true if the gathering process seems to be done.
-    pub inline fn isDone(self: *const TransactionContext) bool {
-        // TODO(Corendos): Shound't we check for write_completion state ?
-        return self.timer_completion.state() == .dead and
-            self.timer_cancel_completion.state() == .dead;
+    pub fn start(self: *TransactionContext, loop: *xev.Loop) void {
+        var buffer: [4096]u8 = undefined;
+        const request = r: {
+            var allocator = std.heap.FixedBufferAllocator.init(&buffer);
+            break :r makeBasicBindingRequest(allocator.allocator(), null) catch unreachable;
+        };
+        self.transaction_id = request.transaction_id;
+
+        log.debug("Transaction {} - Sending request", .{self.transaction_id});
+        self.sendRequest(request, loop);
+    }
+
+    pub fn cancel(self: *TransactionContext, loop: *xev.Loop) void {
+        if (self.write_completion.state() == .active) {
+            self.write_cancel_completion = xev.Completion{
+                .op = .{ .cancel = .{ .c = &self.write_completion } },
+                .userdata = self,
+                .callback = writeCancelCallback,
+            };
+            loop.add(&self.write_cancel_completion);
+        }
+
+        if (self.timer_completion.state() == .active) {
+            self.timer.cancel(
+                self.loop,
+                &self.timer_completion,
+                &self.timer_cancel_completion,
+                TransactionContext,
+                self,
+                timerCancelCallback,
+            );
+        }
+
+        self.canceled = true;
+    }
+
+    pub fn onResponse(self: *TransactionContext, loop: *xev.Loop) void {
+        log.debug("Transaction {} - Received STUN response", .{self.transaction_id});
+
+        if (self.write_completion.state() == .active) {
+            self.write_cancel_completion = xev.Completion{
+                .op = .{ .cancel = .{ .c = &self.write_completion } },
+                .userdata = self,
+                .callback = writeCancelCallback,
+            };
+            loop.add(&self.write_cancel_completion);
+        }
+
+        if (self.timer_completion.state() == .active) {
+            self.timer.cancel(
+                self.loop,
+                &self.timer_completion,
+                &self.timer_cancel_completion,
+                TransactionContext,
+                self,
+                timerCancelCallback,
+            );
+        }
+
+        std.debug.assert(self.result == null);
+        self.result = {};
+
+        if (self.timer_completion.state() == .dead and self.timer_cancel_completion.state() == .dead and self.write_completion.state() == .dead and self.write_cancel_completion.state() == .dead) {
+            self.callback(self.userdata, self, self.result.?);
+        }
+    }
+
+    pub inline fn state(self: TransactionContext) xev.CompletionState {
+        const is_write_active = self.write_completion.state() != .dead or self.write_cancel_completion.state() != .dead;
+        const is_timer_active = self.timer_completion.state() != .dead or self.timer_cancel_completion.state() != .dead;
+        return if (is_write_active or is_timer_active) .active else .dead;
+    }
+
+    fn writeCallback(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = c;
+        _ = loop;
+        const self: *TransactionContext = @ptrCast(@alignCast(userdata.?));
+
+        _ = result catch |err| {
+            log.err("Transaction {} - Got {} when sending STUN request", .{ self.transaction_id.?, err });
+            if (err == error.Canceled and self.canceled) {
+                std.debug.assert(self.result == null);
+                self.result = error.Canceled;
+
+                if (self.timer_completion.state() == .dead and self.timer_cancel_completion.state() == .dead and self.write_cancel_completion.state() == .dead) {
+                    self.callback(self.userdata, self, self.result.?);
+                }
+            }
+            return .disarm;
+        };
+
+        self.request_sent_count += 1;
+        log.debug("Transaction {} - STUN request sent", .{self.transaction_id});
+
+        const is_first_request = self.request_sent_count == 1;
+        self.timer_timeout_ms = if (is_first_request) self.rto else self.timer_timeout_ms * 2;
+
+        const is_last_request = self.request_sent_count == Configuration.request_count;
+        if (is_last_request) {
+            self.timer_timeout_ms = self.rto * Configuration.last_request_factor;
+            self.is_retry_timer = false;
+        }
+
+        self.timer.run(
+            self.loop,
+            &self.timer_completion,
+            self.timer_timeout_ms,
+            Context,
+            self,
+            timerCallback,
+        );
+
+        return .disarm;
+    }
+
+    fn writeCancelCallback(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = result;
+        _ = c;
+        _ = loop;
+        const self: *TransactionContext = @ptrCast(@alignCast(userdata.?));
+
+        if (self.timer_completion.state() == .dead and self.timer_cancel_completion.state() == .dead and self.write_completion.state() == .dead) {
+            self.callback(self.userdata, self, self.result.?);
+        }
+    }
+
+    fn timerCallback(
+        userdata: ?*TransactionContext,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        result: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        _ = c;
+        const self = userdata.?;
+
+        _ = result catch {
+            if (self.timer_cancel_completion.state() == .dead and self.write_completion.state() == .dead and self.write_cancel_completion.state() == .dead) {
+                self.callback(self.userdata, self, self.result.?);
+            }
+            return .disarm;
+        };
+
+        if (self.is_retry_timer) {
+            log.debug("Transaction {} - STUN request {}/{} timed out", .{ self.transaction_id, self.request_sent_count, Configuration.request_count });
+            var buffer: [4096]u8 = undefined;
+            const request = r: {
+                var allocator = std.heap.FixedBufferAllocator.init(&buffer);
+                break :r makeBasicBindingRequest(allocator.allocator()) catch unreachable;
+            };
+            self.sendRequest(request, loop);
+        } else {
+            log.debug("Transaction {} - Gathering timed out", .{self.transaction_id});
+
+            std.debug.assert(self.result == null);
+            self.result = error.Timeout;
+
+            if (self.timer_completion.state() == .dead and self.timer_cancel_completion.state() == .dead) {
+                self.callback(self.userdata, self, self.result.?);
+            }
+        }
+
+        return .disarm;
+    }
+
+    fn timerCancelCallback(
+        userdata: ?*TransactionContext,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        result: xev.CancelError!void,
+    ) xev.CallbackAction {
+        _ = result catch {};
+        _ = c;
+        _ = loop;
+
+        const self = userdata.?;
+
+        if (self.timer_completion.state() == .dead and self.write_completion.state() == .dead and self.write_cancel_completion.state() == .dead) {
+            self.callback(self.userdata, self, self.result.?);
+        }
+
+        return .disarm;
+    }
+
+    fn sendRequest(self: *TransactionContext, request: ztun.Message, loop: *xev.Loop) void {
+        // TODO(Corendos): report correctly
+        //const address = switch (socket_context.address.any.family) {
+        //    std.os.AF.INET => Configuration.stun_address_ipv4,
+        //    std.os.AF.INET6 => Configuration.stun_address_ipv6,
+        //    else => unreachable,
+        //};
+
+        const data = d: {
+            var stream = std.io.fixedBufferStream(self.write_buffer);
+            request.write(stream.writer()) catch unreachable;
+            break :d stream.getWritten();
+        };
+
+        // TODO(Corendos): Report correctly
+        self.transaction_id = request.transaction_id;
+        self.write_data.from(self.server_address, data);
+
+        self.write_completion = xev.Completion{
+            .op = .{
+                .sendmsg = .{
+                    .fd = self.socket_context.socket,
+                    .msghdr = &self.write_data.message_header,
+                    .buffer = null,
+                },
+            },
+            .userdata = self,
+            .callback = writeCallback,
+        };
+        loop.add(&self.write_completion);
     }
 };
 
@@ -1921,36 +2163,6 @@ pub const Context = struct {
         self.handleGatheringEvent(agent_context, .{ .main_timer = result });
 
         return .disarm;
-    }
-
-    fn sendRequestToStunServer(self: *Context, request: ztun.Message, socket_context: *SocketContext, transaction_context: *TransactionContext) void {
-        const address = switch (socket_context.address.any.family) {
-            std.os.AF.INET => Configuration.stun_address_ipv4,
-            std.os.AF.INET6 => Configuration.stun_address_ipv6,
-            else => unreachable,
-        };
-
-        const data = d: {
-            var stream = std.io.fixedBufferStream(transaction_context.write_buffer);
-            request.write(stream.writer()) catch unreachable;
-            break :d stream.getWritten();
-        };
-
-        transaction_context.transaction_id = request.transaction_id;
-        transaction_context.write_data.from(address, data);
-
-        transaction_context.write_completion = xev.Completion{
-            .op = .{
-                .sendmsg = .{
-                    .fd = socket_context.socket,
-                    .msghdr = &transaction_context.write_data.message_header,
-                    .buffer = null,
-                },
-            },
-            .userdata = self,
-            .callback = stunWriteCallback,
-        };
-        self.loop.add(&transaction_context.write_completion);
     }
 
     fn sendRequestToRemoteAgent(self: *Context, request: ztun.Message, check_context: *ConnectivityCheckContext, socket_context: *SocketContext, address: std.net.Address) void {
