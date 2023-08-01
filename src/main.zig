@@ -170,6 +170,7 @@ fn makeBasicBindingRequest(allocator: std.mem.Allocator, transaction_id: ?u96) !
     return try message_builder.build();
 }
 
+/// Make the username used in STUN transaction from local and remote fragments.
 fn makeUsername(
     local_username_fragment: [8]u8,
     remote_username_fragment: [8]u8,
@@ -183,6 +184,7 @@ fn makeUsername(
     return result;
 }
 
+/// Convenience to build a STUN request used in connectivity checks.
 fn makeConnectivityCheckBindingRequest(
     local_username_fragment: [8]u8,
     remote_username_fragment: [8]u8,
@@ -225,6 +227,7 @@ fn makeConnectivityCheckBindingRequest(
     return message;
 }
 
+/// Convenience to build a STUN response to a request.
 fn makeBindingResponse(request: ztun.Message, source: std.net.Address, password: [24]u8, allocator: std.mem.Allocator) !ztun.Message {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -256,6 +259,7 @@ pub inline fn fromStunAddress(mapped_address: ztun.attr.common.MappedAddress) st
     };
 }
 
+/// Convert a std.net.Address to a MAPPED-ADDRESS STUN attributes.
 pub inline fn toStunAddress(address: std.net.Address) ztun.attr.common.MappedAddress {
     const family = switch (address.any.family) {
         std.os.AF.INET => ztun.attr.common.AddressFamily{ .ipv4 = std.mem.toBytes(address.in.sa.addr) },
@@ -362,7 +366,7 @@ pub const TransactionError = error{
     Unexpected,
 };
 
-pub const TransactionResult = TransactionError!void;
+pub const TransactionResult = TransactionError!struct { message: ztun.Message, source: std.net.Address };
 
 const TransactionCallback = *const fn (userdata: ?*anyopaque, transaction_context: *TransactionContext, result: TransactionResult) void;
 fn noopTransactionCallback(_: ?*anyopaque, _: *TransactionContext, _: TransactionResult) void {}
@@ -374,21 +378,27 @@ pub const TransactionContext = struct {
     index: u32,
 
     socket_context: *SocketContext,
-    server_address: std.net.Address,
+    server_address: ?std.net.Address = null,
 
-    /// The timer that is used for retry and failure.
-    timer: xev.Timer,
+    /// The timer that is used for retry.
+    retry_timer: xev.Timer,
     /// The current timeout for the retry timer.
-    timer_timeout_ms: u64 = 0,
-    /// Is the timer used for a retry or for a failure.
-    is_retry_timer: bool = true,
+    retry_timer_timeout_ms: u64 = 0,
     /// The associated xev.Completion.
-    timer_completion: xev.Completion = .{},
+    retry_timer_completion: xev.Completion = .{},
     /// The associated cancel xev.Completion
-    timer_cancel_completion: xev.Completion = .{},
+    retry_timer_cancel_completion: xev.Completion = .{},
+    /// The timer that is used for timeout.
+    timeout_timer: xev.Timer,
+    /// The completion for the transaction timeout.
+    timeout_completion: xev.Completion = .{},
+    /// The associated cancel xev.Completion.
+    timeout_cancel_completion: xev.Completion = .{},
 
     /// The buffer used to send a message.
     write_buffer: []u8 = &.{},
+    /// The actual request data.
+    request_data: []u8 = &.{},
     /// The data required to send a message.
     write_data: WriteData = undefined,
     /// The associated xev.Completion.
@@ -401,105 +411,136 @@ pub const TransactionContext = struct {
     /// Counts the number of request sent.
     request_sent_count: u64 = 0,
     /// The current RTO (see RFC).
-    rto: u64,
+    rto: ?u64 = null,
 
-    canceled: bool = false,
+    flags: packed struct {
+        canceled: bool = false,
+    } = .{},
 
     userdata: ?*anyopaque = null,
     callback: TransactionCallback = noopTransactionCallback,
     result: ?TransactionResult = null,
+    result_storage: []u8 = &.{},
 
-    /// Initialize a Candidate context from the given socket, address and rto.
-    pub fn init(agent_id: u32, index: u32, socket_index: u32, write_buffer: []u8, rto: u64) !TransactionContext {
-        const timer = try xev.Timer.init();
-        errdefer timer.deinit();
+    /// Initialize a Candidate context from the given socket.
+    pub fn init(agent_id: u32, index: u32, socket_context: *SocketContext, write_buffer: []u8, result_storage: []u8) !TransactionContext {
+        const retry_timer = try xev.Timer.init();
+        errdefer retry_timer.deinit();
+
+        const timeout_timer = try xev.Timer.init();
+        errdefer timeout_timer.deinit();
 
         return .{
             .agent_id = agent_id,
             .index = index,
-            .socket_index = socket_index,
-            .timer = timer,
+            .socket_context = socket_context,
+            .retry_timer = retry_timer,
+            .timeout_timer = timeout_timer,
             .write_buffer = write_buffer,
-            .rto = rto,
+            .result_storage = result_storage,
         };
     }
 
     /// Deinitialize a candidate context.
     pub fn deinit(self: *TransactionContext) void {
-        self.timer.deinit();
+        self.retry_timer.deinit();
+        self.timeout_timer.deinit();
     }
 
-    pub fn start(self: *TransactionContext, loop: *xev.Loop) void {
-        var buffer: [4096]u8 = undefined;
-        const request = r: {
-            var allocator = std.heap.FixedBufferAllocator.init(&buffer);
-            break :r makeBasicBindingRequest(allocator.allocator(), null) catch unreachable;
-        };
+    pub fn start(self: *TransactionContext, request: ztun.Message, address: std.net.Address, rto: u64, loop: *xev.Loop) void {
+        self.server_address = address;
+        self.rto = rto;
         self.transaction_id = request.transaction_id;
+        self.request_data = d: {
+            var stream = std.io.fixedBufferStream(self.write_buffer);
+            request.write(stream.writer()) catch unreachable;
+            break :d stream.getWritten();
+        };
 
-        log.debug("Transaction {} - Sending request", .{self.transaction_id});
+        log.debug("Transaction {} - Sending request", .{self.transaction_id.?});
         self.sendRequest(request, loop);
     }
 
     pub fn cancel(self: *TransactionContext, loop: *xev.Loop) void {
-        if (self.write_completion.state() == .active) {
-            self.write_cancel_completion = xev.Completion{
-                .op = .{ .cancel = .{ .c = &self.write_completion } },
-                .userdata = self,
-                .callback = writeCancelCallback,
-            };
-            loop.add(&self.write_cancel_completion);
-        }
+        self.cancelWrite(loop);
+        self.cancelRetry(loop);
+        self.cancelTimeout(loop);
 
-        if (self.timer_completion.state() == .active) {
-            self.timer.cancel(
-                self.loop,
-                &self.timer_completion,
-                &self.timer_cancel_completion,
-                TransactionContext,
-                self,
-                timerCancelCallback,
-            );
-        }
-
-        self.canceled = true;
+        self.flags.canceled = true;
     }
 
-    pub fn onResponse(self: *TransactionContext, loop: *xev.Loop) void {
-        log.debug("Transaction {} - Received STUN response", .{self.transaction_id});
+    pub fn readCallback(self: *TransactionContext, loop: *xev.Loop, raw_message: []const u8, source: std.net.Address) void {
+        log.debug("Transaction {} - Received STUN response", .{self.transaction_id.?});
 
-        if (self.write_completion.state() == .active) {
-            self.write_cancel_completion = xev.Completion{
-                .op = .{ .cancel = .{ .c = &self.write_completion } },
-                .userdata = self,
-                .callback = writeCancelCallback,
-            };
-            loop.add(&self.write_cancel_completion);
-        }
+        self.cancelWrite(loop);
+        self.cancelRetry(loop);
+        self.cancelTimeout(loop);
 
-        if (self.timer_completion.state() == .active) {
-            self.timer.cancel(
-                self.loop,
-                &self.timer_completion,
-                &self.timer_cancel_completion,
-                TransactionContext,
-                self,
-                timerCancelCallback,
-            );
-        }
+        const message = b: {
+            var stream = std.io.fixedBufferStream(raw_message);
+            var allocator = std.heap.FixedBufferAllocator.init(self.result_storage);
+            break :b ztun.Message.readAlloc(stream.reader(), allocator.allocator()) catch unreachable;
+        };
 
         std.debug.assert(self.result == null);
-        self.result = {};
+        self.result = .{ .message = message, .source = source };
 
-        if (self.timer_completion.state() == .dead and self.timer_cancel_completion.state() == .dead and self.write_completion.state() == .dead and self.write_cancel_completion.state() == .dead) {
+        if (self.state() == .dead) {
             self.callback(self.userdata, self, self.result.?);
         }
     }
 
+    pub inline fn isWriteActive(self: TransactionContext) bool {
+        return self.write_completion.state() != .dead or self.write_cancel_completion.state() != .dead;
+    }
+
+    pub inline fn isRetryTimerActive(self: TransactionContext) bool {
+        return self.retry_timer_completion.state() != .dead or self.retry_timer_cancel_completion.state() != .dead;
+    }
+
+    pub inline fn isTimeoutTimerActive(self: TransactionContext) bool {
+        return self.timeout_completion.state() != .dead or self.timeout_cancel_completion.state() != .dead;
+    }
+
     pub inline fn state(self: TransactionContext) xev.CompletionState {
-        const is_write_active = self.write_completion.state() != .dead or self.write_cancel_completion.state() != .dead;
-        const is_timer_active = self.timer_completion.state() != .dead or self.timer_cancel_completion.state() != .dead;
-        return if (is_write_active or is_timer_active) .active else .dead;
+        return if (self.isWriteActive() or self.isRetryTimerActive() or self.isTimeoutTimerActive()) .active else .dead;
+    }
+
+    fn cancelWrite(self: *TransactionContext, loop: *xev.Loop) void {
+        if (self.write_completion.state() == .dead or self.write_cancel_completion.state() == .active) return;
+
+        self.write_cancel_completion = xev.Completion{
+            .op = .{ .cancel = .{ .c = &self.write_completion } },
+            .userdata = self,
+            .callback = writeCancelCallback,
+        };
+        loop.add(&self.write_cancel_completion);
+    }
+
+    fn cancelRetry(self: *TransactionContext, loop: *xev.Loop) void {
+        if (self.retry_timer_completion.state() == .dead or self.retry_timer_cancel_completion.state() == .active) return;
+
+        self.retry_timer.cancel(
+            loop,
+            &self.retry_timer_completion,
+            &self.retry_timer_cancel_completion,
+            TransactionContext,
+            self,
+            retryCancelCallback,
+        );
+    }
+
+    fn cancelTimeout(self: *TransactionContext, loop: *xev.Loop) void {
+        if (self.timeout_completion.state() == .dead or self.timeout_cancel_completion.state() == .active) return;
+
+        self.timeout_timer.cancel(
+            loop,
+            &self.timeout_completion,
+            &self.timeout_cancel_completion,
+            TransactionContext,
+            self,
+            timeoutCancelCallback,
+        );
     }
 
     fn writeCallback(
@@ -509,16 +550,15 @@ pub const TransactionContext = struct {
         result: xev.Result,
     ) xev.CallbackAction {
         _ = c;
-        _ = loop;
         const self: *TransactionContext = @ptrCast(@alignCast(userdata.?));
 
-        _ = result catch |err| {
+        _ = result.sendmsg catch |err| {
             log.err("Transaction {} - Got {} when sending STUN request", .{ self.transaction_id.?, err });
-            if (err == error.Canceled and self.canceled) {
+            if (err == error.Canceled and self.flags.canceled) {
                 std.debug.assert(self.result == null);
                 self.result = error.Canceled;
 
-                if (self.timer_completion.state() == .dead and self.timer_cancel_completion.state() == .dead and self.write_cancel_completion.state() == .dead) {
+                if (self.state() == .dead) {
                     self.callback(self.userdata, self, self.result.?);
                 }
             }
@@ -526,25 +566,27 @@ pub const TransactionContext = struct {
         };
 
         self.request_sent_count += 1;
-        log.debug("Transaction {} - STUN request sent", .{self.transaction_id});
+        log.debug("Transaction {} - STUN request sent", .{self.transaction_id.?});
 
         const is_first_request = self.request_sent_count == 1;
-        self.timer_timeout_ms = if (is_first_request) self.rto else self.timer_timeout_ms * 2;
+        self.retry_timer_timeout_ms = if (is_first_request) self.rto.? else self.retry_timer_timeout_ms * 2;
 
-        const is_last_request = self.request_sent_count == Configuration.request_count;
-        if (is_last_request) {
-            self.timer_timeout_ms = self.rto * Configuration.last_request_factor;
-            self.is_retry_timer = false;
+        if (is_first_request) {
+            const timeout_ms: u64 = (@as(u64, 1 << Configuration.request_count) - 1 + Configuration.last_request_factor) * self.rto.?;
+            self.timeout_timer.run(loop, &self.timeout_completion, timeout_ms, TransactionContext, self, timeoutCallback);
         }
 
-        self.timer.run(
-            self.loop,
-            &self.timer_completion,
-            self.timer_timeout_ms,
-            Context,
-            self,
-            timerCallback,
-        );
+        const is_last_request = self.request_sent_count == Configuration.request_count;
+        if (!is_last_request) {
+            self.retry_timer.run(
+                loop,
+                &self.retry_timer_completion,
+                self.retry_timer_timeout_ms,
+                TransactionContext,
+                self,
+                retryCallback,
+            );
+        }
 
         return .disarm;
     }
@@ -555,17 +597,19 @@ pub const TransactionContext = struct {
         c: *xev.Completion,
         result: xev.Result,
     ) xev.CallbackAction {
-        _ = result;
         _ = c;
+        _ = result;
         _ = loop;
         const self: *TransactionContext = @ptrCast(@alignCast(userdata.?));
 
-        if (self.timer_completion.state() == .dead and self.timer_cancel_completion.state() == .dead and self.write_completion.state() == .dead) {
+        if (self.state() == .dead) {
             self.callback(self.userdata, self, self.result.?);
         }
+
+        return .disarm;
     }
 
-    fn timerCallback(
+    fn retryCallback(
         userdata: ?*TransactionContext,
         loop: *xev.Loop,
         c: *xev.Completion,
@@ -575,47 +619,84 @@ pub const TransactionContext = struct {
         const self = userdata.?;
 
         _ = result catch {
-            if (self.timer_cancel_completion.state() == .dead and self.write_completion.state() == .dead and self.write_cancel_completion.state() == .dead) {
+            if (self.state() == .dead) {
                 self.callback(self.userdata, self, self.result.?);
             }
             return .disarm;
         };
 
-        if (self.is_retry_timer) {
-            log.debug("Transaction {} - STUN request {}/{} timed out", .{ self.transaction_id, self.request_sent_count, Configuration.request_count });
-            var buffer: [4096]u8 = undefined;
-            const request = r: {
-                var allocator = std.heap.FixedBufferAllocator.init(&buffer);
-                break :r makeBasicBindingRequest(allocator.allocator()) catch unreachable;
-            };
-            self.sendRequest(request, loop);
-        } else {
-            log.debug("Transaction {} - Gathering timed out", .{self.transaction_id});
-
-            std.debug.assert(self.result == null);
-            self.result = error.Timeout;
-
-            if (self.timer_completion.state() == .dead and self.timer_cancel_completion.state() == .dead) {
-                self.callback(self.userdata, self, self.result.?);
-            }
-        }
+        log.debug("Transaction {} - STUN request {}/{} timed out", .{ self.transaction_id.?, self.request_sent_count, Configuration.request_count });
+        var buffer: [4096]u8 = undefined;
+        const request = r: {
+            var allocator = std.heap.FixedBufferAllocator.init(&buffer);
+            break :r makeBasicBindingRequest(allocator.allocator(), self.transaction_id.?) catch unreachable;
+        };
+        self.sendRequest(request, loop);
 
         return .disarm;
     }
 
-    fn timerCancelCallback(
+    fn retryCancelCallback(
         userdata: ?*TransactionContext,
         loop: *xev.Loop,
         c: *xev.Completion,
         result: xev.CancelError!void,
     ) xev.CallbackAction {
-        _ = result catch {};
         _ = c;
+        _ = result catch {};
         _ = loop;
 
         const self = userdata.?;
 
-        if (self.timer_completion.state() == .dead and self.write_completion.state() == .dead and self.write_cancel_completion.state() == .dead) {
+        if (self.state() == .dead) {
+            self.callback(self.userdata, self, self.result.?);
+        }
+
+        return .disarm;
+    }
+
+    fn timeoutCallback(
+        userdata: ?*TransactionContext,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        result: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        _ = c;
+        _ = loop;
+
+        const self = userdata.?;
+        _ = result catch {
+            if (self.state() == .dead) {
+                self.callback(self.userdata, self, self.result.?);
+            }
+            return .disarm;
+        };
+
+        log.debug("Transaction {} - Gathering timed out", .{self.transaction_id.?});
+
+        std.debug.assert(self.result == null);
+        self.result = error.Timeout;
+
+        if (self.state() == .dead) {
+            self.callback(self.userdata, self, self.result.?);
+        }
+
+        return .disarm;
+    }
+
+    fn timeoutCancelCallback(
+        userdata: ?*TransactionContext,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        result: xev.CancelError!void,
+    ) xev.CallbackAction {
+        _ = c;
+        _ = result catch {};
+        _ = loop;
+
+        const self = userdata.?;
+
+        if (self.state() == .dead) {
             self.callback(self.userdata, self, self.result.?);
         }
 
@@ -623,22 +704,8 @@ pub const TransactionContext = struct {
     }
 
     fn sendRequest(self: *TransactionContext, request: ztun.Message, loop: *xev.Loop) void {
-        // TODO(Corendos): report correctly
-        //const address = switch (socket_context.address.any.family) {
-        //    std.os.AF.INET => Configuration.stun_address_ipv4,
-        //    std.os.AF.INET6 => Configuration.stun_address_ipv6,
-        //    else => unreachable,
-        //};
-
-        const data = d: {
-            var stream = std.io.fixedBufferStream(self.write_buffer);
-            request.write(stream.writer()) catch unreachable;
-            break :d stream.getWritten();
-        };
-
-        // TODO(Corendos): Report correctly
         self.transaction_id = request.transaction_id;
-        self.write_data.from(self.server_address, data);
+        self.write_data.from(self.server_address.?, self.request_data);
 
         self.write_completion = xev.Completion{
             .op = .{
@@ -834,16 +901,7 @@ const ConnectivityCheckContext = struct {
     agent_id: u32,
     socket_index: u32,
 
-    write_buffer: []u8 = &.{},
-    write_data: WriteData = .{},
-    write_completion: xev.Completion = .{},
-
-    timeout_timer: xev.Timer,
-    timeout_completion: xev.Completion = .{},
-    timeout_cancel_completion: xev.Completion = .{},
-    timeout_occurred: bool = false,
-
-    last_transaction_id: ?u96 = null,
+    transaction_context: TransactionContext,
 
     pair_foundation: CandidatePairFoundation,
 };
@@ -878,7 +936,7 @@ pub const AgentContext = struct {
     remote_candidates: std.ArrayListUnmanaged(Candidate) = .{},
     has_remote_candidates: bool = false,
 
-    buffer_arena_state: ?std.heap.ArenaAllocator = null,
+    buffer_pool: ?std.heap.MemoryPool([4096]u8) = null,
 
     /// Contexts for each bound sockets.
     socket_contexts: []SocketContext = &.{},
@@ -958,11 +1016,11 @@ pub const AgentContext = struct {
         var connectivity_checks_timer = try xev.Timer.init();
         errdefer connectivity_checks_timer.deinit();
 
-        var buffer_arena_state = std.heap.ArenaAllocator.init(allocator);
-        errdefer buffer_arena_state.deinit();
+        var buffer_pool = std.heap.MemoryPool([4096]u8).init(allocator);
+        errdefer buffer_pool.deinit();
 
-        var binding_request_queue_write_buffer = try buffer_arena_state.allocator().alloc(u8, 4096);
-        errdefer buffer_arena_state.allocator().free(binding_request_queue_write_buffer);
+        var binding_request_queue_write_buffer = try buffer_pool.create();
+        errdefer buffer_pool.destroy(binding_request_queue_write_buffer);
 
         const tiebreaker = std.crypto.random.int(u64);
 
@@ -970,7 +1028,7 @@ pub const AgentContext = struct {
             .id = id,
             .allocator = allocator,
             .gathering_main_timer = gathering_main_timer,
-            .buffer_arena_state = buffer_arena_state,
+            .buffer_pool = buffer_pool,
             .check_context_map = CheckContextMap.init(allocator),
             .connectivity_checks_timer = connectivity_checks_timer,
             .binding_request_queue_write_buffer = binding_request_queue_write_buffer,
@@ -987,7 +1045,7 @@ pub const AgentContext = struct {
         self.gathering_main_timer.deinit();
         self.connectivity_checks_timer.deinit();
         self.check_context_map.deinit();
-        if (self.buffer_arena_state) |*s| s.deinit();
+        if (self.buffer_pool) |*buffer_pool| buffer_pool.deinit();
 
         self.allocator.free(self.socket_contexts);
 
@@ -1006,12 +1064,12 @@ pub const AgentContext = struct {
     pub fn initSocketContexts(self: *AgentContext, sockets: []const std.os.fd_t, addresses: []const std.net.Address) !void {
         std.debug.assert(sockets.len == addresses.len);
         const socket_count = sockets.len;
-        const buffer_arena = self.buffer_arena_state.?.allocator();
+        const buffer_pool = &self.buffer_pool.?;
 
         var socket_contexts = try self.allocator.alloc(SocketContext, socket_count);
         errdefer self.allocator.free(socket_contexts);
         for (0..socket_count) |index| {
-            const read_buffer = try buffer_arena.alloc(u8, 4096);
+            const read_buffer = try buffer_pool.create();
             socket_contexts[index] = SocketContext.init(self.id, @intCast(index), sockets[index], addresses[index], read_buffer);
         }
 
@@ -1020,7 +1078,7 @@ pub const AgentContext = struct {
 
     pub fn initGathering(self: *AgentContext) !void {
         const socket_count = self.socket_contexts.len;
-        const buffer_arena = self.buffer_arena_state.?.allocator();
+        const buffer_pool = &self.buffer_pool.?;
 
         var gathering_candidate_statuses = try self.allocator.alloc(CandidateGatheringStatus, socket_count);
         errdefer self.allocator.free(gathering_candidate_statuses);
@@ -1031,8 +1089,11 @@ pub const AgentContext = struct {
         errdefer for (transaction_context_list.items) |*ctx| ctx.deinit();
 
         for (0..socket_count) |index| {
-            const write_buffer = try buffer_arena.alloc(u8, 4096);
-            transaction_context_list.appendAssumeCapacity(try TransactionContext.init(self.id, @intCast(index), @intCast(index), write_buffer, Configuration.computeRtoMs(socket_count)));
+            const write_buffer = try buffer_pool.create();
+            const result_storage = try buffer_pool.create();
+            const socket_context = &self.socket_contexts[index];
+
+            transaction_context_list.appendAssumeCapacity(try TransactionContext.init(self.id, @intCast(index), socket_context, write_buffer, result_storage));
         }
 
         self.gathering_candidate_statuses = gathering_candidate_statuses;
@@ -1045,7 +1106,7 @@ pub const AgentContext = struct {
 
     inline fn getTransactionContextFrom(self: *AgentContext, socket_context: *const SocketContext) ?*TransactionContext {
         return for (self.gathering_transaction_contexts) |*ctx| {
-            if (ctx.socket_index == socket_context.index) break ctx;
+            if (ctx.socket_context == socket_context) break ctx;
         } else null;
     }
 
@@ -1063,7 +1124,7 @@ pub const AgentContext = struct {
     inline fn getConnectivityCheckContextFromTransactionId(self: *AgentContext, transaction_id: u96) ?*ConnectivityCheckContext {
         var it = self.check_context_map.iterator();
         return while (it.next()) |entry| {
-            if (entry.value_ptr.last_transaction_id == transaction_id) break entry.value_ptr;
+            if (entry.value_ptr.transaction_context.transaction_id == transaction_id) break entry.value_ptr;
         } else null;
     }
 
@@ -1071,7 +1132,7 @@ pub const AgentContext = struct {
     fn isGatheringDone(self: *const AgentContext) bool {
         return self.gathering_main_timer_completion.state() == .dead and for (self.gathering_transaction_contexts, 0..) |*ctx, i| {
             const status = self.gathering_candidate_statuses[i];
-            if (!ctx.isDone() or (status != .done and status != .failed)) break false;
+            if (ctx.state() != .dead or (status != .done and status != .failed)) break false;
         } else true;
     }
 
@@ -1171,16 +1232,24 @@ pub const AgentContext = struct {
             }
         }).greaterThan);
 
+        const buffer_pool = &self.buffer_pool.?;
+
         for (self.checklist.pairs.items) |pair| {
             const pair_foundation = self.computePairFoundation(pair);
             const gop = try self.check_context_map.getOrPut(pair_foundation);
             if (!gop.found_existing) {
                 const local_candidate_entry: CandidateEntry = self.local_candidates.items[pair.local_candidate_index];
+                const transaction_context = try TransactionContext.init(
+                    self.id,
+                    0,
+                    &self.socket_contexts[local_candidate_entry.socket_index],
+                    try buffer_pool.create(),
+                    try buffer_pool.create(),
+                );
                 gop.value_ptr.* = ConnectivityCheckContext{
                     .agent_id = self.id,
                     .socket_index = @intCast(local_candidate_entry.socket_index),
-                    .write_buffer = try self.buffer_arena_state.?.allocator().alloc(u8, 4096),
-                    .timeout_timer = try xev.Timer.init(),
+                    .transaction_context = transaction_context,
                     .pair_foundation = pair_foundation,
                 };
             }
@@ -1432,23 +1501,20 @@ pub const Completion = struct {
 /// Represents an event that can happen while gathering candidates.
 const GatheringEventResult = union(enum) {
     /// A STUN response was received and it's the payload.
-    read: struct { socket_context_index: usize, message: ztun.Message },
-    /// A STUN message was sent and the payload contains the result.
-    write: struct { transaction_context_index: usize, result: xev.WriteError!usize },
-    /// The retry timer fired and the payload contains the result.
-    retry_timer: struct { transaction_context_index: usize, result: xev.Timer.RunError!void },
-    /// The retry timer was cancelled and the payload contains the result.
-    cancel_retry_timer: struct { transaction_context_index: usize, result: xev.CancelError!void },
+    read: struct { socket_context_index: usize, raw_message: []const u8 },
+    /// A STUN transaction completed.
+    completed: struct { transaction_context_index: usize, result: TransactionResult },
     /// The main timer fired and the payload contains the result.
     main_timer: xev.Timer.RunError!void,
 };
 
 const ConnectivityCheckEventResult = union(enum) {
-    request_read: struct { socket_context_index: usize, message: ztun.Message, address: std.net.Address },
-    response_read: struct { socket_context_index: usize, message: ztun.Message, address: std.net.Address },
-    request_write: struct { check_context: *ConnectivityCheckContext, result: xev.WriteError!usize },
+    request_read: struct { socket_context_index: usize, raw_message: []const u8, address: std.net.Address },
+    response_read: struct { socket_context_index: usize, raw_message: []const u8, address: std.net.Address },
+    completed: struct { check_context: *ConnectivityCheckContext, result: TransactionResult },
+    //request_write: struct { check_context: *ConnectivityCheckContext, result: xev.WriteError!usize },
     response_write: struct { socket_context_index: usize, result: xev.WriteError!usize },
-    response_timeout: struct { check_context: *ConnectivityCheckContext },
+    //response_timeout: struct { check_context: *ConnectivityCheckContext },
     main_timer: xev.Timer.RunError!void,
 };
 
@@ -1801,7 +1867,7 @@ pub const Context = struct {
         return .rearm;
     }
 
-    /// Single entrypoint for all gathering related events (STUN message received/sent, retry timer fired, etc).
+    /// Single entrypoint for all gathering related events (STUN message received, transaction completed or main timer fired).
     /// The rationale to have a single function instead of multiple callback is that it makes it easier to know exactly when the gathering is done.
     fn handleGatheringEvent(
         self: *Context,
@@ -1811,23 +1877,17 @@ pub const Context = struct {
         std.debug.assert(agent_context.gathering_state != .done);
 
         switch (result) {
-            .write => |r| {
-                const transaction_context = &agent_context.gathering_transaction_contexts[r.transaction_context_index];
-                const socket_context = &agent_context.socket_contexts[transaction_context.socket_index];
-                self.handleStunMessageWrite(agent_context, socket_context, transaction_context, r.result);
-            },
             .read => |r| {
                 const socket_context = &agent_context.socket_contexts[r.socket_context_index];
                 const transaction_context = agent_context.getTransactionContextFrom(socket_context).?;
-                self.handleStunMessageRead(agent_context, socket_context, transaction_context, r.message);
+                self.handleGatheringResponseRead(agent_context, socket_context, transaction_context, r.raw_message) catch @panic("TODO");
             },
-            .retry_timer => |r| {
+            .completed => |r| {
                 const transaction_context = &agent_context.gathering_transaction_contexts[r.transaction_context_index];
-                const socket_context = &agent_context.socket_contexts[transaction_context.socket_index];
-                self.handleRetryTimer(agent_context, socket_context, transaction_context, r.result);
+                const socket_context = transaction_context.socket_context;
+                self.handleGatheringTransactionCompleted(agent_context, socket_context, transaction_context, r.result);
             },
-            .cancel_retry_timer => {},
-            .main_timer => |r| self.handleMainTimer(agent_context, r),
+            .main_timer => |r| self.handleGatheringMainTimer(agent_context, r),
         }
 
         if (!agent_context.isGatheringDone()) return;
@@ -1844,55 +1904,34 @@ pub const Context = struct {
         }
     }
 
-    fn handleStunMessageWrite(
+    fn handleGatheringResponseRead(
         self: *Context,
         agent_context: *AgentContext,
         socket_context: *SocketContext,
         transaction_context: *TransactionContext,
-        result: xev.WriteError!usize,
-    ) void {
-        _ = result catch |err| {
-            log.err("Agent {} - Got {} when sending STUN request from base address \"{}\"", .{ agent_context.id, err, socket_context.address });
-            agent_context.gathering_candidate_statuses[transaction_context.index] = .failed;
-            return;
-        };
-
-        transaction_context.request_sent_count += 1;
-        log.debug("Agent {} - STUN request sent for base address \"{}\"", .{ agent_context.id, socket_context.address });
-
-        const is_first_request = transaction_context.request_sent_count == 1;
-        transaction_context.timer_timeout_ms = if (is_first_request) transaction_context.rto else transaction_context.timer_timeout_ms * 2;
-
-        const is_last_request = transaction_context.request_sent_count == Configuration.request_count;
-        if (is_last_request) {
-            transaction_context.timer_timeout_ms = transaction_context.rto * Configuration.last_request_factor;
-            transaction_context.is_retry_timer = false;
-        }
-
-        transaction_context.timer.run(
-            self.loop,
-            &transaction_context.timer_completion,
-            transaction_context.timer_timeout_ms,
-            Context,
-            self,
-            timerCallback,
-        );
-    }
-
-    fn handleStunMessageRead(
-        self: *Context,
-        agent_context: *AgentContext,
-        socket_context: *SocketContext,
-        transaction_context: *TransactionContext,
-        message: ztun.Message,
-    ) void {
+        raw_message: []const u8,
+    ) !void {
         if (agent_context.gathering_candidate_statuses[transaction_context.index] != .checking) return;
         log.debug("Agent {} - Received STUN response for base address \"{}\"", .{ agent_context.id, socket_context.address });
 
-        agent_context.gathering_candidate_statuses[transaction_context.index] = .done;
-        log.debug("Agent {} - Gathering done for base address \"{}\"", .{ agent_context.id, socket_context.address });
+        transaction_context.readCallback(self.loop, raw_message, undefined);
+    }
 
-        if (getMappedAddressFromStunMessage(message)) |transport_address| {
+    fn handleGatheringTransactionCompleted(
+        self: *Context,
+        agent_context: *AgentContext,
+        socket_context: *SocketContext,
+        transaction_context: *TransactionContext,
+        result: TransactionResult,
+    ) void {
+        _ = self;
+        const payload = result catch |err| {
+            agent_context.gathering_candidate_statuses[transaction_context.index] = .failed;
+            log.debug("Agent {} - Gathering failed with {} for base address \"{}\"", .{ agent_context.id, err, socket_context.address });
+            return;
+        };
+
+        if (getMappedAddressFromStunMessage(payload.message)) |transport_address| {
             const candidate = Candidate{
                 .type = .server_reflexive,
                 .transport_address = transport_address,
@@ -1904,40 +1943,11 @@ pub const Context = struct {
             agent_context.on_candidate_callback(agent_context.userdata, agent_context.id, .{ .candidate = candidate });
         }
 
-        transaction_context.timer.cancel(
-            self.loop,
-            &transaction_context.timer_completion,
-            &transaction_context.timer_cancel_completion,
-            Context,
-            self,
-            timerCancelCallback,
-        );
+        agent_context.gathering_candidate_statuses[transaction_context.index] = .done;
+        log.debug("Agent {} - Gathering done for base address \"{}\"", .{ agent_context.id, socket_context.address });
     }
 
-    fn handleRetryTimer(
-        self: *Context,
-        agent_context: *AgentContext,
-        socket_context: *SocketContext,
-        transaction_context: *TransactionContext,
-        result: xev.Timer.RunError!void,
-    ) void {
-        _ = result catch return;
-
-        if (transaction_context.is_retry_timer) {
-            log.debug("Agent {} - STUN request {}/{} from base address \"{}\" timed out", .{ agent_context.id, transaction_context.request_sent_count, Configuration.request_count, socket_context.address });
-            var buffer: [4096]u8 = undefined;
-            const request = r: {
-                var allocator = std.heap.FixedBufferAllocator.init(&buffer);
-                break :r makeBasicBindingRequest(allocator.allocator()) catch unreachable;
-            };
-            self.sendRequestToStunServer(request, socket_context, transaction_context);
-        } else {
-            log.debug("Agent {} - Gathering timed out for base address \"{}\"", .{ agent_context.id, socket_context.address });
-            agent_context.gathering_candidate_statuses[transaction_context.index] = .failed;
-        }
-    }
-
-    fn handleMainTimer(self: *Context, agent_context: *AgentContext, result: xev.Timer.RunError!void) void {
+    fn handleGatheringMainTimer(self: *Context, agent_context: *AgentContext, result: xev.Timer.RunError!void) void {
         _ = result catch |err| {
             log.err("{}", .{err});
             @panic("TODO");
@@ -1947,7 +1957,7 @@ pub const Context = struct {
         const transaction_context_index = agent_context.getUncheckedCandidate() orelse return;
 
         const transaction_context = &agent_context.gathering_transaction_contexts[transaction_context_index];
-        const socket_context = &agent_context.socket_contexts[transaction_context.socket_index];
+        const socket_context = transaction_context.socket_context;
 
         // Set the candidate in the .checking state
         agent_context.gathering_candidate_statuses[transaction_context_index] = .checking;
@@ -1977,13 +1987,25 @@ pub const Context = struct {
         };
         self.loop.add(&socket_context.read_completion);
 
-        log.debug("Agent {} - Sending message for base address \"{}\"", .{ agent_context.id, socket_context.address });
+        log.debug("Agent {} - Starting transaction for base address \"{}\"", .{ agent_context.id, socket_context.address });
+        transaction_context.userdata = self;
+        transaction_context.callback = gatheringTransactionCompleteCallback;
+        const address = switch (socket_context.address.any.family) {
+            std.os.AF.INET => Configuration.stun_address_ipv4,
+            std.os.AF.INET6 => Configuration.stun_address_ipv6,
+            else => unreachable,
+        };
         var buffer: [4096]u8 = undefined;
         const request = r: {
             var allocator = std.heap.FixedBufferAllocator.init(&buffer);
-            break :r makeBasicBindingRequest(allocator.allocator()) catch unreachable;
+            break :r makeBasicBindingRequest(allocator.allocator(), null) catch unreachable;
         };
-        self.sendRequestToStunServer(request, socket_context, transaction_context);
+        transaction_context.start(
+            request,
+            address,
+            Configuration.computeRtoMs(agent_context.gathering_transaction_contexts.len),
+            self.loop,
+        );
 
         // NOTE(Corendos): Small improvement could be done here. If we now that there won't be any new candidates the next time we go through this function,
         //                 we could avoid one main timer delay.
@@ -2002,15 +2024,7 @@ pub const Context = struct {
         switch (result) {
             .request_read => |payload| {
                 const socket_context = &agent_context.socket_contexts[payload.socket_context_index];
-                self.handleConnectivityCheckRequestRead(payload.message, payload.address, agent_context, socket_context) catch @panic("TODO");
-            },
-            .response_read => |payload| {
-                const socket_context = &agent_context.socket_contexts[payload.socket_context_index];
-                self.handleConnectivityCheckResponseRead(payload.message, payload.address, agent_context, socket_context) catch @panic("TODO");
-            },
-            .request_write => |payload| {
-                const socket_context = &agent_context.socket_contexts[payload.check_context.socket_index];
-                self.handleConnectivityCheckRequestWrite(agent_context, socket_context, payload.check_context, payload.result) catch @panic("TODO");
+                self.handleConnectivityCheckRequestRead(payload.raw_message, payload.address, agent_context, socket_context) catch @panic("TODO");
             },
             .response_write => {
                 log.debug("Agent {} - Stun response sent !", .{agent_context.id});
@@ -2021,8 +2035,13 @@ pub const Context = struct {
                     log.debug("Agent {} - Done sending queued response...", .{agent_context.id});
                 }
             },
-            .response_timeout => |payload| {
-                self.handleConnectivityCheckResponseTimeout(agent_context, payload.check_context) catch @panic("TODO");
+            .response_read => |payload| {
+                const socket_context = &agent_context.socket_contexts[payload.socket_context_index];
+                self.handleConnectivityCheckResponseRead(payload.raw_message, payload.address, agent_context, socket_context) catch @panic("TODO");
+            },
+            .completed => |payload| {
+                const socket_context = &agent_context.socket_contexts[payload.check_context.socket_index];
+                self.handleConnectivityCheckTransactionCompleted(agent_context, socket_context, payload.check_context, payload.result) catch @panic("TODO");
             },
             .main_timer => {
                 self.handleConnectivityCheckMainTimer(agent_context) catch @panic("TODO");
@@ -2030,20 +2049,6 @@ pub const Context = struct {
         }
 
         agent_context.printPairStates();
-    }
-
-    fn tryDecodeStunMessage(allocator: std.mem.Allocator, data: []const u8) ?ztun.Message {
-        var stream = std.io.fixedBufferStream(data);
-        return ztun.Message.readAlloc(stream.reader(), allocator) catch return null;
-    }
-
-    inline fn isAgentStunResponse(message: ztun.Message) bool {
-        return for (message.attributes) |a| {
-            switch (a.type) {
-                ztun.attr.Type.ice_controlled, ztun.attr.Type.ice_controlling => break true,
-                else => {},
-            }
-        } else false;
     }
 
     fn readCallback(
@@ -2065,89 +2070,49 @@ pub const Context = struct {
         };
 
         const data = socket_context.read_buffer[0..bytes_read];
-
-        var buffer: [4096]u8 = undefined;
-        var allocator_state = std.heap.FixedBufferAllocator.init(&buffer);
-        var allocator = allocator_state.allocator();
-
         const source = socket_context.read_data.address;
-        if (tryDecodeStunMessage(allocator, data)) |stun_message| {
-            defer stun_message.deinit(allocator);
 
-            switch (stun_message.type.class) {
+        const stun_header_result = b: {
+            var stream = std.io.fixedBufferStream(data);
+            var reader = stream.reader();
+            break :b ztun.Message.readHeader(reader);
+        };
+
+        if (stun_header_result) |stun_header| {
+            switch (stun_header.type.class) {
                 .success_response => {
                     const is_gathering_response = for (agent_context.gathering_transaction_contexts) |ctx| {
-                        if (stun_message.transaction_id == ctx.transaction_id) break true;
+                        if (stun_header.transaction_id == ctx.transaction_id) break true;
                     } else false;
 
                     if (is_gathering_response) {
-                        self.handleGatheringEvent(agent_context, .{ .read = .{ .socket_context_index = socket_context_index, .message = stun_message } });
+                        self.handleGatheringEvent(agent_context, .{ .read = .{ .socket_context_index = socket_context_index, .raw_message = data } });
                     } else {
-                        self.handleConnectivityCheckEvent(agent_context, .{ .response_read = .{ .socket_context_index = socket_context_index, .message = stun_message, .address = source } });
+                        self.handleConnectivityCheckEvent(agent_context, .{ .response_read = .{ .socket_context_index = socket_context_index, .raw_message = data, .address = source } });
                     }
                 },
                 .request => {
-                    self.handleConnectivityCheckEvent(agent_context, .{ .request_read = .{ .socket_context_index = socket_context_index, .message = stun_message, .address = source } });
+                    self.handleConnectivityCheckEvent(agent_context, .{ .request_read = .{ .socket_context_index = socket_context_index, .raw_message = data, .address = source } });
                 },
                 else => unreachable,
             }
-        } else {
-            // TODO(Corendos): handle other type of messages
-            @panic("TODO: Received message that is not a STUN message");
-        }
+            return .rearm;
+        } else |_| {}
 
-        return .rearm;
+        // TODO(Corendos): handle other type of messages
+        @panic("TODO: Received message that is not a STUN message");
+
+        //return .rearm;
     }
 
-    fn stunWriteCallback(
-        userdata: ?*anyopaque,
-        loop: *xev.Loop,
-        c: *xev.Completion,
-        result: xev.Result,
-    ) xev.CallbackAction {
-        _ = loop;
+    fn gatheringTransactionCompleteCallback(userdata: ?*anyopaque, transaction_context: *TransactionContext, result: TransactionResult) void {
         const self = @as(*Context, @ptrCast(@alignCast(userdata.?)));
-        const transaction_context = @fieldParentPtr(TransactionContext, "write_completion", c);
         const transaction_context_index = transaction_context.index;
         const agent_context = self.agent_map.get(transaction_context.agent_id).?;
 
-        self.handleGatheringEvent(agent_context, .{ .write = .{ .transaction_context_index = transaction_context_index, .result = result.sendmsg } });
+        log.debug("Transaction state: {}", .{transaction_context.state()});
 
-        return .disarm;
-    }
-
-    fn timerCallback(
-        userdata: ?*Context,
-        loop: *xev.Loop,
-        c: *xev.Completion,
-        result: xev.Timer.RunError!void,
-    ) xev.CallbackAction {
-        _ = loop;
-        const self = userdata.?;
-        const transaction_context = @fieldParentPtr(TransactionContext, "timer_completion", c);
-        const transaction_context_index = transaction_context.index;
-        const agent_context = self.agent_map.get(transaction_context.agent_id).?;
-
-        self.handleGatheringEvent(agent_context, .{ .retry_timer = .{ .transaction_context_index = transaction_context_index, .result = result } });
-
-        return .disarm;
-    }
-
-    fn timerCancelCallback(
-        userdata: ?*Context,
-        loop: *xev.Loop,
-        c: *xev.Completion,
-        result: xev.CancelError!void,
-    ) xev.CallbackAction {
-        _ = loop;
-        const self = userdata.?;
-        const transaction_context = @fieldParentPtr(TransactionContext, "timer_cancel_completion", c);
-        const transaction_context_index = transaction_context.index;
-        const agent_context = self.agent_map.get(transaction_context.agent_id).?;
-
-        self.handleGatheringEvent(agent_context, .{ .cancel_retry_timer = .{ .transaction_context_index = transaction_context_index, .result = result } });
-
-        return .disarm;
+        self.handleGatheringEvent(agent_context, .{ .completed = .{ .transaction_context_index = transaction_context_index, .result = result } });
     }
 
     fn mainTimerCallback(
@@ -2242,50 +2207,36 @@ pub const Context = struct {
         return .disarm;
     }
 
-    fn connectivityCheckTimeoutCallback(
-        userdata: ?*Context,
-        loop: *xev.Loop,
-        c: *xev.Completion,
-        result: xev.Timer.RunError!void,
-    ) xev.CallbackAction {
-        _ = loop;
-
-        const self = userdata.?;
-        const check_context = @fieldParentPtr(ConnectivityCheckContext, "timeout_completion", c);
+    fn connectivityCheckTransactionCompletedCallback(
+        userdata: ?*anyopaque,
+        transaction_context: *TransactionContext,
+        result: TransactionResult,
+    ) void {
+        const self = @as(*Context, @ptrCast(@alignCast(userdata.?)));
+        const check_context = @fieldParentPtr(ConnectivityCheckContext, "transaction_context", transaction_context);
         const agent_context = self.agent_map.get(check_context.agent_id).?;
 
-        check_context.timeout_occurred = if (result) true else |_| false;
-
-        if (check_context.timeout_completion.state() == .dead and check_context.timeout_cancel_completion.state() == .dead and check_context.timeout_occurred) {
-            self.handleConnectivityCheckEvent(agent_context, .{ .response_timeout = .{ .check_context = check_context } });
-        }
-
-        return .disarm;
+        self.handleConnectivityCheckEvent(agent_context, .{ .completed = .{ .check_context = check_context, .result = result } });
     }
 
-    fn connectivityCheckTimeoutCancelCallback(
-        userdata: ?*Context,
-        loop: *xev.Loop,
-        c: *xev.Completion,
-        result: xev.CancelError!void,
-    ) xev.CallbackAction {
-        _ = result catch {};
-        _ = loop;
+    fn checkMessageIntegrity(request: ztun.Message, password: []const u8) !void {
+        var buffer: [4096]u8 = undefined;
+        var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
+        if (!request.checkFingerprint(arena_state.allocator())) return error.InvalidFingerprint;
 
-        const self = userdata.?;
-        const check_context = @fieldParentPtr(ConnectivityCheckContext, "timeout_cancel_completion", c);
-        const agent_context = self.agent_map.get(check_context.agent_id).?;
+        const attribute_index = for (request.attributes, 0..) |a, i| {
+            if (a.type == ztun.attr.Type.message_integrity) break i;
+        } else return error.NoMessageIntegrity;
 
-        if (check_context.timeout_completion.state() == .dead and check_context.timeout_cancel_completion.state() == .dead and check_context.timeout_occurred) {
-            self.handleConnectivityCheckEvent(agent_context, .{ .response_timeout = .{ .check_context = check_context } });
-        }
+        const authentication = ztun.auth.Authentication{ .short_term = ztun.auth.ShortTermAuthentication{ .password = password } };
+        const key = try authentication.computeKeyAlloc(arena_state.allocator());
 
-        return .disarm;
+        if (!try request.checkMessageIntegrity(.classic, attribute_index, key, arena_state.allocator())) return error.InvalidMessageIntegrity;
     }
 
     fn handleConnectivityCheckRequestRead(
         self: *Context,
-        request: ztun.Message,
+        raw_message: []const u8,
         source: std.net.Address,
         agent_context: *AgentContext,
         socket_context: *SocketContext,
@@ -2296,22 +2247,19 @@ pub const Context = struct {
         //                 See https://www.rfc-editor.org/rfc/rfc8445#section-7.3.1.3
 
         var buffer: [4096]u8 = undefined;
-        // Check fingerprint/integrity
-        {
+        const request = r: {
             var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
-            if (!request.checkFingerprint(arena_state.allocator())) return error.InvalidFingerprint;
+            var stream = std.io.fixedBufferStream(raw_message);
+            break :r try ztun.Message.readAlloc(stream.reader(), arena_state.allocator());
+        };
 
-            const attribute_index = for (request.attributes, 0..) |a, i| {
-                if (a.type == ztun.attr.Type.message_integrity) break i;
-            } else return error.NoMessageIntegrity;
+        // Check fingerprint/integrity.
+        try checkMessageIntegrity(request, &agent_context.password);
 
-            const key = try (ztun.auth.Authentication{ .short_term = ztun.auth.ShortTermAuthentication{ .password = &agent_context.password } }).computeKeyAlloc(arena_state.allocator());
-
-            if (!try request.checkMessageIntegrity(.classic, attribute_index, key, arena_state.allocator())) return error.InvalidMessageIntegrity;
-        }
-
+        // Enqueue response.
         agent_context.pushResponseFromRequest(request, source) catch unreachable;
 
+        // Handle response sending if required.
         if (agent_context.binding_request_queue_write_completion.state() != .active) {
             const value = agent_context.popResponse();
 
@@ -2338,52 +2286,32 @@ pub const Context = struct {
         }
     }
 
-    fn handleConnectivityCheckRequestWrite(
+    fn handleConnectivityCheckTransactionCompleted(
         self: *Context,
         agent_context: *AgentContext,
         socket_context: *SocketContext,
         check_context: *ConnectivityCheckContext,
-        result: xev.WriteError!usize,
+        result: TransactionResult,
     ) !void {
         _ = socket_context;
-        const pair_index = agent_context.getPairIndexFrom(check_context.pair_foundation).?;
-        if (result) |_| {
-            check_context.timeout_timer.run(self.loop, &check_context.timeout_completion, 500, Context, self, connectivityCheckTimeoutCallback);
-        } else |_| {
-            agent_context.checklist.setPairState(pair_index, .failed);
-        }
-    }
-
-    fn handleConnectivityCheckResponseRead(
-        self: *Context,
-        response: ztun.Message,
-        source: std.net.Address,
-        agent_context: *AgentContext,
-        socket_context: *SocketContext,
-    ) !void {
-        _ = socket_context;
-
-        log.debug("Agent {} - Received response from other peer", .{agent_context.id});
-        const check_context = agent_context.getConnectivityCheckContextFromTransactionId(response.transaction_id) orelse @panic("TODO");
-
-        check_context.timeout_timer.cancel(self.loop, &check_context.timeout_completion, &check_context.timeout_cancel_completion, Context, self, connectivityCheckTimeoutCancelCallback);
 
         const pair_index = agent_context.getPairIndexFrom(check_context.pair_foundation) orelse @panic("TODO");
         const pair = &agent_context.checklist.pairs.items[pair_index];
 
-        if (pair.state != .in_progress) {
-            log.debug("Agent {} - Pair is not in the in_progress state anymore", .{agent_context.id});
+        const payload = result catch |err| {
+            log.debug("Agent {} - Check failed for Candidate pair ({}:{}) with {}", .{ agent_context.id, pair.local_candidate_index, pair.remote_candidate_index, err });
+            agent_context.checklist.setPairState(pair_index, .failed);
             return;
-        }
+        };
 
         const local_candidate = agent_context.local_candidates.items[pair.local_candidate_index].candidate;
         const remote_candidate = agent_context.remote_candidates.items[pair.remote_candidate_index];
 
         // TODO(Corendos): Discover peer-reflexive candidates.
-        const response_address = getMappedAddressFromStunMessage(response) orelse @panic("TODO");
+        const response_address = getMappedAddressFromStunMessage(payload.message) orelse @panic("TODO");
 
         // NOTE(Corendos): handle https://www.rfc-editor.org/rfc/rfc8445#section-7.2.5.2.1.
-        const response_source = source;
+        const response_source = payload.source;
         const request_destination = remote_candidate.transport_address;
         const response_destination = response_address;
         const request_source = local_candidate.transport_address;
@@ -2409,20 +2337,31 @@ pub const Context = struct {
         }
     }
 
-    fn handleConnectivityCheckResponseTimeout(
+    fn handleConnectivityCheckResponseRead(
         self: *Context,
+        raw_message: []const u8,
+        source: std.net.Address,
         agent_context: *AgentContext,
-        check_context: *ConnectivityCheckContext,
+        socket_context: *SocketContext,
     ) !void {
-        _ = self;
-        log.debug("Agent {} - Response timeout", .{agent_context.id});
+        _ = socket_context;
+        var stream = std.io.fixedBufferStream(raw_message);
+
+        const message_header = ztun.Message.readHeader(stream.reader()) catch unreachable;
+        stream.reset();
+
+        log.debug("Agent {} - Received response from other peer", .{agent_context.id});
+        const check_context = agent_context.getConnectivityCheckContextFromTransactionId(message_header.transaction_id) orelse @panic("TODO");
 
         const pair_index = agent_context.getPairIndexFrom(check_context.pair_foundation) orelse @panic("TODO");
-        agent_context.checklist.setPairState(pair_index, .failed);
-
         const pair = &agent_context.checklist.pairs.items[pair_index];
 
-        log.debug("Agent {} - Candidate pair ({}:{}) state: {s}", .{ agent_context.id, pair.local_candidate_index, pair.remote_candidate_index, @tagName(pair.state) });
+        if (pair.state != .in_progress) {
+            log.debug("Agent {} - Pair is not in the in_progress state anymore", .{agent_context.id});
+            return;
+        }
+
+        check_context.transaction_context.readCallback(self.loop, raw_message, source);
     }
 
     fn handleConnectivityCheckMainTimer(self: *Context, agent_context: *AgentContext) !void {
@@ -2463,10 +2402,13 @@ pub const Context = struct {
 
             // TODO(Corendos): We should find a way to get to associated socket easily.
             const local_check_context = agent_context.check_context_map.getPtr(agent_context.computePairFoundation(candidate_pair.*)) orelse unreachable;
+            std.debug.assert(local_check_context.transaction_context.state() == .dead);
             const local_socket_context = &agent_context.socket_contexts[local_check_context.socket_index];
 
             log.debug("Agent {} - Sending Binding request from \"{}\" to \"{}\"", .{ agent_context.id, local_socket_context.address, remote_candidate.transport_address });
-            self.sendRequestToRemoteAgent(request, local_check_context, local_socket_context, remote_candidate.transport_address);
+            local_check_context.transaction_context.userdata = self;
+            local_check_context.transaction_context.callback = connectivityCheckTransactionCompletedCallback;
+            local_check_context.transaction_context.start(request, remote_candidate.transport_address, 500, self.loop);
 
             agent_context.checklist.setPairState(candidate_pair_index, .in_progress);
 
@@ -2481,6 +2423,12 @@ pub const Context = struct {
         }
     }
 };
+
+test "Basic structs size" {
+    try std.testing.expectEqual(@as(usize, 1520), @sizeOf(TransactionContext));
+    try std.testing.expectEqual(@as(usize, 480), @sizeOf(SocketContext));
+    try std.testing.expectEqual(@as(usize, 272952), @sizeOf(AgentContext));
+}
 
 test {
     _ = Worker;
