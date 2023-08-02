@@ -66,7 +66,7 @@ const StopHandler = struct {
 pub fn candidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
     _ = userdata;
     if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation().as_number(), result.candidate.transport_address });
+        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.as_number(), result.candidate.transport_address });
     }
 }
 

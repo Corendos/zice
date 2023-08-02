@@ -9,7 +9,7 @@ const zice = @import("zice");
 pub const std_options = struct {
     pub const log_scope_levels = &.{
         //std.log.ScopeLevel{ .scope = .default, .level = .info },
-        std.log.ScopeLevel{ .scope = .zice, .level = .debug },
+        //std.log.ScopeLevel{ .scope = .zice, .level = .debug },
     };
 };
 
@@ -66,7 +66,7 @@ const StopHandler = struct {
 pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
     if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation().as_number(), result.candidate.transport_address });
+        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.as_number(), result.candidate.transport_address });
         context.controlling_agent_candidates.append(result.candidate) catch unreachable;
     }
 }
@@ -84,7 +84,7 @@ pub fn controllingStateChangeCallback(userdata: ?*anyopaque, agent_index: u32, s
 pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
     if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation().as_number(), result.candidate.transport_address });
+        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.as_number(), result.candidate.transport_address });
         context.controlled_agent_candidates.append(result.candidate) catch unreachable;
     }
 }

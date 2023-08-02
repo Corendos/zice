@@ -86,49 +86,26 @@ pub const Candidate = struct {
     transport_address: std.net.Address,
     /// The candidate base address.
     base_address: std.net.Address,
-    /// The base address id (used to compute foundation).
-    base_address_id: u8,
-    /// The protocol used by the candidate.
-    protocol: Protocol,
-    /// The candidate local preference.
-    local_preference: u16 = 0,
+    /// The candidate priority.
+    priority: u32 = 0,
+    /// The candidate foundation.
+    foundation: Foundation = undefined,
     /// The component ID associated to the candidate.
     component_id: u8 = 1,
 
     // TODO(Corendos): multiple component ID support
-
-    /// Compute the candidate Foundation.
-    pub inline fn foundation(self: Candidate) Foundation {
-        return Foundation{ .address_index = self.base_address_id, .type = self.type, .protocol = self.protocol };
-    }
-
-    /// Compute the candidate priority according to https://www.rfc-editor.org/rfc/rfc8445#section-5.1.2.1
-    pub inline fn priority(self: Candidate) u32 {
-        const type_preference: u32 = self.type.preference();
-        const local_preference: u32 = self.local_preference;
-        const component_id: u32 = self.component_id;
-        return (type_preference << 24) + (local_preference << 8) + (256 - component_id);
-    }
 };
 
-test "candidate priority" {
-    const candidate_1 = Candidate{
-        .type = .host,
-        .transport_address = undefined,
-        .base_address = undefined,
-        .base_address_id = undefined,
-        .protocol = undefined,
-    };
-    const candidate_2 = Candidate{
-        .type = .server_reflexive,
-        .transport_address = undefined,
-        .base_address = undefined,
-        .base_address_id = undefined,
-        .protocol = undefined,
-    };
+inline fn computePriority(type_preference: u32, local_preference: u32, component_id: u8) u32 {
+    return (type_preference << 24) + (local_preference << 8) + (256 - @as(u32, component_id));
+}
 
-    try std.testing.expectEqual(@as(u32, 0x7E_0000_FF), candidate_1.priority());
-    try std.testing.expectEqual(@as(u32, 0x64_0000_FF), candidate_2.priority());
+test "candidate priority" {
+    const priority1 = computePriority(CandidateType.host.preference(), 0, 1);
+    const priority2 = computePriority(CandidateType.server_reflexive.preference(), 0, 1);
+
+    try std.testing.expectEqual(@as(u32, 0x7E_0000_FF), priority1);
+    try std.testing.expectEqual(@as(u32, 0x64_0000_FF), priority2);
 }
 
 /// ICE protocol configuration.
@@ -142,7 +119,7 @@ pub const Configuration = struct {
     /// Represents the limit for candidate pairs within a checklist set.
     pub const candidate_pair_limit = 10;
 
-    //const stun_address_ipv4 = std.net.Address.parseIp4("91.134.140.104", 3478) catch unreachable;
+    //const stun_address_ipv4 = std.net.Address.parseIp4("91.134.140.104", 3479) catch unreachable;
     const stun_address_ipv4 = std.net.Address.parseIp4("172.253.120.127", 19302) catch unreachable;
     const stun_address_ipv6 = std.net.Address.parseIp6("2a00:1450:400c:c00::7f", 19302) catch unreachable;
 
@@ -415,6 +392,7 @@ pub const TransactionContext = struct {
 
     flags: packed struct {
         canceled: bool = false,
+        no_retransmits: bool = false,
     } = .{},
 
     userdata: ?*anyopaque = null,
@@ -457,7 +435,7 @@ pub const TransactionContext = struct {
             break :d stream.getWritten();
         };
 
-        log.debug("Transaction {} - Sending request", .{self.transaction_id.?});
+        log.debug("Transaction {x:12} - Sending request", .{self.transaction_id.?});
         self.sendRequest(request, loop);
     }
 
@@ -469,8 +447,23 @@ pub const TransactionContext = struct {
         self.flags.canceled = true;
     }
 
+    pub fn stopRetransmits(self: *TransactionContext, loop: *xev.Loop) void {
+        self.cancelRetry(loop);
+        self.flags.no_retransmits = true;
+    }
+
+    pub fn forceRetransmit(self: *TransactionContext, loop: *xev.Loop) void {
+        if (self.write_completion.state() == .active) return;
+        var buffer: [4096]u8 = undefined;
+        const request = r: {
+            var allocator = std.heap.FixedBufferAllocator.init(&buffer);
+            break :r makeBasicBindingRequest(allocator.allocator(), self.transaction_id.?) catch unreachable;
+        };
+        self.sendRequest(request, loop);
+    }
+
     pub fn readCallback(self: *TransactionContext, loop: *xev.Loop, raw_message: []const u8, source: std.net.Address) void {
-        log.debug("Transaction {} - Received STUN response", .{self.transaction_id.?});
+        log.debug("Transaction {x:12} - Received STUN response", .{self.transaction_id.?});
 
         self.cancelWrite(loop);
         self.cancelRetry(loop);
@@ -553,7 +546,7 @@ pub const TransactionContext = struct {
         const self: *TransactionContext = @ptrCast(@alignCast(userdata.?));
 
         _ = result.sendmsg catch |err| {
-            log.err("Transaction {} - Got {} when sending STUN request", .{ self.transaction_id.?, err });
+            log.err("Transaction {x:12} - Got {} when sending STUN request", .{ self.transaction_id.?, err });
             if (err == error.Canceled and self.flags.canceled) {
                 std.debug.assert(self.result == null);
                 self.result = error.Canceled;
@@ -566,7 +559,7 @@ pub const TransactionContext = struct {
         };
 
         self.request_sent_count += 1;
-        log.debug("Transaction {} - STUN request sent", .{self.transaction_id.?});
+        log.debug("Transaction {x:12} - STUN request sent", .{self.transaction_id.?});
 
         const is_first_request = self.request_sent_count == 1;
         self.retry_timer_timeout_ms = if (is_first_request) self.rto.? else self.retry_timer_timeout_ms * 2;
@@ -577,7 +570,7 @@ pub const TransactionContext = struct {
         }
 
         const is_last_request = self.request_sent_count == Configuration.request_count;
-        if (!is_last_request) {
+        if (!is_last_request and !self.flags.no_retransmits) {
             self.retry_timer.run(
                 loop,
                 &self.retry_timer_completion,
@@ -625,7 +618,7 @@ pub const TransactionContext = struct {
             return .disarm;
         };
 
-        log.debug("Transaction {} - STUN request {}/{} timed out", .{ self.transaction_id.?, self.request_sent_count, Configuration.request_count });
+        log.debug("Transaction {x:12} - STUN request {}/{} timed out", .{ self.transaction_id.?, self.request_sent_count, Configuration.request_count });
         var buffer: [4096]u8 = undefined;
         const request = r: {
             var allocator = std.heap.FixedBufferAllocator.init(&buffer);
@@ -672,7 +665,7 @@ pub const TransactionContext = struct {
             return .disarm;
         };
 
-        log.debug("Transaction {} - Gathering timed out", .{self.transaction_id.?});
+        log.debug("Transaction {x:12} - Gathering timed out", .{self.transaction_id.?});
 
         std.debug.assert(self.result == null);
         self.result = error.Timeout;
@@ -754,13 +747,6 @@ pub const SocketContext = struct {
     }
 };
 
-const CandidateEntry = struct {
-    /// The actual candidate.
-    candidate: Candidate,
-    /// The socket context this candidate is associated to.
-    socket_index: u32,
-};
-
 /// Represents the role of the agent in an ICE process.
 const AgentRole = enum {
     /// The agent is controlling the ICE process.
@@ -821,6 +807,8 @@ const CandidatePair = struct {
     remote_candidate_index: usize,
     /// The pair priority.
     priority: u64,
+    /// The pair foundation.
+    foundation: CandidatePairFoundation,
     /// The candidate pair state.
     state: CandidatePairState = .frozen,
     /// Has this pair been nominated ? (Only used when in a valid list).
@@ -837,6 +825,7 @@ const CandidatePairFoundation = packed struct {
 };
 
 const TriggeredCheckNode = struct {
+    candidate_pair_index: usize = undefined,
     next: ?*TriggeredCheckNode = null,
 };
 
@@ -851,18 +840,13 @@ const Checklist = struct {
     /// Valid candidate pair list.
     valid_list: std.ArrayListUnmanaged(CandidatePair) = .{},
 
-    triggered_check_node_storage: []TriggeredCheckNode = &.{},
-    free_triggered_check_node: Intrusive(TriggeredCheckNode) = .{},
+    triggered_check_node_pool: std.heap.MemoryPool(TriggeredCheckNode) = undefined,
+
     triggered_check_queue: Intrusive(TriggeredCheckNode) = .{},
 
     pub fn init(pairs: std.ArrayListUnmanaged(CandidatePair), allocator: std.mem.Allocator) !Checklist {
-        var storage = try allocator.alloc(TriggeredCheckNode, 100);
-
-        var free_triggered_check_node: Intrusive(TriggeredCheckNode) = .{};
-        for (storage) |*node| {
-            node.* = .{};
-            free_triggered_check_node.push(node);
-        }
+        var pool = try std.heap.MemoryPool(TriggeredCheckNode).initPreheated(allocator, 10);
+        errdefer pool.deinit();
 
         var state_count = [_]u8{0} ** CandidatePairState.count;
         for (pairs.items) |p| {
@@ -872,20 +856,22 @@ const Checklist = struct {
         return Checklist{
             .pairs = pairs,
             .state_count = state_count,
-            .triggered_check_node_storage = storage,
-            .free_triggered_check_node = free_triggered_check_node,
+            .triggered_check_node_pool = pool,
         };
     }
 
     pub fn deinit(self: *Checklist, allocator: std.mem.Allocator) void {
-        allocator.free(self.triggered_check_node_storage);
+        _ = allocator;
+        self.triggered_check_node_pool.deinit();
     }
 
     pub inline fn setPairState(self: *Checklist, index: usize, state: CandidatePairState) void {
-        const old_state = self.pairs.items[index].state;
+        const pair = &self.pairs.items[index];
+        const old_state = pair.state;
         self.state_count[@intFromEnum(old_state)] -= 1;
         self.state_count[@intFromEnum(state)] += 1;
-        self.pairs.items[index].state = state;
+        pair.state = state;
+        log.debug("Pair ({}:{}) {s} -> {s}", .{ pair.local_candidate_index, pair.remote_candidate_index, @tagName(old_state), @tagName(state) });
     }
 
     pub fn resize(self: *Checklist, allocator: std.mem.Allocator, new_size: usize) !void {
@@ -895,19 +881,52 @@ const Checklist = struct {
         }
         try self.pairs.resize(allocator, new_size);
     }
+
+    pub fn triggeredCheckQueueContains(self: *Checklist, candidate_pair_index: usize) bool {
+        var node_opt = self.triggered_check_queue.tail;
+        return while (node_opt) |node| {
+            if (node.candidate_pair_index == candidate_pair_index) break true;
+            node_opt = node.next;
+        } else false;
+    }
+
+    pub fn pushTriggeredCheck(self: *Checklist, candidate_pair_index: usize) void {
+        const node = self.triggered_check_node_pool.create() catch unreachable;
+        node.* = .{ .candidate_pair_index = candidate_pair_index, .next = null };
+        self.triggered_check_queue.push(node);
+    }
+
+    pub fn popTriggeredCheck(self: *Checklist) ?usize {
+        const node = self.triggered_check_queue.pop() orelse return null;
+        defer self.triggered_check_node_pool.destroy(node);
+        return node.candidate_pair_index;
+    }
 };
 
 const ConnectivityCheckContext = struct {
     agent_id: u32,
     socket_index: u32,
+    local_candidate_index: usize,
+    remote_candidate_index: usize,
 
     transaction_context: TransactionContext,
+};
 
-    pair_foundation: CandidatePairFoundation,
+const CandidatePairContext = struct {
+    pub fn hash(_: CandidatePairContext, key: CandidatePair) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&key.local_candidate_index));
+        hasher.update(std.mem.asBytes(&key.remote_candidate_index));
+        return hasher.final();
+    }
+
+    pub fn eql(_: CandidatePairContext, a: CandidatePair, b: CandidatePair) bool {
+        return a.local_candidate_index == b.local_candidate_index and a.remote_candidate_index == b.remote_candidate_index;
+    }
 };
 
 pub const AgentContext = struct {
-    const CheckContextMap = std.AutoHashMap(CandidatePairFoundation, ConnectivityCheckContext);
+    const ConnectivityCheckContextMap = std.HashMap(CandidatePair, *ConnectivityCheckContext, CandidatePairContext, std.hash_map.default_max_load_percentage);
 
     /// The id of this agent.
     id: u32,
@@ -932,7 +951,7 @@ pub const AgentContext = struct {
     /// The remote password used for connectivity checks.
     remote_password: ?[24]u8 = null,
 
-    local_candidates: std.ArrayListUnmanaged(CandidateEntry) = .{},
+    local_candidates: std.ArrayListUnmanaged(Candidate) = .{},
     remote_candidates: std.ArrayListUnmanaged(Candidate) = .{},
     has_remote_candidates: bool = false,
 
@@ -960,8 +979,12 @@ pub const AgentContext = struct {
     /// The checklists used to check candidate pairs.
     checklist: Checklist = .{},
 
+    /// Buffer of ConnectivityCheckContext that can be used for connectivity checks.
+    connectivity_context_pool: std.heap.MemoryPool(ConnectivityCheckContext),
     /// Contains the connectivity check context for each candidate pair foundation.
-    check_context_map: CheckContextMap,
+    connectivity_check_context_map: ConnectivityCheckContextMap,
+    /// Contains the connectivity check context for each triggered check.
+    triggered_check_context_map: ConnectivityCheckContextMap,
 
     /// The timer that fires when a connectivity check needs to be done.
     connectivity_checks_timer: xev.Timer,
@@ -985,12 +1008,6 @@ pub const AgentContext = struct {
     on_candidate_callback: OnCandidateCallback,
     /// Callback to call when the gathering state changes.
     on_state_change_callback: OnStateChangeCallback,
-
-    inline fn computePairFoundation(self: *const AgentContext, pair: CandidatePair) CandidatePairFoundation {
-        const local_foundation = self.local_candidates.items[pair.local_candidate_index].candidate.foundation();
-        const remote_foundation = self.remote_candidates.items[pair.remote_candidate_index].foundation();
-        return CandidatePairFoundation{ .local = local_foundation, .remote = remote_foundation };
-    }
 
     fn generateUsernameFragmentAndPassword() struct { username: [8]u8, password: [24]u8 } {
         var buffer: [6 + 18]u8 = undefined;
@@ -1019,6 +1036,9 @@ pub const AgentContext = struct {
         var buffer_pool = std.heap.MemoryPool([4096]u8).init(allocator);
         errdefer buffer_pool.deinit();
 
+        var connectivity_context_pool = std.heap.MemoryPool(ConnectivityCheckContext).init(allocator);
+        errdefer connectivity_context_pool.deinit();
+
         var binding_request_queue_write_buffer = try buffer_pool.create();
         errdefer buffer_pool.destroy(binding_request_queue_write_buffer);
 
@@ -1029,7 +1049,9 @@ pub const AgentContext = struct {
             .allocator = allocator,
             .gathering_main_timer = gathering_main_timer,
             .buffer_pool = buffer_pool,
-            .check_context_map = CheckContextMap.init(allocator),
+            .connectivity_context_pool = connectivity_context_pool,
+            .connectivity_check_context_map = ConnectivityCheckContextMap.init(allocator),
+            .triggered_check_context_map = ConnectivityCheckContextMap.init(allocator),
             .connectivity_checks_timer = connectivity_checks_timer,
             .binding_request_queue_write_buffer = binding_request_queue_write_buffer,
             .username_fragment = result.username,
@@ -1043,9 +1065,12 @@ pub const AgentContext = struct {
 
     pub fn deinit(self: *AgentContext) void {
         self.gathering_main_timer.deinit();
-        self.connectivity_checks_timer.deinit();
-        self.check_context_map.deinit();
         if (self.buffer_pool) |*buffer_pool| buffer_pool.deinit();
+
+        self.connectivity_checks_timer.deinit();
+        self.connectivity_check_context_map.deinit();
+        self.triggered_check_context_map.deinit();
+        self.connectivity_context_pool.deinit();
 
         self.allocator.free(self.socket_contexts);
 
@@ -1104,27 +1129,35 @@ pub const AgentContext = struct {
         return &self.socket_contexts[transaction_context.socket_index];
     }
 
+    inline fn getSocketContextIndexFromAddress(self: *AgentContext, address: std.net.Address) ?usize {
+        return for (self.socket_contexts, 0..) |ctx, i| {
+            if (ctx.address.eql(address)) break i;
+        } else null;
+    }
+
     inline fn getTransactionContextFrom(self: *AgentContext, socket_context: *const SocketContext) ?*TransactionContext {
         return for (self.gathering_transaction_contexts) |*ctx| {
             if (ctx.socket_context == socket_context) break ctx;
         } else null;
     }
 
-    inline fn getPairFrom(self: *AgentContext, pair_foundation: CandidatePairFoundation) ?*CandidatePair {
-        const index = self.getPairIndexFrom(pair_foundation) orelse return null;
-        return &self.checklist.pairs.items[index];
-    }
-
-    inline fn getPairIndexFrom(self: *AgentContext, pair_foundation: CandidatePairFoundation) ?usize {
-        return for (self.checklist.pairs.items, 0..) |*pair, index| {
-            if (self.computePairFoundation(pair.*).eql(pair_foundation)) break index;
+    inline fn getConnectivityCheckContextFromTransactionId(self: *AgentContext, transaction_id: u96) ?*ConnectivityCheckContext {
+        var it = self.connectivity_check_context_map.iterator();
+        return while (it.next()) |entry| {
+            if (entry.value_ptr.*.transaction_context.transaction_id == transaction_id) break entry.value_ptr.*;
         } else null;
     }
 
-    inline fn getConnectivityCheckContextFromTransactionId(self: *AgentContext, transaction_id: u96) ?*ConnectivityCheckContext {
-        var it = self.check_context_map.iterator();
+    inline fn getTriggeredCheckContextFromTransactionId(self: *AgentContext, transaction_id: u96) ?*ConnectivityCheckContext {
+        var it = self.triggered_check_context_map.iterator();
         return while (it.next()) |entry| {
-            if (entry.value_ptr.transaction_context.transaction_id == transaction_id) break entry.value_ptr;
+            if (entry.value_ptr.*.transaction_context.transaction_id == transaction_id) break entry.value_ptr.*;
+        } else null;
+    }
+
+    inline fn getPairIndexFromCandidateIndices(self: *AgentContext, local_candidate_index: usize, remote_candidate_index: usize) ?usize {
+        return for (self.checklist.pairs.items, 0..) |p, i| {
+            if (p.local_candidate_index == local_candidate_index and p.remote_candidate_index == remote_candidate_index) break i;
         } else null;
     }
 
@@ -1146,8 +1179,8 @@ pub const AgentContext = struct {
         return null;
     }
 
-    fn addLocalCandidate(self: *AgentContext, candidate: Candidate, socket_index: u32) !void {
-        try self.local_candidates.append(self.allocator, CandidateEntry{ .candidate = candidate, .socket_index = socket_index });
+    fn addLocalCandidate(self: *AgentContext, candidate: Candidate) !void {
+        try self.local_candidates.append(self.allocator, candidate);
     }
 
     fn computePriorities(self: *AgentContext) void {
@@ -1160,10 +1193,10 @@ pub const AgentContext = struct {
         var candidate_lists_per_type: [candidate_type_count * 2]std.ArrayList(usize) = undefined;
         for (&candidate_lists_per_type) |*list| list.* = std.ArrayList(usize).initCapacity(arena_state.allocator(), self.local_candidates.items.len) catch unreachable;
 
-        for (self.local_candidates.items, 0..) |entry, i| {
-            const address_family = entry.candidate.transport_address.any.family;
+        for (self.local_candidates.items, 0..) |candidate, i| {
+            const address_family = candidate.transport_address.any.family;
             const address_index: usize = if (address_family == std.os.AF.INET) 0 else if (address_family == std.os.AF.INET6) 1 else unreachable;
-            candidate_lists_per_type[@intFromEnum(entry.candidate.type) * 2 + address_index].appendAssumeCapacity(i);
+            candidate_lists_per_type[@intFromEnum(candidate.type) * 2 + address_index].appendAssumeCapacity(i);
         }
 
         // Consider each candidate type separately to assign local_preference.
@@ -1202,7 +1235,9 @@ pub const AgentContext = struct {
                     }
                 };
 
-                self.local_candidates.items[candidate_index].candidate.local_preference = current_local_preference;
+                const candidate = &self.local_candidates.items[candidate_index];
+
+                candidate.priority = computePriority(candidate.type.preference(), current_local_preference, candidate.component_id);
                 current_local_preference -= 128;
             }
         }
@@ -1212,10 +1247,9 @@ pub const AgentContext = struct {
         self.computePriorities();
 
         // Sort candidates
-        std.sort.heap(CandidateEntry, self.local_candidates.items, {}, (struct {
-            fn lessThan(context: void, lhs: CandidateEntry, rhs: CandidateEntry) bool {
-                _ = context;
-                return lhs.candidate.priority() > rhs.candidate.priority();
+        std.sort.heap(Candidate, self.local_candidates.items, {}, (struct {
+            fn lessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
+                return lhs.priority > rhs.priority;
             }
         }).lessThan);
 
@@ -1226,53 +1260,32 @@ pub const AgentContext = struct {
         self.formCandidatesPairs();
         self.pruneCandidatePairs();
         self.removeLowerPriorityPairs();
+
         std.sort.heap(CandidatePair, self.checklist.pairs.items, {}, (struct {
             fn greaterThan(_: void, a: CandidatePair, b: CandidatePair) bool {
                 return a.priority > b.priority;
             }
         }).greaterThan);
-
-        const buffer_pool = &self.buffer_pool.?;
-
-        for (self.checklist.pairs.items) |pair| {
-            const pair_foundation = self.computePairFoundation(pair);
-            const gop = try self.check_context_map.getOrPut(pair_foundation);
-            if (!gop.found_existing) {
-                const local_candidate_entry: CandidateEntry = self.local_candidates.items[pair.local_candidate_index];
-                const transaction_context = try TransactionContext.init(
-                    self.id,
-                    0,
-                    &self.socket_contexts[local_candidate_entry.socket_index],
-                    try buffer_pool.create(),
-                    try buffer_pool.create(),
-                );
-                gop.value_ptr.* = ConnectivityCheckContext{
-                    .agent_id = self.id,
-                    .socket_index = @intCast(local_candidate_entry.socket_index),
-                    .transaction_context = transaction_context,
-                    .pair_foundation = pair_foundation,
-                };
-            }
-        }
     }
 
     fn formCandidatesPairs(self: *AgentContext) void {
         // TODO(Corendos): Better handle checklist size
         var pairs = std.ArrayListUnmanaged(CandidatePair).initCapacity(self.allocator, 100) catch unreachable;
 
-        for (self.local_candidates.items, 0..) |local_entry, i| {
-            const local_component_id = local_entry.candidate.component_id;
-            const local_address_family = local_entry.candidate.transport_address.any.family;
+        for (self.local_candidates.items, 0..) |local_candidate, i| {
+            const local_component_id = local_candidate.component_id;
+            const local_address_family = local_candidate.transport_address.any.family;
             for (self.remote_candidates.items, 0..) |remote_candidate, j| {
                 const remote_component_id = remote_candidate.component_id;
                 const remote_address_family = remote_candidate.transport_address.any.family;
                 if (local_component_id == remote_component_id and local_address_family == remote_address_family) {
-                    const g = if (self.role == .controlling) local_entry.candidate.priority() else remote_candidate.priority();
-                    const d = if (self.role == .controlled) local_entry.candidate.priority() else remote_candidate.priority();
+                    const g = if (self.role == .controlling) local_candidate.priority else remote_candidate.priority;
+                    const d = if (self.role == .controlled) local_candidate.priority else remote_candidate.priority;
                     pairs.appendAssumeCapacity(CandidatePair{
                         .local_candidate_index = i,
                         .remote_candidate_index = j,
                         .priority = (@as(u64, @min(g, d)) << 32) + (@as(u64, @max(g, d) << 1)) + @as(u64, if (g > d) 1 else 0),
+                        .foundation = CandidatePairFoundation{ .local = local_candidate.foundation, .remote = remote_candidate.foundation },
                     });
                 }
             }
@@ -1287,7 +1300,7 @@ pub const AgentContext = struct {
         while (index < count - 1) : (index += 1) {
             const source_pair = &self.checklist.pairs.items[index];
             const source_local_candidate_index = source_pair.local_candidate_index;
-            const source_local_candidate = self.local_candidates.items[source_local_candidate_index].candidate;
+            const source_local_candidate = self.local_candidates.items[source_local_candidate_index];
             const source_remote_candidate_index = source_pair.remote_candidate_index;
 
             var other_index: usize = index + 1;
@@ -1295,7 +1308,7 @@ pub const AgentContext = struct {
             while (other_index < count) {
                 const dest_pair = &self.checklist.pairs.items[other_index];
                 const dest_local_candidate_index = dest_pair.local_candidate_index;
-                const dest_local_candidate = self.local_candidates.items[dest_local_candidate_index].candidate;
+                const dest_local_candidate = self.local_candidates.items[dest_local_candidate_index];
                 const dest_remote_candidate_index = dest_pair.remote_candidate_index;
 
                 const have_same_local_candidate_base = std.net.Address.eql(source_local_candidate.base_address, dest_local_candidate.base_address);
@@ -1336,11 +1349,10 @@ pub const AgentContext = struct {
 
         for (self.checklist.pairs.items, 0..) |p, i| {
             // Compute pair foundation
-            const local_candidate = self.local_candidates.items[p.local_candidate_index].candidate;
-            const pair_foundation = self.computePairFoundation(p);
+            const local_candidate = self.local_candidates.items[p.local_candidate_index];
 
             // Get hash map entry if it exists.
-            const gop = foundation_map.getOrPut(pair_foundation) catch unreachable;
+            const gop = foundation_map.getOrPut(p.foundation) catch unreachable;
 
             if (!gop.found_existing) {
                 // If it doesn't exist yet, we store this pair as the one that will be put in the Waiting state.
@@ -1348,10 +1360,10 @@ pub const AgentContext = struct {
             } else {
                 // Otherwise, we compare the component IDs and/or priorities to select the one that will be put in the Waiting state.
                 const stored_pair = self.checklist.pairs.items[gop.value_ptr.*];
-                const stored_local_candidate = self.local_candidates.items[stored_pair.local_candidate_index].candidate;
+                const stored_local_candidate = self.local_candidates.items[stored_pair.local_candidate_index];
 
                 const has_lower_component_id = local_candidate.component_id < stored_local_candidate.component_id;
-                const has_higher_priority = local_candidate.component_id == stored_local_candidate.component_id and local_candidate.priority() > stored_local_candidate.priority();
+                const has_higher_priority = local_candidate.component_id == stored_local_candidate.component_id and local_candidate.priority > stored_local_candidate.priority;
                 if (has_lower_component_id or has_higher_priority) {
                     gop.value_ptr.* = i;
                 }
@@ -1398,11 +1410,11 @@ pub const AgentContext = struct {
             if (p.state == .waiting) {
                 const has_higher_priority = p.priority > max_priority;
                 const has_same_priority = p.priority == max_priority;
-                const has_lower_component_id = self.local_candidates.items[p.local_candidate_index].candidate.component_id < min_component_id;
+                const has_lower_component_id = self.local_candidates.items[p.local_candidate_index].component_id < min_component_id;
                 if (has_higher_priority or (has_same_priority and has_lower_component_id)) {
                     pair_index = index;
                     max_priority = p.priority;
-                    min_component_id = self.local_candidates.items[p.local_candidate_index].candidate.component_id;
+                    min_component_id = self.local_candidates.items[p.local_candidate_index].component_id;
                 }
             }
         }
@@ -1423,11 +1435,9 @@ pub const AgentContext = struct {
     fn unfreezePair(self: *AgentContext) void {
         pair: for (self.checklist.pairs.items, 0..) |*p, index| {
             if (p.state != .frozen) continue;
-            const pair_foundation = self.computePairFoundation(p.*);
             for (self.checklist.pairs.items) |*p2| {
                 if (p2 == p) continue;
-                const other_pair_foundation = self.computePairFoundation(p2.*);
-                if (p2.state == .waiting or p2.state == .in_progress and pair_foundation.eql(other_pair_foundation)) continue :pair;
+                if ((p2.state == .waiting or p2.state == .in_progress) and p.foundation.eql(p2.foundation)) continue :pair;
             }
 
             // If we are here, we didn't find another pair with the same foundation in the waiting or in_progress state.
@@ -1436,16 +1446,34 @@ pub const AgentContext = struct {
         }
     }
 
+    const DummyFormatter = struct {
+        ctx: *AgentContext,
+        pub fn format(self: DummyFormatter, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            _ = options;
+            _ = fmt;
+            try writer.print("Agent {}\n", .{self.ctx.id});
+            for (std.meta.tags(CandidatePairState)) |t| {
+                try writer.print("    {s}: {}\n", .{ @tagName(t), self.ctx.checklist.state_count[@intFromEnum(t)] });
+            }
+
+            for (self.ctx.checklist.pairs.items) |p| {
+                const foundation_bit_size = @bitSizeOf(Foundation.IntType);
+                const pair_foundation: u64 = (@as(u64, p.foundation.remote.as_number()) << foundation_bit_size) + @as(u64, p.foundation.local.as_number());
+                try writer.print("    {}:{} ({}): {s}\n", .{ p.local_candidate_index, p.remote_candidate_index, pair_foundation, @tagName(p.state) });
+            }
+        }
+    };
+
     fn printPairStates(self: *AgentContext) void {
-        for (std.meta.tags(CandidatePairState)) |t| {
-            log.debug("{s}: {}", .{ @tagName(t), self.checklist.state_count[@intFromEnum(t)] });
-        }
-        for (self.checklist.pairs.items) |p| {
-            const foundation_bit_size = @bitSizeOf(Foundation.IntType);
-            const foundation = self.computePairFoundation(p);
-            const pair_foundation: u64 = (@as(u64, foundation.remote.as_number()) << foundation_bit_size) + @as(u64, foundation.local.as_number());
-            log.debug("{}:{} ({}): {s}", .{ p.local_candidate_index, p.remote_candidate_index, pair_foundation, @tagName(p.state) });
-        }
+        log.debug("{}", .{DummyFormatter{ .ctx = self }});
+        //for (std.meta.tags(CandidatePairState)) |t| {
+        //    log.debug("{s}: {}", .{ @tagName(t), self.checklist.state_count[@intFromEnum(t)] });
+        //}
+        //for (self.checklist.pairs.items) |p| {
+        //    const foundation_bit_size = @bitSizeOf(Foundation.IntType);
+        //    const pair_foundation: u64 = (@as(u64, p.foundation.remote.as_number()) << foundation_bit_size) + @as(u64, p.foundation.local.as_number());
+        //    log.debug("{}:{} ({}): {s}", .{ p.local_candidate_index, p.remote_candidate_index, pair_foundation, @tagName(p.state) });
+        //}
     }
 };
 
@@ -1770,11 +1798,15 @@ pub const Context = struct {
             const candidate = Candidate{
                 .type = .host,
                 .base_address = ctx.address,
-                .base_address_id = @intCast(index),
                 .transport_address = ctx.address,
-                .protocol = .udp,
+                .foundation = Foundation{
+                    .type = .host,
+                    // TODO(Corentin): When supported, get that from the socket.
+                    .protocol = .udp,
+                    .address_index = @intCast(index),
+                },
             };
-            agent_context.addLocalCandidate(candidate, @intCast(index)) catch unreachable;
+            agent_context.addLocalCandidate(candidate) catch unreachable;
             agent_context.on_candidate_callback(agent_context.userdata, agent_context.id, .{ .candidate = candidate });
         }
 
@@ -1936,10 +1968,14 @@ pub const Context = struct {
                 .type = .server_reflexive,
                 .transport_address = transport_address,
                 .base_address = socket_context.address,
-                .base_address_id = @intCast(socket_context.index),
-                .protocol = .udp,
+                .foundation = Foundation{
+                    .type = .server_reflexive,
+                    // TODO(Corentin): When supported, get that from the socket.
+                    .protocol = .udp,
+                    .address_index = @intCast(socket_context.index),
+                },
             };
-            agent_context.addLocalCandidate(candidate, socket_context.index) catch unreachable;
+            agent_context.addLocalCandidate(candidate) catch unreachable;
             agent_context.on_candidate_callback(agent_context.userdata, agent_context.id, .{ .candidate = candidate });
         }
 
@@ -2047,8 +2083,6 @@ pub const Context = struct {
                 self.handleConnectivityCheckMainTimer(agent_context) catch @panic("TODO");
             },
         }
-
-        agent_context.printPairStates();
     }
 
     fn readCallback(
@@ -2128,30 +2162,6 @@ pub const Context = struct {
         self.handleGatheringEvent(agent_context, .{ .main_timer = result });
 
         return .disarm;
-    }
-
-    fn sendRequestToRemoteAgent(self: *Context, request: ztun.Message, check_context: *ConnectivityCheckContext, socket_context: *SocketContext, address: std.net.Address) void {
-        const data = d: {
-            var stream = std.io.fixedBufferStream(check_context.write_buffer);
-            request.write(stream.writer()) catch unreachable;
-            break :d stream.getWritten();
-        };
-
-        check_context.write_data.from(address, data);
-        check_context.last_transaction_id = request.transaction_id;
-
-        check_context.write_completion = xev.Completion{
-            .op = .{
-                .sendmsg = .{
-                    .fd = socket_context.socket,
-                    .msghdr = &check_context.write_data.message_header,
-                    .buffer = null,
-                },
-            },
-            .userdata = self,
-            .callback = connectivityCheckWriteCallback,
-        };
-        self.loop.add(&check_context.write_completion);
     }
 
     fn connectivityCheckTimerCallback(
@@ -2241,7 +2251,6 @@ pub const Context = struct {
         agent_context: *AgentContext,
         socket_context: *SocketContext,
     ) !void {
-        log.debug("Agent {} - Received Binding request from \"{}\"", .{ agent_context.id, source });
 
         // TODO(Corendos): Check if this is a peer-reflexive candidate.
         //                 See https://www.rfc-editor.org/rfc/rfc8445#section-7.3.1.3
@@ -2252,6 +2261,8 @@ pub const Context = struct {
             var stream = std.io.fixedBufferStream(raw_message);
             break :r try ztun.Message.readAlloc(stream.reader(), arena_state.allocator());
         };
+
+        log.debug("Agent {} - Received Binding request for {x:12}", .{ agent_context.id, request.transaction_id });
 
         // Check fingerprint/integrity.
         try checkMessageIntegrity(request, &agent_context.password);
@@ -2284,6 +2295,47 @@ pub const Context = struct {
             };
             self.loop.add(&agent_context.binding_request_queue_write_completion);
         }
+
+        // Find local candidate whose transport address matches the address on which the request was received.
+        const local_candidate_index = for (agent_context.local_candidates.items, 0..) |*c, i| {
+            if (c.transport_address.eql(socket_context.address)) break i;
+        } else unreachable;
+
+        const remote_candidate_index_opt: ?usize = for (agent_context.remote_candidates.items, 0..) |*c, i| {
+            if (c.transport_address.eql(source)) break i;
+        } else null;
+
+        if (remote_candidate_index_opt == null) {
+            log.debug("Agent {} - No remote candidate matching the source address (peer reflexive candidate maybe?)", .{agent_context.id});
+            return;
+        }
+
+        const candidate_pair_index = agent_context.getPairIndexFromCandidateIndices(local_candidate_index, remote_candidate_index_opt.?) orelse {
+            log.debug("Agent {} - No pair corresponding to the given indices", .{agent_context.id});
+            return;
+        };
+        const candidate_pair = &agent_context.checklist.pairs.items[candidate_pair_index];
+
+        switch (candidate_pair.state) {
+            .succeeded => {},
+            .in_progress => {
+                if (agent_context.connectivity_check_context_map.get(candidate_pair.*)) |check_context| {
+                    check_context.transaction_context.stopRetransmits(self.loop);
+                }
+                agent_context.checklist.setPairState(candidate_pair_index, .waiting);
+
+                if (!agent_context.checklist.triggeredCheckQueueContains(candidate_pair_index)) {
+                    agent_context.checklist.pushTriggeredCheck(candidate_pair_index);
+                }
+            },
+            else => {
+                agent_context.checklist.setPairState(candidate_pair_index, .waiting);
+
+                if (!agent_context.checklist.triggeredCheckQueueContains(candidate_pair_index)) {
+                    agent_context.checklist.pushTriggeredCheck(candidate_pair_index);
+                }
+            },
+        }
     }
 
     fn handleConnectivityCheckTransactionCompleted(
@@ -2294,17 +2346,27 @@ pub const Context = struct {
         result: TransactionResult,
     ) !void {
         _ = socket_context;
+        defer {
+            agent_context.buffer_pool.?.destroy(@alignCast(check_context.transaction_context.write_buffer[0..4096]));
+            agent_context.buffer_pool.?.destroy(@alignCast(check_context.transaction_context.result_storage[0..4096]));
+            check_context.transaction_context.deinit();
+            agent_context.connectivity_context_pool.destroy(check_context);
+        }
 
-        const pair_index = agent_context.getPairIndexFrom(check_context.pair_foundation) orelse @panic("TODO");
+        const pair_index = agent_context.getPairIndexFromCandidateIndices(check_context.local_candidate_index, check_context.remote_candidate_index) orelse @panic("TODO");
         const pair = &agent_context.checklist.pairs.items[pair_index];
 
         const payload = result catch |err| {
-            log.debug("Agent {} - Check failed for Candidate pair ({}:{}) with {}", .{ agent_context.id, pair.local_candidate_index, pair.remote_candidate_index, err });
+            if (check_context.transaction_context.flags.no_retransmits) {
+                // Due to triggered check, we might never receive the answer but must not treat the lack of response as a failure.
+                return;
+            }
+            log.debug("Agent {} - Check failed for candidate pair ({}:{}) with {}", .{ agent_context.id, pair.local_candidate_index, pair.remote_candidate_index, err });
             agent_context.checklist.setPairState(pair_index, .failed);
             return;
         };
 
-        const local_candidate = agent_context.local_candidates.items[pair.local_candidate_index].candidate;
+        const local_candidate = agent_context.local_candidates.items[pair.local_candidate_index];
         const remote_candidate = agent_context.remote_candidates.items[pair.remote_candidate_index];
 
         // TODO(Corendos): Discover peer-reflexive candidates.
@@ -2319,7 +2381,7 @@ pub const Context = struct {
         const new_state: CandidatePairState = if (response_source.eql(request_destination) and response_destination.eql(request_source)) .succeeded else .failed;
         agent_context.checklist.setPairState(pair_index, new_state);
 
-        log.debug("Agent {} - Candidate pair ({}:{}) state: {s}", .{ agent_context.id, pair.local_candidate_index, pair.remote_candidate_index, @tagName(pair.state) });
+        //log.debug("Agent {} - Candidate pair ({}:{}) state: {s}", .{ agent_context.id, pair.local_candidate_index, pair.remote_candidate_index, @tagName(pair.state) });
 
         if (new_state == .failed) return;
 
@@ -2329,12 +2391,12 @@ pub const Context = struct {
         const valid_pair = pair.*;
         agent_context.checklist.valid_list.append(self.allocator, valid_pair) catch unreachable;
         for (agent_context.checklist.pairs.items, 0..) |*p, i| {
-            const valid_pair_foundation = agent_context.computePairFoundation(valid_pair);
-            const pair_foundation = agent_context.computePairFoundation(p.*);
-            if (p.state == .frozen and pair_foundation.eql(valid_pair_foundation)) {
+            if (p.state == .frozen and pair.foundation.eql(valid_pair.foundation)) {
                 agent_context.checklist.setPairState(i, .waiting);
             }
         }
+
+        //agent_context.printPairStates();
     }
 
     fn handleConnectivityCheckResponseRead(
@@ -2350,67 +2412,110 @@ pub const Context = struct {
         const message_header = ztun.Message.readHeader(stream.reader()) catch unreachable;
         stream.reset();
 
-        log.debug("Agent {} - Received response from other peer", .{agent_context.id});
-        const check_context = agent_context.getConnectivityCheckContextFromTransactionId(message_header.transaction_id) orelse @panic("TODO");
+        var is_triggered_check: bool = false;
+        const check_context = if (agent_context.getConnectivityCheckContextFromTransactionId(message_header.transaction_id)) |check_context| b: {
+            break :b check_context;
+        } else if (agent_context.getTriggeredCheckContextFromTransactionId(message_header.transaction_id)) |check_context| b: {
+            is_triggered_check = true;
+            break :b check_context;
+        } else @panic("TODO");
 
-        const pair_index = agent_context.getPairIndexFrom(check_context.pair_foundation) orelse @panic("TODO");
+        const pair_index = agent_context.getPairIndexFromCandidateIndices(check_context.local_candidate_index, check_context.remote_candidate_index) orelse @panic("TODO");
         const pair = &agent_context.checklist.pairs.items[pair_index];
 
-        if (pair.state != .in_progress) {
-            log.debug("Agent {} - Pair is not in the in_progress state anymore", .{agent_context.id});
-            return;
-        }
+        log.debug("Agent {} - Received response on {s}transaction {x:12} for candidate pair ({}:{})", .{
+            agent_context.id,
+            if (is_triggered_check) "triggered " else "",
+            message_header.transaction_id,
+            pair.local_candidate_index,
+            pair.remote_candidate_index,
+        });
 
         check_context.transaction_context.readCallback(self.loop, raw_message, source);
     }
 
-    fn handleConnectivityCheckMainTimer(self: *Context, agent_context: *AgentContext) !void {
-        log.debug("Agent {} - Connectivity check timer fired", .{agent_context.id});
-
-        // TODO(Corendos): handle multiple checklists
-
-        const candidate_pair_index_opt = b: {
-            if (!agent_context.checklist.triggered_check_queue.empty()) {}
-
-            const waiting_pair_count = agent_context.getWaitingPairCount();
-
-            if (waiting_pair_count == 0) {
-                agent_context.unfreezePair();
+    inline fn tryPopTriggeredCheckQueue(agent_context: *AgentContext) ?usize {
+        //return agent_context.checklist.popTriggeredCheck();
+        while (!agent_context.checklist.triggered_check_queue.empty()) {
+            const pair_index = agent_context.checklist.popTriggeredCheck().?;
+            const pair = &agent_context.checklist.pairs.items[pair_index];
+            if (pair.state == .waiting or pair.state == .in_progress) {
+                return pair_index;
             }
+        }
 
-            break :b agent_context.getWaitingPairIndex();
+        return null;
+    }
+
+    fn startTransaction(self: *Context, agent_context: *AgentContext, candidate_pair_index: usize, is_triggered_check: bool) !void {
+        const candidate_pair = &agent_context.checklist.pairs.items[candidate_pair_index];
+        const local_candidate = agent_context.local_candidates.items[candidate_pair.local_candidate_index];
+        const remote_candidate = agent_context.remote_candidates.items[candidate_pair.remote_candidate_index];
+
+        const map = if (is_triggered_check) &agent_context.triggered_check_context_map else &agent_context.connectivity_check_context_map;
+
+        const gop = try map.getOrPut(candidate_pair.*);
+        errdefer map.removeByPtr(gop.key_ptr);
+
+        std.debug.assert(!gop.found_existing);
+
+        const check_context = try agent_context.connectivity_context_pool.create();
+        errdefer agent_context.connectivity_context_pool.destroy(check_context);
+
+        const socket_context_index = agent_context.getSocketContextIndexFromAddress(local_candidate.base_address).?;
+        const socket_context = &agent_context.socket_contexts[socket_context_index];
+
+        const transaction_context = try TransactionContext.init(
+            agent_context.id,
+            0,
+            socket_context,
+            try agent_context.buffer_pool.?.create(),
+            try agent_context.buffer_pool.?.create(),
+        );
+        errdefer transaction_context.deinit();
+
+        check_context.* = ConnectivityCheckContext{
+            .agent_id = agent_context.id,
+            .socket_index = @intCast(socket_context_index),
+            .transaction_context = transaction_context,
+            .local_candidate_index = candidate_pair.local_candidate_index,
+            .remote_candidate_index = candidate_pair.remote_candidate_index,
+        };
+        gop.value_ptr.* = check_context;
+
+        var buffer: [4096]u8 = undefined;
+        const request = r: {
+            var allocator = std.heap.FixedBufferAllocator.init(&buffer);
+            break :r makeConnectivityCheckBindingRequest(
+                agent_context.username_fragment,
+                agent_context.remote_username_fragment.?,
+                agent_context.remote_password.?,
+                local_candidate.priority,
+                agent_context.role.?,
+                agent_context.tiebreaker,
+                allocator.allocator(),
+            ) catch unreachable;
         };
 
-        if (candidate_pair_index_opt) |candidate_pair_index| {
-            const candidate_pair = &agent_context.checklist.pairs.items[candidate_pair_index];
-            const local_candidate = agent_context.local_candidates.items[candidate_pair.local_candidate_index].candidate;
-            const remote_candidate = agent_context.remote_candidates.items[candidate_pair.remote_candidate_index];
+        log.debug("Agent {} - Starting {s}transaction {x:12} for candidate pair ({}:{})", .{
+            agent_context.id,
+            if (is_triggered_check) "triggered " else "",
+            request.transaction_id,
+            candidate_pair.local_candidate_index,
+            candidate_pair.remote_candidate_index,
+        });
+        check_context.transaction_context.userdata = self;
+        check_context.transaction_context.callback = connectivityCheckTransactionCompletedCallback;
+        check_context.transaction_context.start(request, remote_candidate.transport_address, 500, self.loop);
 
-            var buffer: [4096]u8 = undefined;
-            const request = r: {
-                var allocator = std.heap.FixedBufferAllocator.init(&buffer);
-                break :r makeConnectivityCheckBindingRequest(
-                    agent_context.username_fragment,
-                    agent_context.remote_username_fragment.?,
-                    agent_context.remote_password.?,
-                    local_candidate.priority(),
-                    agent_context.role.?,
-                    agent_context.tiebreaker,
-                    allocator.allocator(),
-                ) catch unreachable;
-            };
+        agent_context.checklist.setPairState(candidate_pair_index, .in_progress);
+    }
 
-            // TODO(Corendos): We should find a way to get to associated socket easily.
-            const local_check_context = agent_context.check_context_map.getPtr(agent_context.computePairFoundation(candidate_pair.*)) orelse unreachable;
-            std.debug.assert(local_check_context.transaction_context.state() == .dead);
-            const local_socket_context = &agent_context.socket_contexts[local_check_context.socket_index];
+    fn handleConnectivityCheckMainTimer(self: *Context, agent_context: *AgentContext) !void {
+        // TODO(Corendos): handle multiple checklists
 
-            log.debug("Agent {} - Sending Binding request from \"{}\" to \"{}\"", .{ agent_context.id, local_socket_context.address, remote_candidate.transport_address });
-            local_check_context.transaction_context.userdata = self;
-            local_check_context.transaction_context.callback = connectivityCheckTransactionCompletedCallback;
-            local_check_context.transaction_context.start(request, remote_candidate.transport_address, 500, self.loop);
-
-            agent_context.checklist.setPairState(candidate_pair_index, .in_progress);
+        if (tryPopTriggeredCheckQueue(agent_context)) |candidate_pair_index| {
+            try self.startTransaction(agent_context, candidate_pair_index, true);
 
             agent_context.connectivity_checks_timer.run(
                 self.loop,
@@ -2420,12 +2525,37 @@ pub const Context = struct {
                 self,
                 connectivityCheckTimerCallback,
             );
+            return;
         }
+
+        const waiting_pair_count = agent_context.getWaitingPairCount();
+        if (waiting_pair_count == 0) {
+            agent_context.unfreezePair();
+        }
+
+        if (agent_context.getWaitingPairIndex()) |candidate_pair_index| {
+            try self.startTransaction(agent_context, candidate_pair_index, false);
+
+            agent_context.connectivity_checks_timer.run(
+                self.loop,
+                &agent_context.connectivity_checks_timer_completion,
+                Configuration.new_transaction_interval_ms,
+                Context,
+                self,
+                connectivityCheckTimerCallback,
+            );
+            return;
+        }
+
+        log.debug("Agent {} - No more candidate pair to check", .{agent_context.id});
+
+        //agent_context.printPairStates();
     }
 };
 
 test "Basic structs size" {
     try std.testing.expectEqual(@as(usize, 1520), @sizeOf(TransactionContext));
+    try std.testing.expectEqual(@as(usize, 1536), @sizeOf(ConnectivityCheckContext));
     try std.testing.expectEqual(@as(usize, 480), @sizeOf(SocketContext));
     try std.testing.expectEqual(@as(usize, 272952), @sizeOf(AgentContext));
 }
