@@ -7,6 +7,8 @@ const builtin = @import("builtin");
 const ztun = @import("ztun");
 const xev = @import("xev");
 
+const DoublyLinkedList = @import("doubly_linked_list.zig").DoublyLinkedList;
+
 pub const net = @import("net.zig");
 
 const platform = switch (builtin.os.tag) {
@@ -799,12 +801,20 @@ const CandidatePairState = enum {
     const count = std.meta.tags(CandidatePairState).len;
 };
 
-/// Represents a candidate pair to check.
+/// Represents a candidate pair.
 const CandidatePair = struct {
     /// The index of the local candidate.
     local_candidate_index: usize,
     /// The index of the remote candidate.
     remote_candidate_index: usize,
+
+    pub inline fn eql(a: CandidatePair, b: CandidatePair) bool {
+        return a.local_candidate_index == b.local_candidate_index and a.remote_candidate_index == b.remote_candidate_index;
+    }
+};
+
+/// Represents the data associated with a candidate pair.
+const CandidatePairData = struct {
     /// The pair priority.
     priority: u64,
     /// The pair foundation.
@@ -825,8 +835,14 @@ const CandidatePairFoundation = packed struct {
 };
 
 const TriggeredCheckNode = struct {
-    candidate_pair_index: usize = undefined,
+    candidate_pair: CandidatePair,
+
     next: ?*TriggeredCheckNode = null,
+    prev: ?*TriggeredCheckNode = null,
+
+    pub fn eql(a: TriggeredCheckNode, b: TriggeredCheckNode) bool {
+        return a.candidate_pair.eql(b.candidate_pair);
+    }
 };
 
 /// Represents a checklist that will be used to check candidate pairs.
@@ -835,81 +851,84 @@ const Checklist = struct {
     state: ChecklistState = .running,
     /// The list of candidate pairs to check.
     pairs: std.ArrayListUnmanaged(CandidatePair) = .{},
+    /// The data associated with the pairs.
+    pairs_data: std.ArrayListUnmanaged(CandidatePairData) = .{},
     /// Store the number of pairs in a specific state.
     state_count: [CandidatePairState.count]u8 = [_]u8{0} ** CandidatePairState.count,
-    /// Valid candidate pair list.
-    valid_list: std.ArrayListUnmanaged(CandidatePair) = .{},
 
-    triggered_check_node_pool: std.heap.MemoryPool(TriggeredCheckNode) = undefined,
+    /// Valid candidate pairs.
+    valid_pairs: std.ArrayListUnmanaged(CandidatePair) = .{},
+    /// Valid candidate pairs data.
+    valid_pairs_data: std.ArrayListUnmanaged(CandidatePairData) = .{},
 
-    triggered_check_queue: Intrusive(TriggeredCheckNode) = .{},
+    /// The triggered check FIFO associated with this checklist.
+    triggered_check_queue: DoublyLinkedList(TriggeredCheckNode) = .{},
 
-    pub fn init(pairs: std.ArrayListUnmanaged(CandidatePair), allocator: std.mem.Allocator) !Checklist {
-        var pool = try std.heap.MemoryPool(TriggeredCheckNode).initPreheated(allocator, 10);
-        errdefer pool.deinit();
-
+    pub fn init(pairs: std.ArrayListUnmanaged(CandidatePair), pairs_data: std.ArrayListUnmanaged(CandidatePairData)) !Checklist {
         var state_count = [_]u8{0} ** CandidatePairState.count;
-        for (pairs.items) |p| {
+        for (pairs_data.items) |p| {
             state_count[@intFromEnum(p.state)] += 1;
         }
 
         return Checklist{
             .pairs = pairs,
+            .pairs_data = pairs_data,
             .state_count = state_count,
-            .triggered_check_node_pool = pool,
         };
     }
 
     pub fn deinit(self: *Checklist, allocator: std.mem.Allocator) void {
-        _ = allocator;
-        self.triggered_check_node_pool.deinit();
+        self.pairs.deinit(allocator);
+        self.pairs_data.deinit(allocator);
+        self.valid_pairs.deinit(allocator);
+        self.valid_pairs_data.deinit(allocator);
     }
 
     pub inline fn setPairState(self: *Checklist, index: usize, state: CandidatePairState) void {
-        const pair = &self.pairs.items[index];
-        const old_state = pair.state;
+        const candidate_pair = self.pairs.items[index];
+        const candidate_pair_data = &self.pairs_data.items[index];
+        const old_state = candidate_pair_data.state;
         self.state_count[@intFromEnum(old_state)] -= 1;
         self.state_count[@intFromEnum(state)] += 1;
-        pair.state = state;
-        log.debug("Pair ({}:{}) {s} -> {s}", .{ pair.local_candidate_index, pair.remote_candidate_index, @tagName(old_state), @tagName(state) });
+        candidate_pair_data.state = state;
+        log.debug("Pair ({}:{}) {s} -> {s}", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, @tagName(old_state), @tagName(state) });
     }
 
     pub fn resize(self: *Checklist, allocator: std.mem.Allocator, new_size: usize) !void {
         std.debug.assert(new_size <= self.pairs.items.len);
-        for (self.pairs.items[new_size..]) |p| {
-            self.state_count[@intFromEnum(p.state)] -= 1;
+        std.debug.assert(new_size <= self.pairs_data.items.len);
+        for (self.pairs_data.items[new_size..]) |candidate_pair_data| {
+            self.state_count[@intFromEnum(candidate_pair_data.state)] -= 1;
         }
         try self.pairs.resize(allocator, new_size);
+        try self.pairs_data.resize(allocator, new_size);
     }
 
-    pub fn triggeredCheckQueueContains(self: *Checklist, candidate_pair_index: usize) bool {
-        var node_opt = self.triggered_check_queue.tail;
-        return while (node_opt) |node| {
-            if (node.candidate_pair_index == candidate_pair_index) break true;
-            node_opt = node.next;
-        } else false;
-    }
+    //pub fn triggeredCheckQueueContains(self: *Checklist, candidate_pair_index: usize) bool {
+    //    var node_opt = self.triggered_check_queue.tail;
+    //    return while (node_opt) |node| {
+    //        if (node.candidate_pair_index == candidate_pair_index) break true;
+    //        node_opt = node.next;
+    //    } else false;
+    //}
 
-    pub fn pushTriggeredCheck(self: *Checklist, candidate_pair_index: usize) void {
-        const node = self.triggered_check_node_pool.create() catch unreachable;
-        node.* = .{ .candidate_pair_index = candidate_pair_index, .next = null };
-        self.triggered_check_queue.push(node);
-    }
+    //pub fn pushTriggeredCheck(self: *Checklist, candidate_pair_index: usize) void {
+    //    const node = self.triggered_check_node_pool.create() catch unreachable;
+    //    node.* = .{ .candidate_pair_index = candidate_pair_index, .next = null };
+    //    self.triggered_check_queue.push(node);
+    //}
 
-    pub fn popTriggeredCheck(self: *Checklist) ?usize {
-        const node = self.triggered_check_queue.pop() orelse return null;
-        defer self.triggered_check_node_pool.destroy(node);
-        return node.candidate_pair_index;
-    }
+    //pub fn popTriggeredCheck(self: *Checklist) ?usize {
+    //    const node = self.triggered_check_queue.pop() orelse return null;
+    //    defer self.triggered_check_node_pool.destroy(node);
+    //    return node.candidate_pair_index;
+    //}
 };
 
 const ConnectivityCheckContext = struct {
     agent_id: u32,
     socket_index: u32,
-
-    // TODO(Corendos): Find a way to make that stable in case we add new candidate pairs
-    //                 Maybe we could keep a stable list and have a sorted list linking to indices ?
-    candidate_pair_index: usize,
+    candidate_pair: CandidatePair,
 
     flags: packed struct {
         is_triggered_check: bool = false,
@@ -917,19 +936,6 @@ const ConnectivityCheckContext = struct {
     } = .{},
 
     transaction_context: TransactionContext,
-};
-
-const CandidatePairContext = struct {
-    pub fn hash(_: CandidatePairContext, key: CandidatePair) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(std.mem.asBytes(&key.local_candidate_index));
-        hasher.update(std.mem.asBytes(&key.remote_candidate_index));
-        return hasher.final();
-    }
-
-    pub fn eql(_: CandidatePairContext, a: CandidatePair, b: CandidatePair) bool {
-        return a.local_candidate_index == b.local_candidate_index and a.remote_candidate_index == b.remote_candidate_index;
-    }
 };
 
 pub const AgentContext = struct {
@@ -962,7 +968,7 @@ pub const AgentContext = struct {
     remote_candidates: std.ArrayListUnmanaged(Candidate) = .{},
     has_remote_candidates: bool = false,
 
-    buffer_pool: ?std.heap.MemoryPool([4096]u8) = null,
+    buffer_pool: std.heap.MemoryPool([4096]u8),
 
     /// Contexts for each bound sockets.
     socket_contexts: []SocketContext = &.{},
@@ -982,6 +988,9 @@ pub const AgentContext = struct {
 
     // Connectivity checks related fields.
 
+    /// A pool of Node used to build triggered checks FIFO.
+    triggered_check_node_pool: std.heap.MemoryPool(TriggeredCheckNode) = undefined,
+
     // TODO(Corendos): handle multiple data-stream.
     /// The checklists used to check candidate pairs.
     checklist: Checklist = .{},
@@ -991,7 +1000,7 @@ pub const AgentContext = struct {
     /// Contains the connectivity check context for each transaction in progress.
     connectivity_check_context_map: ConnectivityCheckContextMap,
     /// Contains the current transaction id for each candidate pair.
-    connectivity_check_transaction_map: std.HashMap(CandidatePair, u96, CandidatePairContext, std.hash_map.default_max_load_percentage),
+    connectivity_check_transaction_map: std.AutoHashMap(CandidatePair, u96),
 
     /// The timer that fires when a connectivity check needs to be done.
     connectivity_checks_timer: xev.Timer,
@@ -1046,6 +1055,9 @@ pub const AgentContext = struct {
         var connectivity_context_pool = std.heap.MemoryPool(ConnectivityCheckContext).init(allocator);
         errdefer connectivity_context_pool.deinit();
 
+        var triggered_check_node_pool = std.heap.MemoryPool(TriggeredCheckNode).init(allocator);
+        errdefer triggered_check_node_pool.deinit();
+
         var binding_request_queue_write_buffer = try buffer_pool.create();
         errdefer buffer_pool.destroy(binding_request_queue_write_buffer);
 
@@ -1056,9 +1068,10 @@ pub const AgentContext = struct {
             .allocator = allocator,
             .gathering_main_timer = gathering_main_timer,
             .buffer_pool = buffer_pool,
+            .triggered_check_node_pool = triggered_check_node_pool,
             .connectivity_context_pool = connectivity_context_pool,
             .connectivity_check_context_map = ConnectivityCheckContextMap.init(allocator),
-            .connectivity_check_transaction_map = std.HashMap(CandidatePair, u96, CandidatePairContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .connectivity_check_transaction_map = std.AutoHashMap(CandidatePair, u96).init(allocator),
             .connectivity_checks_timer = connectivity_checks_timer,
             .binding_request_queue_write_buffer = binding_request_queue_write_buffer,
             .username_fragment = result.username,
@@ -1072,8 +1085,9 @@ pub const AgentContext = struct {
 
     pub fn deinit(self: *AgentContext) void {
         self.gathering_main_timer.deinit();
-        if (self.buffer_pool) |*buffer_pool| buffer_pool.deinit();
+        self.buffer_pool.deinit();
 
+        self.triggered_check_node_pool.deinit();
         self.connectivity_checks_timer.deinit();
         self.connectivity_check_transaction_map.deinit();
         self.connectivity_check_context_map.deinit();
@@ -1088,20 +1102,17 @@ pub const AgentContext = struct {
         self.local_candidates.deinit(self.allocator);
         self.remote_candidates.deinit(self.allocator);
 
-        self.checklist.pairs.deinit(self.allocator);
-        self.checklist.valid_list.deinit(self.allocator);
         self.checklist.deinit(self.allocator);
     }
 
     pub fn initSocketContexts(self: *AgentContext, sockets: []const std.os.fd_t, addresses: []const std.net.Address) !void {
         std.debug.assert(sockets.len == addresses.len);
         const socket_count = sockets.len;
-        const buffer_pool = &self.buffer_pool.?;
 
         var socket_contexts = try self.allocator.alloc(SocketContext, socket_count);
         errdefer self.allocator.free(socket_contexts);
         for (0..socket_count) |index| {
-            const read_buffer = try buffer_pool.create();
+            const read_buffer = try self.buffer_pool.create();
             socket_contexts[index] = SocketContext.init(self.id, @intCast(index), sockets[index], addresses[index], read_buffer);
         }
 
@@ -1110,7 +1121,6 @@ pub const AgentContext = struct {
 
     pub fn initGathering(self: *AgentContext) !void {
         const socket_count = self.socket_contexts.len;
-        const buffer_pool = &self.buffer_pool.?;
 
         var gathering_candidate_statuses = try self.allocator.alloc(CandidateGatheringStatus, socket_count);
         errdefer self.allocator.free(gathering_candidate_statuses);
@@ -1121,8 +1131,8 @@ pub const AgentContext = struct {
         errdefer for (transaction_context_list.items) |*ctx| ctx.deinit();
 
         for (0..socket_count) |index| {
-            const write_buffer = try buffer_pool.create();
-            const result_storage = try buffer_pool.create();
+            const write_buffer = try self.buffer_pool.create();
+            const result_storage = try self.buffer_pool.create();
             const socket_context = &self.socket_contexts[index];
 
             transaction_context_list.appendAssumeCapacity(try TransactionContext.init(self.id, @intCast(index), socket_context, write_buffer, result_storage));
@@ -1144,9 +1154,14 @@ pub const AgentContext = struct {
         } else null;
     }
 
-    inline fn getPairIndexFromCandidateIndices(self: *AgentContext, local_candidate_index: usize, remote_candidate_index: usize) ?usize {
-        return for (self.checklist.pairs.items, 0..) |p, i| {
-            if (p.local_candidate_index == local_candidate_index and p.remote_candidate_index == remote_candidate_index) break i;
+    inline fn getCandidatePairData(self: *AgentContext, candidate_pair: CandidatePair) ?*CandidatePairData {
+        const index = self.getCandidatePairIndex(candidate_pair) orelse return null;
+        return &self.checklist.pairs_data.items[index];
+    }
+
+    inline fn getCandidatePairIndex(self: *AgentContext, candidate_pair: CandidatePair) ?usize {
+        return for (self.checklist.pairs.items, 0..) |current_candidate_pair, i| {
+            if (current_candidate_pair.eql(candidate_pair)) break i;
         } else null;
     }
 
@@ -1250,22 +1265,29 @@ pub const AgentContext = struct {
         self.pruneCandidatePairs();
         self.removeLowerPriorityPairs();
 
-        std.sort.heap(CandidatePair, self.checklist.pairs.items, {}, (struct {
-            fn greaterThan(_: void, a: CandidatePair, b: CandidatePair) bool {
-                return a.priority > b.priority;
+        const SortContext = struct {
+            checklist: *Checklist,
+
+            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                return ctx.checklist.pairs_data.items[a].priority > ctx.checklist.pairs_data.items[b].priority;
             }
-        }).greaterThan);
+
+            pub fn swap(ctx: @This(), a: usize, b: usize) void {
+                std.mem.swap(CandidatePair, &ctx.checklist.pairs.items[a], &ctx.checklist.pairs.items[b]);
+                std.mem.swap(CandidatePairData, &ctx.checklist.pairs_data.items[a], &ctx.checklist.pairs_data.items[b]);
+            }
+        };
+
+        std.sort.heapContext(0, self.checklist.pairs.items.len, SortContext{ .checklist = &self.checklist });
     }
 
-    fn makeCandidatePair(self: *const AgentContext, local_candidate_index: usize, remote_candidate_index: usize) CandidatePair {
-        const local_candidate = &self.local_candidates.items[local_candidate_index];
-        const remote_candidate = &self.remote_candidates.items[remote_candidate_index];
+    fn makeCandidatePairData(self: *const AgentContext, candidate_pair: CandidatePair) CandidatePairData {
+        const local_candidate = &self.local_candidates.items[candidate_pair.local_candidate_index];
+        const remote_candidate = &self.remote_candidates.items[candidate_pair.remote_candidate_index];
 
         const g = if (self.role == .controlling) local_candidate.priority else remote_candidate.priority;
         const d = if (self.role == .controlled) local_candidate.priority else remote_candidate.priority;
-        return CandidatePair{
-            .local_candidate_index = local_candidate_index,
-            .remote_candidate_index = remote_candidate_index,
+        return CandidatePairData{
             .priority = (@as(u64, @min(g, d)) << 32) + (@as(u64, @max(g, d) << 1)) + @as(u64, if (g > d) 1 else 0),
             .foundation = CandidatePairFoundation{ .local = local_candidate.foundation, .remote = remote_candidate.foundation },
         };
@@ -1274,6 +1296,7 @@ pub const AgentContext = struct {
     fn formCandidatesPairs(self: *AgentContext) void {
         // TODO(Corendos): Better handle checklist size
         var pairs = std.ArrayListUnmanaged(CandidatePair).initCapacity(self.allocator, 100) catch unreachable;
+        var pairs_data = std.ArrayListUnmanaged(CandidatePairData).initCapacity(self.allocator, 100) catch unreachable;
 
         for (self.local_candidates.items, 0..) |local_candidate, i| {
             const local_component_id = local_candidate.component_id;
@@ -1282,52 +1305,62 @@ pub const AgentContext = struct {
                 const remote_component_id = remote_candidate.component_id;
                 const remote_address_family = remote_candidate.transport_address.any.family;
                 if (local_component_id == remote_component_id and local_address_family == remote_address_family) {
-                    pairs.appendAssumeCapacity(self.makeCandidatePair(i, j));
+                    const candidate_pair = CandidatePair{ .local_candidate_index = i, .remote_candidate_index = j };
+                    pairs.appendAssumeCapacity(candidate_pair);
+                    pairs_data.appendAssumeCapacity(self.makeCandidatePairData(candidate_pair));
                 }
             }
         }
 
-        self.checklist = Checklist.init(pairs, self.allocator) catch unreachable;
+        self.checklist = Checklist.init(pairs, pairs_data) catch unreachable;
     }
 
     fn pruneCandidatePairs(self: *AgentContext) void {
-        for (self.checklist.pairs.items) |*p| {
-            const local_candidate = self.local_candidates.items[p.local_candidate_index];
+        // Replace reflexive candidate with their base as per https://www.rfc-editor.org/rfc/rfc8445#section-6.1.2.4.
+        for (self.checklist.pairs.items) |*candidate_pair| {
+            const local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
+
             if (local_candidate.type == .server_reflexive) {
                 const new_local_candidate_index = for (self.local_candidates.items, 0..) |*c, i| {
                     if (c.type == .host and c.transport_address.eql(local_candidate.base_address)) break i;
                 } else unreachable;
-                p.local_candidate_index = new_local_candidate_index;
+                candidate_pair.local_candidate_index = new_local_candidate_index;
             }
         }
 
+        // Remove redundant pairs as per https://www.rfc-editor.org/rfc/rfc8445#section-6.1.2.4.
         var index: usize = 0;
         var count: usize = self.checklist.pairs.items.len;
         while (index < count - 1) : (index += 1) {
-            const source_pair = &self.checklist.pairs.items[index];
-            const source_local_candidate_index = source_pair.local_candidate_index;
-            const source_local_candidate = self.local_candidates.items[source_local_candidate_index];
-            const source_remote_candidate_index = source_pair.remote_candidate_index;
+            const current_candidate_pair = &self.checklist.pairs.items[index];
+            const current_candidate_pair_data = &self.checklist.pairs_data.items[index];
+
+            const current_local_candidate_index = current_candidate_pair.local_candidate_index;
+            const current_local_candidate = self.local_candidates.items[current_local_candidate_index];
+            const current_remote_candidate_index = current_candidate_pair.remote_candidate_index;
 
             var other_index: usize = index + 1;
 
             while (other_index < count) {
-                const dest_pair = &self.checklist.pairs.items[other_index];
-                const dest_local_candidate_index = dest_pair.local_candidate_index;
-                const dest_local_candidate = self.local_candidates.items[dest_local_candidate_index];
-                const dest_remote_candidate_index = dest_pair.remote_candidate_index;
+                const other_candidate_pair = &self.checklist.pairs.items[other_index];
+                const other_candidate_pair_data = &self.checklist.pairs_data.items[index];
+                const other_local_candidate_index = other_candidate_pair.local_candidate_index;
+                const other_local_candidate = self.local_candidates.items[other_local_candidate_index];
+                const other_remote_candidate_index = other_candidate_pair.remote_candidate_index;
 
-                const have_same_local_candidate_base = std.net.Address.eql(source_local_candidate.base_address, dest_local_candidate.base_address);
-                const have_same_remote_candidate = source_remote_candidate_index == dest_remote_candidate_index;
+                const have_same_local_candidate_base = std.net.Address.eql(current_local_candidate.base_address, other_local_candidate.base_address);
+                const have_same_remote_candidate = current_remote_candidate_index == other_remote_candidate_index;
 
                 if (have_same_local_candidate_base and have_same_remote_candidate) {
-                    if (source_pair.priority < dest_pair.priority) {
+                    if (current_candidate_pair_data.priority < other_candidate_pair_data.priority) {
                         // Swap higher priority pair with current one
-                        std.mem.swap(CandidatePair, source_pair, dest_pair);
+                        std.mem.swap(CandidatePair, current_candidate_pair, other_candidate_pair);
+                        std.mem.swap(CandidatePairData, &self.checklist.pairs_data.items[index], &self.checklist.pairs_data.items[other_index]);
                     }
 
                     // Swap redundant candidate pair with last one and reduce the number of candidate pair by one.
-                    std.mem.swap(CandidatePair, dest_pair, &self.checklist.pairs.items[count - 1]);
+                    std.mem.swap(CandidatePair, other_candidate_pair, &self.checklist.pairs.items[count - 1]);
+                    std.mem.swap(CandidatePairData, &self.checklist.pairs_data.items[other_index], &self.checklist.pairs_data.items[count - 1]);
                     count -= 1;
 
                     continue;
@@ -1338,6 +1371,7 @@ pub const AgentContext = struct {
         }
 
         std.debug.assert(count <= self.checklist.pairs.items.len);
+        std.debug.assert(count <= self.checklist.pairs_data.items.len);
         self.checklist.resize(self.allocator, count) catch unreachable;
     }
 
@@ -1353,20 +1387,20 @@ pub const AgentContext = struct {
 
         var foundation_map = std.AutoHashMap(CandidatePairFoundation, usize).init(arena_state.allocator());
 
-        for (self.checklist.pairs.items, 0..) |p, i| {
+        for (self.checklist.pairs.items, self.checklist.pairs_data.items, 0..) |candidate_pair, candidate_pair_data, i| {
             // Compute pair foundation
-            const local_candidate = self.local_candidates.items[p.local_candidate_index];
+            const local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
 
             // Get hash map entry if it exists.
-            const gop = foundation_map.getOrPut(p.foundation) catch unreachable;
+            const gop = foundation_map.getOrPut(candidate_pair_data.foundation) catch unreachable;
 
             if (!gop.found_existing) {
                 // If it doesn't exist yet, we store this pair as the one that will be put in the Waiting state.
                 gop.value_ptr.* = i;
             } else {
                 // Otherwise, we compare the component IDs and/or priorities to select the one that will be put in the Waiting state.
-                const stored_pair = self.checklist.pairs.items[gop.value_ptr.*];
-                const stored_local_candidate = self.local_candidates.items[stored_pair.local_candidate_index];
+                const stored_candidate_pair = self.checklist.pairs.items[gop.value_ptr.*];
+                const stored_local_candidate = self.local_candidates.items[stored_candidate_pair.local_candidate_index];
 
                 const has_lower_component_id = local_candidate.component_id < stored_local_candidate.component_id;
                 const has_higher_priority = local_candidate.component_id == stored_local_candidate.component_id and local_candidate.priority > stored_local_candidate.priority;
@@ -1402,48 +1436,47 @@ pub const AgentContext = struct {
         return .{ .response = self.binding_request_queue[index].response, .source = self.binding_request_queue[index].source };
     }
 
-    fn getWaitingPair(self: *AgentContext) ?*CandidatePair {
-        const index = self.getWaitingPairIndex() orelse return null;
-        return &self.checklist.pairs.items[index];
-    }
-
-    fn getWaitingPairIndex(self: *AgentContext) ?usize {
-        var pair_index: ?usize = null;
+    fn getWaitingPair(self: *AgentContext) ?CandidatePair {
+        var result: ?CandidatePair = null;
 
         var max_priority: u64 = 0;
         var min_component_id: u8 = 255;
-        for (self.checklist.pairs.items, 0..) |*p, index| {
-            if (p.state == .waiting) {
-                const has_higher_priority = p.priority > max_priority;
-                const has_same_priority = p.priority == max_priority;
-                const has_lower_component_id = self.local_candidates.items[p.local_candidate_index].component_id < min_component_id;
+        for (self.checklist.pairs.items, self.checklist.pairs_data.items) |candidate_pair, candidate_pair_data| {
+            if (candidate_pair_data.state == .waiting) {
+                const has_higher_priority = candidate_pair_data.priority > max_priority;
+                const has_same_priority = candidate_pair_data.priority == max_priority;
+                const has_lower_component_id = self.local_candidates.items[candidate_pair.local_candidate_index].component_id < min_component_id;
                 if (has_higher_priority or (has_same_priority and has_lower_component_id)) {
-                    pair_index = index;
-                    max_priority = p.priority;
-                    min_component_id = self.local_candidates.items[p.local_candidate_index].component_id;
+                    result = candidate_pair;
+                    max_priority = candidate_pair_data.priority;
+                    min_component_id = self.local_candidates.items[candidate_pair.local_candidate_index].component_id;
                 }
             }
         }
 
-        return pair_index;
+        return result;
     }
 
     inline fn getWaitingPairCount(self: *const AgentContext) usize {
         var count: usize = 0;
 
-        for (self.checklist.pairs.items) |pair| {
-            if (pair.state == .waiting) count += 1;
+        for (self.checklist.pairs_data.items) |candidate_pair_data| {
+            if (candidate_pair_data.state == .waiting) count += 1;
         }
 
         return count;
     }
 
     fn unfreezePair(self: *AgentContext) void {
-        pair: for (self.checklist.pairs.items, 0..) |*p, index| {
-            if (p.state != .frozen) continue;
-            for (self.checklist.pairs.items) |*p2| {
-                if (p2 == p) continue;
-                if ((p2.state == .waiting or p2.state == .in_progress) and p.foundation.eql(p2.foundation)) continue :pair;
+        pair: for (self.checklist.pairs_data.items, 0..) |current_candidate_pair_data, index| {
+            if (current_candidate_pair_data.state != .frozen) continue;
+
+            for (self.checklist.pairs_data.items, 0..) |other_candidate_pair_data, other_index| {
+                if (index == other_index) continue;
+
+                const have_same_foundation = current_candidate_pair_data.foundation.eql(other_candidate_pair_data.foundation);
+                const other_state = other_candidate_pair_data.state;
+                if ((other_state == .waiting or other_state == .in_progress) and have_same_foundation) continue :pair;
             }
 
             // If we are here, we didn't find another pair with the same foundation in the waiting or in_progress state.
@@ -1462,10 +1495,10 @@ pub const AgentContext = struct {
                 try writer.print("    {s}: {}\n", .{ @tagName(t), self.ctx.checklist.state_count[@intFromEnum(t)] });
             }
 
-            for (self.ctx.checklist.pairs.items) |p| {
+            for (self.ctx.checklist.pairs.items, self.ctx.checklist.pairs_data.items) |candidate_pair, candidate_pair_data| {
                 const foundation_bit_size = @bitSizeOf(Foundation.IntType);
-                const pair_foundation: u64 = (@as(u64, p.foundation.remote.as_number()) << foundation_bit_size) + @as(u64, p.foundation.local.as_number());
-                try writer.print("    {}:{} ({}): {s}\n", .{ p.local_candidate_index, p.remote_candidate_index, pair_foundation, @tagName(p.state) });
+                const pair_foundation: u64 = (@as(u64, candidate_pair_data.foundation.remote.as_number()) << foundation_bit_size) + @as(u64, candidate_pair_data.foundation.local.as_number());
+                try writer.print("    {}:{} ({}): {s}\n", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, pair_foundation, @tagName(candidate_pair_data.state) });
             }
         }
     };
@@ -1481,10 +1514,10 @@ pub const AgentContext = struct {
             _ = fmt;
             try writer.print("Agent {}\n", .{self.ctx.id});
 
-            for (self.ctx.checklist.valid_list.items) |p| {
+            for (self.ctx.checklist.valid_pairs.items, self.ctx.checklist.valid_pairs_data.items) |candidate_pair, candidate_pair_data| {
                 const foundation_bit_size = @bitSizeOf(Foundation.IntType);
-                const pair_foundation: u64 = (@as(u64, p.foundation.remote.as_number()) << foundation_bit_size) + @as(u64, p.foundation.local.as_number());
-                try writer.print("    {}:{} ({}): {s}\n", .{ p.local_candidate_index, p.remote_candidate_index, pair_foundation, @tagName(p.state) });
+                const pair_foundation: u64 = (@as(u64, candidate_pair_data.foundation.remote.as_number()) << foundation_bit_size) + @as(u64, candidate_pair_data.foundation.local.as_number());
+                try writer.print("    {}:{} ({}): {s}\n", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, pair_foundation, @tagName(candidate_pair_data.state) });
             }
         }
     };
@@ -2102,6 +2135,55 @@ pub const Context = struct {
                 self.handleConnectivityCheckMainTimer(agent_context) catch @panic("TODO");
             },
         }
+
+        // Update checklist state
+        var scratch_buffer = agent_context.buffer_pool.create() catch unreachable;
+        defer agent_context.buffer_pool.destroy(scratch_buffer);
+        var scratch_arena = std.heap.FixedBufferAllocator.init(scratch_buffer);
+
+        // NOTE(Corendos): This contains a boolean indicating for each component is there is a nominated pair.
+        var hash_map = std.AutoHashMap(u8, struct { has_nominated_pair: bool = false, has_valid_pair: bool = false }).init(scratch_arena.allocator());
+
+        // We check all the pairs, storing for each component if there is a nominated pair. We also check for non complete transaction.
+        var in_progress: bool = false;
+        for (agent_context.checklist.pairs.items, agent_context.checklist.pairs_data.items) |candidate_pair, candidate_pair_data| {
+            const local_candidate = agent_context.local_candidates.items[candidate_pair.local_candidate_index];
+            const gop = hash_map.getOrPut(local_candidate.component_id) catch unreachable;
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{};
+            }
+
+            gop.value_ptr.has_nominated_pair = gop.value_ptr.has_nominated_pair or candidate_pair_data.nominated;
+
+            in_progress = in_progress or (candidate_pair_data.state != .succeeded and candidate_pair_data.state != .failed);
+        }
+
+        for (agent_context.checklist.valid_pairs.items) |p| {
+            const local_candidate = agent_context.local_candidates.items[p.local_candidate_index];
+            const gop = hash_map.getOrPut(local_candidate.component_id) catch unreachable;
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{};
+            }
+            gop.value_ptr.has_valid_pair = true;
+        }
+
+        var is_complete: bool = true;
+        var all_component_have_valid_pair: bool = true;
+
+        var it = hash_map.iterator();
+        while (it.next()) |entry| {
+            is_complete = is_complete and entry.value_ptr.has_nominated_pair;
+            all_component_have_valid_pair = all_component_have_valid_pair and entry.value_ptr.has_valid_pair;
+        }
+
+        const new_state: ChecklistState = if (is_complete) .completed else if (!all_component_have_valid_pair and !in_progress) .failed else .running;
+
+        if (new_state != agent_context.checklist.state) {
+            log.debug("Agent {} - New checklist state: {}", .{ agent_context.id, new_state });
+            agent_context.checklist.state = new_state;
+        } else {
+            log.debug("Agent {} - Checklist still in {} state", .{ agent_context.id, new_state });
+        }
     }
 
     fn readCallback(
@@ -2303,40 +2385,44 @@ pub const Context = struct {
             if (c.transport_address.eql(socket_context.address)) break i;
         } else unreachable;
 
-        const remote_candidate_index_opt: ?usize = for (agent_context.remote_candidates.items, 0..) |*c, i| {
+        const remote_candidate_index = for (agent_context.remote_candidates.items, 0..) |*c, i| {
             if (c.transport_address.eql(source)) break i;
-        } else null;
-
-        if (remote_candidate_index_opt == null) {
+        } else {
             log.debug("Agent {} - No remote candidate matching the source address (peer reflexive candidate maybe?)", .{agent_context.id});
             return;
-        }
+        };
 
-        const candidate_pair_index = agent_context.getPairIndexFromCandidateIndices(local_candidate_index, remote_candidate_index_opt.?) orelse {
+        const candidate_pair = CandidatePair{ .local_candidate_index = local_candidate_index, .remote_candidate_index = remote_candidate_index };
+        const candidate_pair_index = agent_context.getCandidatePairIndex(candidate_pair) orelse {
             log.debug("Agent {} - No pair corresponding to the given indices", .{agent_context.id});
             return;
         };
-        const candidate_pair = &agent_context.checklist.pairs.items[candidate_pair_index];
 
-        switch (candidate_pair.state) {
+        const candidate_pair_data = &agent_context.checklist.pairs_data.items[candidate_pair_index];
+
+        switch (candidate_pair_data.state) {
             .succeeded => {},
             .in_progress => {
-                const transaction_id = agent_context.connectivity_check_transaction_map.get(candidate_pair.*).?;
+                const transaction_id = agent_context.connectivity_check_transaction_map.get(candidate_pair).?;
                 const check_context = agent_context.connectivity_check_context_map.get(transaction_id).?;
                 check_context.transaction_context.stopRetransmits(self.loop);
                 check_context.flags.is_canceled = true;
 
                 agent_context.checklist.setPairState(candidate_pair_index, .waiting);
 
-                if (!agent_context.checklist.triggeredCheckQueueContains(candidate_pair_index)) {
-                    agent_context.checklist.pushTriggeredCheck(candidate_pair_index);
+                if (agent_context.checklist.triggered_check_queue.findFirst(TriggeredCheckNode{ .candidate_pair = candidate_pair }, TriggeredCheckNode.eql) == null) {
+                    const new_node = try agent_context.triggered_check_node_pool.create();
+                    new_node.* = .{ .candidate_pair = candidate_pair };
+                    agent_context.checklist.triggered_check_queue.pushBack(new_node);
                 }
             },
             else => {
                 agent_context.checklist.setPairState(candidate_pair_index, .waiting);
 
-                if (!agent_context.checklist.triggeredCheckQueueContains(candidate_pair_index)) {
-                    agent_context.checklist.pushTriggeredCheck(candidate_pair_index);
+                if (agent_context.checklist.triggered_check_queue.findFirst(TriggeredCheckNode{ .candidate_pair = candidate_pair }, TriggeredCheckNode.eql) == null) {
+                    const new_node = try agent_context.triggered_check_node_pool.create();
+                    new_node.* = .{ .candidate_pair = candidate_pair };
+                    agent_context.checklist.triggered_check_queue.pushBack(new_node);
                 }
             },
         }
@@ -2350,13 +2436,13 @@ pub const Context = struct {
         result: TransactionResult,
     ) !void {
         _ = socket_context;
-        const candidate_pair_index = check_context.candidate_pair_index;
-        const candidate_pair = &agent_context.checklist.pairs.items[candidate_pair_index];
+        const candidate_pair = check_context.candidate_pair;
+        const candidate_pair_index = agent_context.getCandidatePairIndex(candidate_pair) orelse unreachable;
 
         defer {
             _ = agent_context.connectivity_check_context_map.remove(check_context.transaction_context.transaction_id.?);
-            agent_context.buffer_pool.?.destroy(@alignCast(check_context.transaction_context.write_buffer[0..4096]));
-            agent_context.buffer_pool.?.destroy(@alignCast(check_context.transaction_context.result_storage[0..4096]));
+            agent_context.buffer_pool.destroy(@alignCast(check_context.transaction_context.write_buffer[0..4096]));
+            agent_context.buffer_pool.destroy(@alignCast(check_context.transaction_context.result_storage[0..4096]));
             check_context.transaction_context.deinit();
             agent_context.connectivity_context_pool.destroy(check_context);
         }
@@ -2401,25 +2487,28 @@ pub const Context = struct {
             if (c.transport_address.eql(response_address)) break i;
         } else @panic("Probably a peer reflexive candidate");
 
-        var valid_pair = agent_context.makeCandidatePair(valid_local_candidate_index, candidate_pair.remote_candidate_index);
-        valid_pair.state = .succeeded;
+        const valid_candidate_pair = CandidatePair{ .local_candidate_index = valid_local_candidate_index, .remote_candidate_index = candidate_pair.remote_candidate_index };
+        var valid_candidate_pair_data = agent_context.makeCandidatePairData(valid_candidate_pair);
+        valid_candidate_pair_data.state = .succeeded;
 
         valid: {
-            if (CandidatePairContext.eql(undefined, candidate_pair.*, valid_pair)) {
-                agent_context.checklist.valid_list.append(self.allocator, valid_pair) catch unreachable;
+            if (candidate_pair.eql(valid_candidate_pair)) {
+                agent_context.checklist.valid_pairs.append(self.allocator, valid_candidate_pair) catch unreachable;
+                agent_context.checklist.valid_pairs_data.append(self.allocator, valid_candidate_pair_data) catch unreachable;
                 break :valid;
             }
 
-            for (agent_context.checklist.pairs.items) |*p| {
-                if (CandidatePairContext.eql(undefined, p.*, valid_pair)) {
-                    agent_context.checklist.valid_list.append(self.allocator, valid_pair) catch unreachable;
+            for (agent_context.checklist.pairs.items) |other_candidate_pair| {
+                if (other_candidate_pair.eql(valid_candidate_pair)) {
+                    agent_context.checklist.valid_pairs.append(self.allocator, valid_candidate_pair) catch unreachable;
+                    agent_context.checklist.valid_pairs_data.append(self.allocator, valid_candidate_pair_data) catch unreachable;
                     break :valid;
                 }
             }
         }
 
-        for (agent_context.checklist.pairs.items, 0..) |*p, i| {
-            if (p.state == .frozen and candidate_pair.foundation.eql(valid_pair.foundation)) {
+        for (agent_context.checklist.pairs_data.items, 0..) |candidate_pair_data, i| {
+            if (candidate_pair_data.state == .frozen and candidate_pair_data.foundation.eql(valid_candidate_pair_data.foundation)) {
                 agent_context.checklist.setPairState(i, .waiting);
             }
         }
@@ -2443,7 +2532,7 @@ pub const Context = struct {
         const check_context_opt = agent_context.connectivity_check_context_map.get(message_header.transaction_id);
 
         if (check_context_opt) |check_context| {
-            const candidate_pair = &agent_context.checklist.pairs.items[check_context.candidate_pair_index];
+            const candidate_pair = check_context.candidate_pair;
 
             log.debug("Agent {} - Received response on {s}transaction {x:12} for candidate pair ({}:{})", .{
                 agent_context.id,
@@ -2462,10 +2551,15 @@ pub const Context = struct {
     inline fn tryPopTriggeredCheckQueue(agent_context: *AgentContext) ?usize {
         //return agent_context.checklist.popTriggeredCheck();
         while (!agent_context.checklist.triggered_check_queue.empty()) {
-            const pair_index = agent_context.checklist.popTriggeredCheck().?;
-            const pair = &agent_context.checklist.pairs.items[pair_index];
-            if (pair.state == .waiting) {
-                return pair_index;
+            var node = agent_context.checklist.triggered_check_queue.popFront().?;
+            defer agent_context.triggered_check_node_pool.destroy(node);
+
+            const candidate_pair = node.candidate_pair;
+            const candidate_pair_index = agent_context.getCandidatePairIndex(candidate_pair).?;
+            const candidate_pair_data = &agent_context.checklist.pairs_data.items[candidate_pair_index];
+
+            if (candidate_pair_data.state == .waiting) {
+                return candidate_pair_index;
             }
         }
 
@@ -2473,7 +2567,7 @@ pub const Context = struct {
     }
 
     fn startTransaction(self: *Context, agent_context: *AgentContext, candidate_pair_index: usize, is_triggered_check: bool) !void {
-        const candidate_pair = &agent_context.checklist.pairs.items[candidate_pair_index];
+        const candidate_pair = agent_context.checklist.pairs.items[candidate_pair_index];
         const local_candidate = agent_context.local_candidates.items[candidate_pair.local_candidate_index];
         const remote_candidate = agent_context.remote_candidates.items[candidate_pair.remote_candidate_index];
 
@@ -2506,21 +2600,21 @@ pub const Context = struct {
             agent_context.id,
             0,
             socket_context,
-            try agent_context.buffer_pool.?.create(),
-            try agent_context.buffer_pool.?.create(),
+            try agent_context.buffer_pool.create(),
+            try agent_context.buffer_pool.create(),
         );
         errdefer transaction_context.deinit();
 
         check_context.* = ConnectivityCheckContext{
             .agent_id = agent_context.id,
             .socket_index = @intCast(socket_context_index),
-            .candidate_pair_index = candidate_pair_index,
+            .candidate_pair = candidate_pair,
             .transaction_context = transaction_context,
             .flags = .{ .is_triggered_check = is_triggered_check },
         };
         context_map_gop.value_ptr.* = check_context;
 
-        const transaction_map_gop = try agent_context.connectivity_check_transaction_map.getOrPut(candidate_pair.*);
+        const transaction_map_gop = try agent_context.connectivity_check_transaction_map.getOrPut(candidate_pair);
         transaction_map_gop.value_ptr.* = request.transaction_id;
 
         log.debug("Agent {} - Starting {s}transaction {x:12} for candidate pair ({}:{})", .{
@@ -2559,7 +2653,9 @@ pub const Context = struct {
             agent_context.unfreezePair();
         }
 
-        if (agent_context.getWaitingPairIndex()) |candidate_pair_index| {
+        if (agent_context.getWaitingPair()) |candidate_pair| {
+            const candidate_pair_index = agent_context.getCandidatePairIndex(candidate_pair).?;
+
             try self.startTransaction(agent_context, candidate_pair_index, false);
 
             agent_context.connectivity_checks_timer.run(
