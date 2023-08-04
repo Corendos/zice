@@ -1183,10 +1183,6 @@ pub const AgentContext = struct {
         return null;
     }
 
-    fn addLocalCandidate(self: *AgentContext, candidate: Candidate) !void {
-        try self.local_candidates.append(self.allocator, candidate);
-    }
-
     fn computePriorities(self: *AgentContext) void {
         // TODO(Corendos): Handle component ID as well.
 
@@ -1247,17 +1243,28 @@ pub const AgentContext = struct {
         }
     }
 
-    fn removeRedundantAndSortCandidates(self: *AgentContext) void {
-        self.computePriorities();
+    fn removeRedundantCandidates(self: *AgentContext) void {
+        var current_index: usize = 0;
+        while (current_index < self.local_candidates.items.len - 1) : (current_index += 1) {
+            const current_candidate: Candidate = self.local_candidates.items[current_index];
 
-        // Sort candidates
-        std.sort.heap(Candidate, self.local_candidates.items, {}, (struct {
-            fn lessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
-                return lhs.priority > rhs.priority;
+            var other_index: usize = current_index + 1;
+            while (other_index < self.local_candidates.items.len) {
+                const other_candidate: Candidate = self.local_candidates.items[other_index];
+
+                const have_same_base_address = current_candidate.base_address.eql(other_candidate.base_address);
+                const have_same_transport_address = current_candidate.transport_address.eql(other_candidate.transport_address);
+                if (have_same_base_address and have_same_transport_address) {
+                    if (current_candidate.priority < other_candidate.priority) {
+                        std.mem.swap(Candidate, &self.local_candidates.items[current_index], &self.local_candidates.items[other_index]);
+                    }
+                    _ = self.local_candidates.swapRemove(other_index);
+                    continue;
+                }
+
+                other_index += 1;
             }
-        }).lessThan);
-
-        // TODO(Corendos): Remove redundant candidates.
+        }
     }
 
     fn computeCandidatePairs(self: *AgentContext) !void {
@@ -1856,7 +1863,7 @@ pub const Context = struct {
                     .address_index = @intCast(index),
                 },
             };
-            agent_context.addLocalCandidate(candidate) catch unreachable;
+            agent_context.local_candidates.append(self.allocator, candidate) catch unreachable;
             agent_context.on_candidate_callback(agent_context.userdata, agent_context.id, .{ .candidate = candidate });
         }
 
@@ -1979,7 +1986,8 @@ pub const Context = struct {
 
         agent_context.on_candidate_callback(agent_context.userdata, agent_context.id, .{ .done = {} });
 
-        agent_context.removeRedundantAndSortCandidates();
+        agent_context.computePriorities();
+        agent_context.removeRedundantCandidates();
 
         if (agent_context.has_remote_candidates) {
             self.startChecks(agent_context);
@@ -2006,7 +2014,6 @@ pub const Context = struct {
         transaction_context: *TransactionContext,
         result: TransactionResult,
     ) void {
-        _ = self;
         const payload = result catch |err| {
             agent_context.gathering_candidate_statuses[transaction_context.index] = .failed;
             log.debug("Agent {} - Gathering failed with {} for base address \"{}\"", .{ agent_context.id, err, socket_context.address });
@@ -2025,7 +2032,7 @@ pub const Context = struct {
                     .address_index = @intCast(socket_context.index),
                 },
             };
-            agent_context.addLocalCandidate(candidate) catch unreachable;
+            agent_context.local_candidates.append(self.allocator, candidate) catch unreachable;
             agent_context.on_candidate_callback(agent_context.userdata, agent_context.id, .{ .candidate = candidate });
         }
 
