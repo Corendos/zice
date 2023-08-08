@@ -4,15 +4,6 @@
 const std = @import("std");
 const xev = @import("xev");
 
-const zice = @import("zice");
-
-pub const std_options = struct {
-    pub const log_scope_levels = &.{
-        //std.log.ScopeLevel{ .scope = .default, .level = .info },
-        std.log.ScopeLevel{ .scope = .zice, .level = .debug },
-    };
-};
-
 const StopHandler = struct {
     storage: [@sizeOf(std.os.linux.signalfd_siginfo)]u8,
     fd: std.os.fd_t,
@@ -62,62 +53,34 @@ const StopHandler = struct {
         std.os.sigprocmask(std.os.SIG.BLOCK, &self.mask, null);
     }
 };
-pub fn candidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
-    _ = userdata;
-    if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation().as_number(), result.candidate.transport_address });
-    }
-}
 
-pub fn stateChangeCallback(userdata: ?*anyopaque, agent_index: u32, state: zice.GatheringState) void {
-    _ = userdata;
-    std.log.info("Agent {} new gathering state: {any}", .{ agent_index, state });
-}
+pub const CandidatePair = struct {
+    local: usize,
+    remote: usize,
+};
 
-const Context = struct {
-    zice_context: *zice.Context,
-    agent: u32 = 0,
+pub const CandidatePairData = struct {
+    data: [10]u8 = undefined,
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var network_loop = try xev.Loop.init(.{});
-    defer network_loop.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
 
-    var stop_handler = try StopHandler.init();
-    defer stop_handler.deinit();
+    var logging_allocator_state = std.heap.loggingAllocator(arena_state.allocator());
+    var allocator = logging_allocator_state.allocator();
 
-    stop_handler.register(&network_loop);
+    var map = std.AutoHashMap(CandidatePair, CandidatePairData).init(allocator);
+    defer map.deinit();
 
-    var zice_context = try zice.Context.init(gpa.allocator());
-    defer zice_context.deinit();
+    for (0..10) |i| {
+        const gop = try map.getOrPut(.{ .local = i, .remote = 2 });
 
-    try zice_context.start(&network_loop);
+        gop.value_ptr.* = .{};
+    }
 
-    var network_loop_thread = try std.Thread.spawn(.{}, (struct {
-        fn callback(l: *xev.Loop) !void {
-            try l.run(.until_done);
-        }
-    }).callback, .{&network_loop});
-
-    var context = Context{
-        .zice_context = &zice_context,
-    };
-
-    var agent = try zice_context.newAgent(zice.CreateAgentOptions{
-        .userdata = &context,
-        .on_candidate_callback = candidateCallback,
-        .on_state_change_callback = stateChangeCallback,
-    });
-    defer zice_context.deleteAgent(agent);
-
-    context.agent = agent;
-
-    var gather_completion: zice.Completion = .{};
-
-    try zice_context.gatherCandidates(&gather_completion, agent);
-
-    network_loop_thread.join();
+    std.log.debug("Used: {}", .{arena_state.queryCapacity()});
 }

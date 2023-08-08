@@ -28,7 +28,7 @@ pub fn buildSamples(b: *std.build.Builder, optimize: std.builtin.Mode, target: s
         });
         executable.addModule("zice", b.modules.get("zice").?);
         executable.addModule("xev", b.dependency("libxev", .{}).module("xev"));
-        const install_executable = b.addInstallArtifact(executable);
+        const install_executable = b.addInstallArtifact(executable, .{});
 
         const build_step_description = std.fmt.allocPrint(b.allocator, "Build the \"{s}\" executable", .{executable_name}) catch unreachable;
         const build_step = b.step(executable_name, build_step_description);
