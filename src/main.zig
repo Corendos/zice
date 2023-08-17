@@ -172,6 +172,7 @@ fn makeConnectivityCheckBindingRequest(
     priority: u32,
     role: AgentRole,
     tiebreaker: u64,
+    use_candidate: bool,
     allocator: std.mem.Allocator,
 ) !ztun.Message {
     var message_builder = ztun.MessageBuilder.init(allocator);
@@ -196,6 +197,11 @@ fn makeConnectivityCheckBindingRequest(
         .controlled => try (ztun.attr.common.IceControlled{ .value = tiebreaker }).toAttribute(allocator),
     };
     try message_builder.addAttribute(role_attribute);
+
+    if (use_candidate) {
+        const use_candidate_attribute = try (ztun.attr.common.UseCandidate{}).toAttribute(allocator);
+        try message_builder.addAttribute(use_candidate_attribute);
+    }
 
     message_builder.addMessageIntegrity(authentication);
 
@@ -344,8 +350,11 @@ pub const OnCandidateCallback = *const fn (userdata: ?*anyopaque, agent_id: u32,
 fn noopCandidateCallback(_: ?*anyopaque, _: u32, _: CandidateResult) void {}
 
 /// Callback that is called when the ICE state changes.
-pub const OnStateChangeCallback = *const fn (userdata: ?*anyopaque, agent_id: u32, state: GatheringState) void;
-fn noopStateChangeCallback(_: ?*anyopaque, _: u32, _: GatheringState) void {}
+pub const OnStateChangeCallback = *const fn (userdata: ?*anyopaque, agent_id: u32, state: AgentState) void;
+fn noopStateChangeCallback(_: ?*anyopaque, _: u32, _: AgentState) void {}
+
+pub const OnDataCallback = *const fn (userdate: ?*anyopaque, agent_id: u32, component_id: u8, data: []const u8) void;
+fn noopDataCallback(_: ?*anyopaque, _: u32, _: u8, _: []const u8) void {}
 
 pub const TransactionError = error{
     Canceled,
@@ -485,8 +494,9 @@ pub const TransactionContext = struct {
             break :b ztun.Message.readAlloc(stream.reader(), allocator.allocator()) catch unreachable;
         };
 
-        std.debug.assert(self.result == null);
-        self.result = .{ .message = message, .source = source };
+        if (self.result == null) {
+            self.result = .{ .message = message, .source = source };
+        }
 
         if (self.state() == .dead) {
             self.callback(self.userdata, self, self.result.?);
@@ -765,22 +775,14 @@ const AgentRole = enum {
     controlled,
 };
 
-/// Represents the state of the agent.
-const AgentState = enum {
-    /// The agent has been created.
-    created,
-    /// The agent is checking candidate pairs.
-    checking,
-    /// The agent connection process completed.
+/// Represents the state of the ICE session.
+pub const AgentState = enum {
+    /// The Agent is running.
+    running,
+    /// The Agent completed all the checklists,
     completed,
-    /// The agent is connected to another agent.
-    connected,
-    /// The agent has been disconnected from another agent.
-    disconnected,
-    /// The agent failed to connect to another agent.
+    /// The agent has at least on efailed checklist.
     failed,
-    /// The agent connection has been closed.
-    closed,
 };
 
 /// Represents the state of a checklist.
@@ -844,6 +846,7 @@ const CandidatePairFoundation = packed struct {
 
 const TriggeredCheckNode = struct {
     candidate_pair: CandidatePair,
+    nominate: bool = false,
 
     next: ?*TriggeredCheckNode = null,
     prev: ?*TriggeredCheckNode = null,
@@ -870,6 +873,10 @@ const Checklist = struct {
     /// The triggered check FIFO associated with this checklist.
     triggered_check_queue: DoublyLinkedList(TriggeredCheckNode) = .{},
 
+    nomination_in_progress: bool = false,
+
+    selected_pair: ?CandidatePair = null,
+
     pub fn init(allocator: std.mem.Allocator) !Checklist {
         return Checklist{
             .pairs_map = std.AutoArrayHashMap(CandidatePair, CandidatePairData).init(allocator),
@@ -890,13 +897,6 @@ const Checklist = struct {
 
         return candidate_pair_data_a.priority < candidate_pair_data_b.priority;
     }
-
-    //pub fn addPairData(self: *Checklist, candidate_pair: CandidatePair, candidate_pair_data: CandidatePairData) !void {
-    //    const gop = try self.pairs_map.getOrPut(candidate_pair);
-    //    if (gop.found_existing) unreachable;
-
-    //    gop.value_ptr.* = candidate_pair_data;
-    //}
 
     pub fn addPair(self: *Checklist, candidate_pair: CandidatePair, candidate_pair_data: CandidatePairData) !void {
         const gop = try self.pairs_map.getOrPut(candidate_pair);
@@ -978,6 +978,39 @@ const Checklist = struct {
         candidate_pair_data.state = state;
         //log.debug("Pair ({}:{}) {s} -> {s}", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, @tagName(old_state), @tagName(state) });
     }
+
+    pub fn updateState(self: *Checklist) void {
+        const new_state: ChecklistState = b: {
+            const has_nominated_pair_for_component = for (self.valid_pairs_map.values()) |v| {
+                if (v.state == .succeeded and v.nominated) break true;
+            } else false;
+
+            if (has_nominated_pair_for_component) {
+                break :b .completed;
+            }
+
+            const are_pairs_done = for (self.ordered_pairs.items) |candidate_pair| {
+                const candidate_pair_data = self.pairs_map.get(candidate_pair).?;
+                if (candidate_pair_data.state != .succeeded and candidate_pair_data.state != .failed) break false;
+            } else true;
+
+            break :b if (are_pairs_done)
+                .failed
+            else
+                .running;
+        };
+
+        if (new_state == .completed) {
+            self.selected_pair = for (self.valid_pairs_map.keys(), self.valid_pairs_map.values()) |k, v| {
+                if (v.nominated) break k;
+            } else unreachable;
+        }
+
+        if (new_state != self.state) {
+            log.debug("New Checklist state: {s} -> {s}", .{ @tagName(self.state), @tagName(new_state) });
+            self.state = new_state;
+        }
+    }
 };
 
 const ConnectivityCheckContext = struct {
@@ -987,6 +1020,7 @@ const ConnectivityCheckContext = struct {
 
     flags: packed struct {
         is_triggered_check: bool = false,
+        is_nomination: bool = false,
         is_canceled: bool = false,
     } = .{},
 
@@ -1003,7 +1037,7 @@ pub const AgentContext = struct {
     allocator: std.mem.Allocator,
 
     /// The agent state.
-    state: AgentState = .created,
+    state: AgentState = .running,
     /// The agent role.
     role: ?AgentRole = null,
 
@@ -1061,6 +1095,8 @@ pub const AgentContext = struct {
     connectivity_checks_timer: xev.Timer,
     /// The associated xev.Completion.
     connectivity_checks_timer_completion: xev.Completion = .{},
+    /// The completion used to cancel the connectivity checks timer.
+    connectivity_checks_timer_cancel_completion: xev.Completion = .{},
 
     // TODO(Corendos): This is temporary to test how it could work.
     binding_request_queue: [64]struct { source: std.net.Address, response: ztun.Message, storage: [4096]u8 } = undefined,
@@ -1079,6 +1115,8 @@ pub const AgentContext = struct {
     on_candidate_callback: OnCandidateCallback,
     /// Callback to call when the gathering state changes.
     on_state_change_callback: OnStateChangeCallback,
+    /// Callbacks to call when data is available.
+    on_data_callback: OnDataCallback,
 
     fn generateUsernameFragmentAndPassword() struct { username: [8]u8, password: [24]u8 } {
         var buffer: [6 + 18]u8 = undefined;
@@ -1095,6 +1133,7 @@ pub const AgentContext = struct {
         userdata: ?*anyopaque,
         on_candidate_callback: OnCandidateCallback,
         on_state_change_callback: OnStateChangeCallback,
+        on_data_callback: OnDataCallback,
         allocator: std.mem.Allocator,
     ) !AgentContext {
         const result = generateUsernameFragmentAndPassword();
@@ -1135,6 +1174,7 @@ pub const AgentContext = struct {
             .userdata = userdata,
             .on_candidate_callback = on_candidate_callback,
             .on_state_change_callback = on_state_change_callback,
+            .on_data_callback = on_data_callback,
         };
     }
 
@@ -1211,6 +1251,12 @@ pub const AgentContext = struct {
 
     inline fn getLocalCandidateIndexFromTransportAddress(self: *const AgentContext, address: std.net.Address) ?usize {
         return for (self.local_candidates.items, 0..) |c, i| {
+            if (c.transport_address.eql(address)) break i;
+        } else null;
+    }
+
+    inline fn getRemoteCandidateIndexFromTransportAddress(self: *const AgentContext, address: std.net.Address) ?usize {
+        return for (self.remote_candidates.items, 0..) |c, i| {
             if (c.transport_address.eql(address)) break i;
         } else null;
     }
@@ -1634,6 +1680,71 @@ pub const AgentContext = struct {
         }
     }
 
+    pub fn releaseCheckContext(self: *AgentContext, check_context: *ConnectivityCheckContext) void {
+        _ = self.connectivity_check_context_map.remove(check_context.transaction_context.transaction_id.?);
+        self.buffer_pool.destroy(@alignCast(check_context.transaction_context.write_buffer[0..4096]));
+        self.buffer_pool.destroy(@alignCast(check_context.transaction_context.result_storage[0..4096]));
+        check_context.transaction_context.deinit();
+        self.connectivity_context_pool.destroy(check_context);
+    }
+
+    pub fn handleNomination(self: *AgentContext, candidate_pair: CandidatePair, loop: *xev.Loop) void {
+        const candidate_pair_data = self.checklist.valid_pairs_map.getPtr(candidate_pair).?;
+        candidate_pair_data.nominated = true;
+
+        const valid_local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
+
+        if (self.checklist.state == .running) {
+            // Remove pairs with same component ID from the triggered_check_queue.
+            var new_check_queue = DoublyLinkedList(TriggeredCheckNode){};
+            var node_opt: ?*TriggeredCheckNode = self.checklist.triggered_check_queue.head;
+            while (node_opt) |node| {
+                const next = node.next;
+                const node_local_candidate = self.local_candidates.items[node.candidate_pair.local_candidate_index];
+                if (node_local_candidate.component_id == valid_local_candidate.component_id) {
+                    self.triggered_check_node_pool.destroy(node);
+                } else {
+                    node.next = null;
+                    node.prev = null;
+                    new_check_queue.pushBack(node);
+                }
+                node_opt = next;
+            }
+            self.checklist.triggered_check_queue = new_check_queue;
+
+            // Remove pairs with same component ID from the checklist.
+            var index: usize = 0;
+            while (index < self.checklist.ordered_pairs.items.len) {
+                const current_candidate_pair = self.checklist.ordered_pairs.items[index];
+                const current_local_candidate = self.local_candidates.items[current_candidate_pair.local_candidate_index];
+                if (!current_candidate_pair.eql(candidate_pair) and current_local_candidate.component_id == valid_local_candidate.component_id) {
+                    _ = self.checklist.ordered_pairs.orderedRemove(index);
+                    const entry = self.checklist.pairs_map.fetchSwapRemove(current_candidate_pair).?;
+                    self.checklist.state_count[@intFromEnum(entry.value.state)] -= 1;
+
+                    var it = self.connectivity_check_context_map.valueIterator();
+                    while (it.next()) |current_check_context| {
+                        if (current_check_context.*.candidate_pair.eql(current_candidate_pair)) {
+                            current_check_context.*.transaction_context.stopRetransmits(loop);
+                            current_check_context.*.flags.is_canceled = true;
+                        }
+                    }
+                    continue;
+                }
+
+                index += 1;
+            }
+        }
+    }
+
+    pub inline fn setState(self: *AgentContext, new_state: AgentState) void {
+        const old_state = self.state;
+        if (new_state != old_state) {
+            self.state = new_state;
+            self.on_state_change_callback(self.userdata, self.id, new_state);
+        }
+    }
+
     // Debug utilities
 
     const PairsFormatter = struct {
@@ -1669,7 +1780,7 @@ pub const AgentContext = struct {
             for (self.ctx.checklist.valid_pairs_map.keys(), self.ctx.checklist.valid_pairs_map.values()) |candidate_pair, candidate_pair_data| {
                 const foundation_bit_size = @bitSizeOf(Foundation.IntType);
                 const pair_foundation: u64 = (@as(u64, candidate_pair_data.foundation.remote.as_number()) << foundation_bit_size) + @as(u64, candidate_pair_data.foundation.local.as_number());
-                try writer.print("    {}:{} f:{} p:{} = {s}\n", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, pair_foundation, candidate_pair_data.priority, @tagName(candidate_pair_data.state) });
+                try writer.print("    {}:{} f:{} p:{} n:{} = {s}\n", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, pair_foundation, candidate_pair_data.priority, candidate_pair_data.nominated, @tagName(candidate_pair_data.state) });
             }
         }
     };
@@ -1704,6 +1815,7 @@ pub const CreateAgentOptions = struct {
     userdata: ?*anyopaque = null,
     on_candidate_callback: OnCandidateCallback = noopCandidateCallback,
     on_state_change_callback: OnStateChangeCallback = noopStateChangeCallback,
+    on_data_callback: OnDataCallback = noopDataCallback,
 };
 
 const NetworkInterface = struct {
@@ -1720,6 +1832,7 @@ const InterfaceAddress = struct {
 pub const OperationType = enum {
     gather_candidates,
     set_remote_candidates,
+    send,
 };
 
 pub const RemoteCandidateParameters = struct {
@@ -1728,16 +1841,33 @@ pub const RemoteCandidateParameters = struct {
     password: [24]u8,
 };
 
+pub const SendParameters = struct {
+    data_stream_id: u8,
+    component_id: u8,
+    data: []const u8,
+
+    write_completion: xev.Completion = .{},
+    write_data: WriteData = .{},
+};
+
 pub const Operation = union(OperationType) {
     gather_candidates: void,
     set_remote_candidates: RemoteCandidateParameters,
+    send: SendParameters,
 };
 
-pub const Callback = *const fn (?*anyopaque) void;
+pub const SendError = xev.WriteError || error{
+    NotReady,
+};
 
-pub fn noopCallback(userdata: ?*anyopaque) void {
-    _ = userdata;
-}
+pub const Result = union(OperationType) {
+    gather_candidates: void,
+    set_remote_candidates: void,
+    send: SendError!usize,
+};
+
+pub const Callback = *const fn (userdata: ?*anyopaque, result: Result) void;
+pub fn noopCallback(_: ?*anyopaque, _: Result) void {}
 
 pub const Completion = struct {
     agent_id: u32 = 0,
@@ -1927,7 +2057,7 @@ pub const Context = struct {
         const new_agent = try self.allocator.create(AgentContext);
         errdefer self.allocator.destroy(new_agent);
 
-        new_agent.* = try AgentContext.init(agent_id, options.userdata, options.on_candidate_callback, options.on_state_change_callback, self.allocator);
+        new_agent.* = try AgentContext.init(agent_id, options.userdata, options.on_candidate_callback, options.on_state_change_callback, options.on_data_callback, self.allocator);
         errdefer new_agent.deinit();
 
         gop.value_ptr.* = new_agent;
@@ -1982,6 +2112,29 @@ pub const Context = struct {
         try self.async_handle.notify();
     }
 
+    pub fn send(self: *Context, c: *Completion, userdata: ?*anyopaque, callback: Callback, agent_id: u32, data_stream_id: u8, component_id: u8, data: []const u8) !void {
+        c.* = Completion{
+            .agent_id = agent_id,
+            .op = .{
+                .send = SendParameters{
+                    .data_stream_id = data_stream_id,
+                    .component_id = component_id,
+                    .data = data,
+                },
+            },
+            .userdata = userdata,
+            .callback = callback,
+        };
+
+        {
+            self.async_queue_mutex.lock();
+            defer self.async_queue_mutex.unlock();
+            self.async_queue.push(c);
+        }
+
+        try self.async_handle.notify();
+    }
+
     pub fn processGatherCandidates(self: *Context, agent_context: *AgentContext, loop: *xev.Loop) !void {
         var address_list = try std.ArrayList(std.net.Address).initCapacity(self.allocator, self.interface_addresses.items.len);
         defer address_list.deinit();
@@ -2013,7 +2166,6 @@ pub const Context = struct {
         }
 
         agent_context.gathering_state = .gathering;
-        agent_context.on_state_change_callback(agent_context.userdata, agent_context.id, agent_context.gathering_state);
 
         try agent_context.initSocketContexts(socket_list.items, address_list.items);
 
@@ -2067,6 +2219,48 @@ pub const Context = struct {
         }
     }
 
+    fn processSend(self: *Context, agent_context: *AgentContext, completion: *Completion, loop: *xev.Loop) !void {
+        _ = self;
+        if (agent_context.checklist.selected_pair) |selected_pair| {
+            const local_candidate = agent_context.local_candidates.items[selected_pair.local_candidate_index];
+            const remote_candidate = agent_context.remote_candidates.items[selected_pair.remote_candidate_index];
+
+            const socket_context = agent_context.socket_contexts[agent_context.getSocketContextIndexFromAddress(local_candidate.base_address).?];
+
+            const parameters = &completion.op.send;
+
+            parameters.write_data.from(remote_candidate.transport_address, parameters.data);
+            parameters.write_completion = xev.Completion{
+                .op = .{
+                    .sendmsg = .{
+                        .fd = socket_context.socket,
+                        .msghdr = &parameters.write_data.message_header,
+                        .buffer = null,
+                    },
+                },
+                .userdata = completion,
+                .callback = (struct {
+                    pub fn callback(
+                        userdata: ?*anyopaque,
+                        inner_loop: *xev.Loop,
+                        inner_c: *xev.Completion,
+                        inner_result: xev.Result,
+                    ) xev.CallbackAction {
+                        _ = inner_c;
+                        _ = inner_loop;
+                        const inner_completion: *Completion = @ptrCast(@alignCast(userdata.?));
+                        const result: SendError!usize = inner_result.sendmsg catch |err| err;
+                        inner_completion.callback(inner_completion.userdata, .{ .send = result });
+                        return .disarm;
+                    }
+                }).callback,
+            };
+            loop.add(&parameters.write_completion);
+        } else {
+            completion.callback(completion.userdata, Result{ .send = error.NotReady });
+        }
+    }
+
     fn startChecks(
         self: *Context,
         agent_context: *AgentContext,
@@ -2076,7 +2270,7 @@ pub const Context = struct {
         agent_context.computeInitialCandidatePairsState();
         agent_context.printPairStates();
 
-        self.handleConnectivityCheckMainTimer(agent_context) catch unreachable;
+        self.handleConnectivityCheckMainTimer(agent_context, {}) catch unreachable;
     }
 
     fn swapAsyncQueue(self: *Context) Intrusive(Completion) {
@@ -2113,12 +2307,16 @@ pub const Context = struct {
                         continue;
                     }
                     self.processGatherCandidates(agent_context, loop) catch @panic("TODO");
+                    completion.callback(completion.userdata, .{ .gather_candidates = {} });
                 },
                 .set_remote_candidates => |candidates| {
                     self.processSetRemoteCandidates(agent_context, candidates, loop) catch @panic("TODO");
+                    completion.callback(completion.userdata, .{ .set_remote_candidates = {} });
+                },
+                .send => {
+                    self.processSend(agent_context, completion, loop) catch @panic("TODO");
                 },
             }
-            completion.callback(completion.userdata);
         }
 
         return .rearm;
@@ -2150,8 +2348,6 @@ pub const Context = struct {
         if (!agent_context.isGatheringDone()) return;
 
         agent_context.gathering_state = .done;
-        agent_context.on_state_change_callback(agent_context.userdata, agent_context.id, agent_context.gathering_state);
-
         agent_context.on_candidate_callback(agent_context.userdata, agent_context.id, .{ .done = {} });
 
         agent_context.computePriorities();
@@ -2304,62 +2500,33 @@ pub const Context = struct {
                 const socket_context = &agent_context.socket_contexts[payload.check_context.socket_index];
                 self.handleConnectivityCheckTransactionCompleted(agent_context, socket_context, payload.check_context, payload.result) catch @panic("TODO");
 
-                agent_context.printPairStates();
+                agent_context.releaseCheckContext(payload.check_context);
+                agent_context.checklist.updateState();
             },
-            .main_timer => {
-                self.handleConnectivityCheckMainTimer(agent_context) catch @panic("TODO");
+            .main_timer => |payload| {
+                self.handleConnectivityCheckMainTimer(agent_context, payload) catch @panic("TODO");
             },
         }
 
-        // Update checklist state
-        var scratch_buffer = agent_context.buffer_pool.create() catch unreachable;
-        defer agent_context.buffer_pool.destroy(scratch_buffer);
-        var scratch_arena = std.heap.FixedBufferAllocator.init(scratch_buffer);
+        if (result == .request_read or result == .completed) {
+            agent_context.printPairStates();
+            agent_context.printValidList();
+        }
 
-        // NOTE(Corendos): This contains a boolean indicating for each component is there is a nominated pair.
-        var hash_map = std.AutoHashMap(u8, struct { has_nominated_pair: bool = false, has_valid_pair: bool = false }).init(scratch_arena.allocator());
-        _ = hash_map;
-
-        // We check all the pairs, storing for each component if there is a nominated pair. We also check for non complete transaction.
-        //var in_progress: bool = false;
-        //for (agent_context.checklist.pairs.items, agent_context.checklist.pairs_data.items) |candidate_pair, candidate_pair_data| {
-        //    const local_candidate = agent_context.local_candidates.items[candidate_pair.local_candidate_index];
-        //    const gop = hash_map.getOrPut(local_candidate.component_id) catch unreachable;
-        //    if (!gop.found_existing) {
-        //        gop.value_ptr.* = .{};
-        //    }
-
-        //    gop.value_ptr.has_nominated_pair = gop.value_ptr.has_nominated_pair or candidate_pair_data.nominated;
-
-        //    in_progress = in_progress or (candidate_pair_data.state != .succeeded and candidate_pair_data.state != .failed);
-        //}
-
-        //for (agent_context.checklist.valid_pairs.items) |p| {
-        //    const local_candidate = agent_context.local_candidates.items[p.local_candidate_index];
-        //    const gop = hash_map.getOrPut(local_candidate.component_id) catch unreachable;
-        //    if (!gop.found_existing) {
-        //        gop.value_ptr.* = .{};
-        //    }
-        //    gop.value_ptr.has_valid_pair = true;
-        //}
-
-        //var is_complete: bool = true;
-        //var all_component_have_valid_pair: bool = true;
-
-        //var it = hash_map.iterator();
-        //while (it.next()) |entry| {
-        //    is_complete = is_complete and entry.value_ptr.has_nominated_pair;
-        //    all_component_have_valid_pair = all_component_have_valid_pair and entry.value_ptr.has_valid_pair;
-        //}
-
-        //const new_state: ChecklistState = if (is_complete) .completed else if (!all_component_have_valid_pair and !in_progress) .failed else .running;
-
-        //if (new_state != agent_context.checklist.state) {
-        //    log.debug("Agent {} - New checklist state: {}", .{ agent_context.id, new_state });
-        //    agent_context.checklist.state = new_state;
-        //} else {
-        //    log.debug("Agent {} - Checklist still in {} state", .{ agent_context.id, new_state });
-        //}
+        // TODO(Corendos): handle multiple checklists.
+        if (agent_context.checklist.state == .completed) {
+            agent_context.setState(.completed);
+            if (agent_context.connectivity_checks_timer_completion.state() == .active and agent_context.connectivity_checks_timer_cancel_completion.state() == .dead) {
+                agent_context.connectivity_checks_timer.cancel(
+                    self.loop,
+                    &agent_context.connectivity_checks_timer_completion,
+                    &agent_context.connectivity_checks_timer_cancel_completion,
+                    Context,
+                    self,
+                    Context.connectivityCheckTimerCancelCallback,
+                );
+            }
+        }
     }
 
     fn readCallback(
@@ -2411,9 +2578,16 @@ pub const Context = struct {
         } else |_| {}
 
         // TODO(Corendos): handle other type of messages
-        @panic("TODO: Received message that is not a STUN message");
+        if (agent_context.checklist.selected_pair) |selected_pair| {
+            const remote_candidate = agent_context.remote_candidates.items[selected_pair.remote_candidate_index];
+            if (remote_candidate.transport_address.eql(source)) {
+                agent_context.on_data_callback(agent_context.userdata, agent_context.id, remote_candidate.component_id, data);
+            }
+        } else {
+            log.debug("Agent {} - Received data but no pair has been selected yet.", .{agent_context.id});
+        }
 
-        //return .rearm;
+        return .rearm;
     }
 
     fn gatheringTransactionCompleteCallback(userdata: ?*anyopaque, transaction_context: *TransactionContext, result: TransactionResult) void {
@@ -2451,6 +2625,20 @@ pub const Context = struct {
         const agent_context = @fieldParentPtr(AgentContext, "connectivity_checks_timer_completion", c);
 
         self.handleConnectivityCheckEvent(agent_context, .{ .main_timer = result });
+
+        return .disarm;
+    }
+
+    fn connectivityCheckTimerCancelCallback(
+        userdata: ?*Context,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        result: xev.CancelError!void,
+    ) xev.CallbackAction {
+        _ = result catch {};
+        _ = c;
+        _ = userdata;
+        _ = loop;
 
         return .disarm;
     }
@@ -2509,6 +2697,7 @@ pub const Context = struct {
         agent_context: *AgentContext,
         socket_context: *SocketContext,
     ) !void {
+        defer agent_context.checklist.updateState();
 
         // TODO(Corendos): Check if this is a peer-reflexive candidate.
         //                 See https://www.rfc-editor.org/rfc/rfc8445#section-7.3.1.3
@@ -2552,14 +2741,13 @@ pub const Context = struct {
             self.loop.add(&agent_context.binding_request_queue_write_completion);
         }
 
-        // Find local candidate whose transport address matches the address on which the request was received.
-        const local_candidate_index = for (agent_context.local_candidates.items, 0..) |*c, i| {
-            if (c.transport_address.eql(socket_context.address)) break i;
-        } else unreachable;
+        const use_candidate = for (request.attributes) |a| {
+            if (a.type == ztun.attr.Type.use_candidate) break true;
+        } else false;
 
-        const remote_candidate_index = for (agent_context.remote_candidates.items, 0..) |*c, i| {
-            if (c.transport_address.eql(source)) break i;
-        } else {
+        // Find local candidate whose transport address matches the address on which the request was received.
+        const local_candidate_index = agent_context.getLocalCandidateIndexFromTransportAddress(socket_context.address) orelse unreachable;
+        const remote_candidate_index = agent_context.getRemoteCandidateIndexFromTransportAddress(source) orelse {
             log.debug("Agent {} - No remote candidate matching the source address (peer reflexive candidate maybe?)", .{agent_context.id});
             return;
         };
@@ -2567,53 +2755,78 @@ pub const Context = struct {
         const candidate_pair = CandidatePair{ .local_candidate_index = local_candidate_index, .remote_candidate_index = remote_candidate_index };
         const is_pair_in_checklist = agent_context.checklist.containsPair(candidate_pair);
 
-        if (is_pair_in_checklist) {
-            const candidate_pair_data = agent_context.checklist.pairs_map.get(candidate_pair).?;
-            switch (candidate_pair_data.state) {
-                .succeeded => {},
-                .failed => {
-                    // TODO(Corendos): Find a way to make that compliant with the spec. Issue is that it's creating an infinite loop of checks.
-                    //
-                    // Let's assume Agent L is checking the pair 0:3
-                    // 1. Agent L sends a STUN request to R
-                    // 2. Agent R sends back the response. In parallel it adds the pair 0:3 to the triggered check queue and sets its state to "waiting".
-                    // 3. Agent L handles response and sets the pair state to "failed" due to non-symmetric transport addresses.
-                    // 4. Agent R sends a STUN request to L due to the triggered check.
-                    // 5. Agent L sends back the response. In parallel is adds the pair 0:3 to the triggered check queue and changes its state from "failed" to "waiting".
-                    // 6. Agent R handles the response and sets the pair state to "failed" due to non-symmetric transport addresses.
-                    // 7. We are back to the situation before 1. and it creates a loop
-                    //
-                    // Since the triggered check are done before any other checks, if the request-response-request happens fast enough, no other candidate pair can be checked and we have an infinite loop of checks.
-                },
-                else => {
-                    log.debug("Agent {} - Adding {}:{} to the triggered check queue", .{ agent_context.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
-                    if (candidate_pair_data.state == .in_progress) {
-                        const transaction_id = agent_context.connectivity_check_transaction_map.get(candidate_pair).?;
-                        const check_context = agent_context.connectivity_check_context_map.get(transaction_id).?;
-                        check_context.transaction_context.stopRetransmits(self.loop);
-                        check_context.flags.is_canceled = true;
-                    }
-                    agent_context.checklist.setPairState(candidate_pair, .waiting);
-
-                    if (agent_context.checklist.triggered_check_queue.findFirst(TriggeredCheckNode{ .candidate_pair = candidate_pair }, TriggeredCheckNode.eql) == null) {
-                        const new_node = try agent_context.triggered_check_node_pool.create();
-                        new_node.* = .{ .candidate_pair = candidate_pair };
-                        agent_context.checklist.triggered_check_queue.pushBack(new_node);
-                    }
-                },
-            }
-        } else {
+        if (!is_pair_in_checklist) {
             const candidate_pair_data = agent_context.makeCandidatePairData(candidate_pair);
             agent_context.checklist.addPair(candidate_pair, candidate_pair_data) catch unreachable;
-            agent_context.checklist.setPairState(candidate_pair, .waiting);
-
-            // TODO(Corendos): find a way to give the password and username fragment to use for triggered check.
-            if (agent_context.checklist.triggered_check_queue.findFirst(TriggeredCheckNode{ .candidate_pair = candidate_pair }, TriggeredCheckNode.eql) == null) {
-                const new_node = try agent_context.triggered_check_node_pool.create();
-                new_node.* = .{ .candidate_pair = candidate_pair };
-                agent_context.checklist.triggered_check_queue.pushBack(new_node);
-            }
         }
+        const candidate_pair_data = agent_context.checklist.pairs_map.get(candidate_pair).?;
+
+        // Handle triggered checks.
+        switch (candidate_pair_data.state) {
+            .succeeded => {},
+            .failed => {
+                // TODO(Corendos): Find a way to make that compliant with the spec. Issue is that it's creating an infinite loop of checks.
+                //
+                // Let's assume Agent L is checking the pair 0:3
+                // 1. Agent L sends a STUN request to R
+                // 2. Agent R sends back the response. In parallel it adds the pair 0:3 to the triggered check queue and sets its state to "waiting".
+                // 3. Agent L handles response and sets the pair state to "failed" due to non-symmetric transport addresses.
+                // 4. Agent R sends a STUN request to L due to the triggered check.
+                // 5. Agent L sends back the response. In parallel is adds the pair 0:3 to the triggered check queue and changes its state from "failed" to "waiting".
+                // 6. Agent R handles the response and sets the pair state to "failed" due to non-symmetric transport addresses.
+                // 7. We are back to the situation before 1. and it creates a loop
+                //
+                // Since the triggered check are done before any other checks, if the request-response-request happens fast enough, no other candidate pair can be checked and we have an infinite loop of checks.
+            },
+            else => {
+                log.debug("Agent {} - Adding {}:{} to the triggered check queue", .{ agent_context.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
+                if (candidate_pair_data.state == .in_progress) {
+                    const transaction_id = agent_context.connectivity_check_transaction_map.get(candidate_pair).?;
+                    const check_context = agent_context.connectivity_check_context_map.get(transaction_id).?;
+                    check_context.transaction_context.stopRetransmits(self.loop);
+                    check_context.flags.is_canceled = true;
+                }
+                agent_context.checklist.setPairState(candidate_pair, .waiting);
+
+                if (agent_context.checklist.triggered_check_queue.findFirst(TriggeredCheckNode{ .candidate_pair = candidate_pair }, TriggeredCheckNode.eql) == null) {
+                    const new_node = try agent_context.triggered_check_node_pool.create();
+                    new_node.* = .{ .candidate_pair = candidate_pair, .nominate = use_candidate };
+                    agent_context.checklist.triggered_check_queue.pushBack(new_node);
+                }
+            },
+        }
+
+        if (candidate_pair_data.state == .succeeded and use_candidate) {
+            agent_context.handleNomination(candidate_pair, self.loop);
+        }
+    }
+
+    inline fn areTransportAddressesSymmetric(request_source: std.net.Address, request_destination: std.net.Address, response_source: std.net.Address, response_destination: std.net.Address) bool {
+        return response_source.eql(request_destination) and response_destination.eql(request_source);
+    }
+
+    fn constructValidPair(self: *Context, agent_context: *AgentContext, candidate_pair: CandidatePair, mapped_address: std.net.Address, request_destination: std.net.Address) CandidatePair {
+        _ = self;
+        const valid_local_candidate_index = agent_context.getLocalCandidateIndexFromTransportAddress(mapped_address) orelse @panic("Probably a peer reflexive candidate");
+        const valid_remote_candidate_index = agent_context.getRemoteCandidateIndexFromTransportAddress(request_destination) orelse unreachable;
+
+        const valid_candidate_pair = CandidatePair{ .local_candidate_index = valid_local_candidate_index, .remote_candidate_index = valid_remote_candidate_index };
+
+        if (valid_candidate_pair.eql(candidate_pair) or agent_context.checklist.containsPair(valid_candidate_pair)) {
+            // TODO(Corentin): Be careful with peer-reflexive priority.
+
+            const gop = agent_context.checklist.valid_pairs_map.getOrPut(valid_candidate_pair) catch unreachable;
+            if (!gop.found_existing) {
+                var valid_candidate_pair_data = agent_context.makeCandidatePairData(valid_candidate_pair);
+                valid_candidate_pair_data.state = .succeeded;
+
+                gop.value_ptr.* = valid_candidate_pair_data;
+            }
+        } else {
+            @panic("TODO");
+        }
+
+        return valid_candidate_pair;
     }
 
     fn handleConnectivityCheckTransactionCompleted(
@@ -2623,25 +2836,15 @@ pub const Context = struct {
         check_context: *ConnectivityCheckContext,
         result: TransactionResult,
     ) !void {
-        _ = self;
         _ = socket_context;
         const candidate_pair = check_context.candidate_pair;
 
-        defer {
-            _ = agent_context.connectivity_check_context_map.remove(check_context.transaction_context.transaction_id.?);
-            agent_context.buffer_pool.destroy(@alignCast(check_context.transaction_context.write_buffer[0..4096]));
-            agent_context.buffer_pool.destroy(@alignCast(check_context.transaction_context.result_storage[0..4096]));
-            check_context.transaction_context.deinit();
-            agent_context.connectivity_context_pool.destroy(check_context);
-        }
-
         const payload = result catch |err| {
-            if (check_context.flags.is_canceled) {
-                // Due to triggered check, we might never receive the answer but must not treat the lack of response as a failure.
-                return;
+            // Due to triggered check, we might never receive the answer but must not treat the lack of response as a failure.
+            if (!check_context.flags.is_canceled) {
+                log.debug("Agent {} - Check failed for candidate pair ({}:{}) with {}", .{ agent_context.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, err });
+                agent_context.checklist.setPairState(candidate_pair, .failed);
             }
-            log.debug("Agent {} - Check failed for candidate pair ({}:{}) with {}", .{ agent_context.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, err });
-            agent_context.checklist.setPairState(candidate_pair, .failed);
             return;
         };
 
@@ -2654,16 +2857,10 @@ pub const Context = struct {
         const remote_candidate = agent_context.remote_candidates.items[candidate_pair.remote_candidate_index];
 
         // TODO(Corendos): Discover peer-reflexive candidates.
-        const response_address = getMappedAddressFromStunMessage(payload.message) orelse @panic("TODO");
+        const mapped_address = getMappedAddressFromStunMessage(payload.message) orelse @panic("TODO");
 
         // NOTE(Corendos): handle https://www.rfc-editor.org/rfc/rfc8445#section-7.2.5.2.1.
-        const response_source = payload.source;
-        const request_destination = remote_candidate.transport_address;
-        const response_destination = response_address;
-        const request_source = local_candidate.transport_address;
-
-        const are_source_and_destination_symmetric = response_source.eql(request_destination) and response_destination.eql(request_source);
-        if (!are_source_and_destination_symmetric) {
+        if (!areTransportAddressesSymmetric(local_candidate.transport_address, remote_candidate.transport_address, payload.source, mapped_address)) {
             log.debug("Agent {} - Check failed for candidate pair ({}:{}) because source and destination are not symmetric", .{ agent_context.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
 
             agent_context.checklist.setPairState(candidate_pair, .failed);
@@ -2674,26 +2871,7 @@ pub const Context = struct {
         // TODO(Corendos): implement peer-reflexive candidates handling here.
 
         // Constructing a Valid Pair
-        const valid_local_candidate_index = agent_context.getLocalCandidateIndexFromTransportAddress(response_address) orelse @panic("Probably a peer reflexive candidate");
-        const valid_candidate_pair = CandidatePair{ .local_candidate_index = valid_local_candidate_index, .remote_candidate_index = candidate_pair.remote_candidate_index };
-
-        if (valid_candidate_pair.eql(candidate_pair)) {
-            var valid_candidate_pair_data = agent_context.makeCandidatePairData(valid_candidate_pair);
-            valid_candidate_pair_data.state = .succeeded;
-
-            // TODO(Corentin): Be careful with peer-reflexive priority.
-            agent_context.checklist.addValidPair(valid_candidate_pair, valid_candidate_pair_data) catch unreachable;
-        } else {
-            if (agent_context.checklist.containsPair(valid_candidate_pair)) {
-                var valid_candidate_pair_data = agent_context.makeCandidatePairData(valid_candidate_pair);
-                valid_candidate_pair_data.state = .succeeded;
-
-                // TODO(Corentin): Be careful with peer-reflexive priority.
-                agent_context.checklist.addValidPair(valid_candidate_pair, valid_candidate_pair_data) catch unreachable;
-            } else {
-                @panic("TODO");
-            }
-        }
+        const valid_candidate_pair = self.constructValidPair(agent_context, candidate_pair, mapped_address, remote_candidate.transport_address);
 
         // Updating Candidate Pair States.
         agent_context.checklist.setPairState(candidate_pair, .succeeded);
@@ -2704,7 +2882,7 @@ pub const Context = struct {
         const candidate_pair_data = agent_context.checklist.pairs_map.get(candidate_pair).?;
 
         // Set the states for all other Frozen candidate pairs in all checklists with the same foundation to Waiting
-        // NOTE(Corendos): The RFC is unclear there, do we compare to the foundation of the valid pair or to the foundation of the pair that generated the spec ?
+        // NOTE(Corendos): The RFC is unclear there, do we compare to the foundation of the valid pair or to the foundation of the pair that generated the check ?
         //                 In case of failure, it says "When the ICE agent sets the candidate pair state to Failed as a result of a connectivity-check error, the
         //                 agent does not change the states of other candidate pairs with the same foundation" so I guess it's the second scenario.
         for (agent_context.checklist.pairs_map.keys(), agent_context.checklist.pairs_map.values()) |current_candidate_pair, current_candidate_pair_data| {
@@ -2713,7 +2891,18 @@ pub const Context = struct {
             }
         }
 
-        agent_context.printValidList();
+        if (check_context.flags.is_nomination) {
+            agent_context.handleNomination(valid_candidate_pair, self.loop);
+        }
+
+        // Try to nominate pair
+        if (agent_context.role == .controlling and !agent_context.checklist.nomination_in_progress) {
+            agent_context.checklist.nomination_in_progress = true;
+            log.debug("Agent {} - Try to nominate pair {}:{}", .{ agent_context.id, valid_candidate_pair.local_candidate_index, valid_candidate_pair.remote_candidate_index });
+            const new_node = try agent_context.triggered_check_node_pool.create();
+            new_node.* = .{ .candidate_pair = valid_candidate_pair, .nominate = true };
+            agent_context.checklist.triggered_check_queue.pushBack(new_node);
+        }
     }
 
     fn handleConnectivityCheckResponseRead(
@@ -2732,15 +2921,15 @@ pub const Context = struct {
         const check_context_opt = agent_context.connectivity_check_context_map.get(message_header.transaction_id);
 
         if (check_context_opt) |check_context| {
-            const candidate_pair = check_context.candidate_pair;
+            //const candidate_pair = check_context.candidate_pair;
 
-            log.debug("Agent {} - Received response on {s}transaction {x:12} for candidate pair ({}:{})", .{
-                agent_context.id,
-                if (check_context.flags.is_triggered_check) "triggered " else "",
-                message_header.transaction_id,
-                candidate_pair.local_candidate_index,
-                candidate_pair.remote_candidate_index,
-            });
+            //log.debug("Agent {} - Received response on {s}transaction {x:12} for candidate pair ({}:{})", .{
+            //    agent_context.id,
+            //    if (check_context.flags.is_triggered_check) "triggered " else "",
+            //    message_header.transaction_id,
+            //    candidate_pair.local_candidate_index,
+            //    candidate_pair.remote_candidate_index,
+            //});
 
             check_context.transaction_context.readCallback(self.loop, raw_message, source);
         } else {
@@ -2748,24 +2937,32 @@ pub const Context = struct {
         }
     }
 
-    inline fn tryPopTriggeredCheckQueue(agent_context: *AgentContext) ?CandidatePair {
-        //return agent_context.checklist.popTriggeredCheck();
-        while (!agent_context.checklist.triggered_check_queue.empty()) {
-            var node = agent_context.checklist.triggered_check_queue.popFront().?;
-            defer agent_context.triggered_check_node_pool.destroy(node);
+    inline fn tryPopTriggeredCheckQueue(agent_context: *AgentContext) ?TriggeredCheckNode {
+        var node = agent_context.checklist.triggered_check_queue.popFront() orelse return null;
+        defer agent_context.triggered_check_node_pool.destroy(node);
 
-            const candidate_pair = node.candidate_pair;
-            const candidate_pair_data = agent_context.checklist.pairs_map.getPtr(candidate_pair).?;
+        node.prev = null;
+        node.next = null;
 
-            if (candidate_pair_data.state == .waiting) {
-                return candidate_pair;
-            }
-        }
+        return node.*;
+        //while (!agent_context.checklist.triggered_check_queue.empty()) {
+        //    var node = agent_context.checklist.triggered_check_queue.popFront().?;
+        //    defer agent_context.triggered_check_node_pool.destroy(node);
 
-        return null;
+        //    const candidate_pair = node.candidate_pair;
+        //    const candidate_pair_data = agent_context.checklist.pairs_map.getPtr(candidate_pair).?;
+
+        //    if (candidate_pair_data.state == .waiting) {
+        //        node.prev = null;
+        //        node.next = null;
+        //        return node.*;
+        //    }
+        //}
+
+        //return null;
     }
 
-    fn startTransaction(self: *Context, agent_context: *AgentContext, candidate_pair: CandidatePair, is_triggered_check: bool) !void {
+    fn startTransaction(self: *Context, agent_context: *AgentContext, candidate_pair: CandidatePair, is_triggered_check: bool, is_nominated: bool) !void {
         const local_candidate = agent_context.local_candidates.items[candidate_pair.local_candidate_index];
         const remote_candidate = agent_context.remote_candidates.items[candidate_pair.remote_candidate_index];
 
@@ -2779,6 +2976,7 @@ pub const Context = struct {
                 local_candidate.priority,
                 agent_context.role.?,
                 agent_context.tiebreaker,
+                is_nominated,
                 allocator.allocator(),
             ) catch unreachable;
         };
@@ -2808,7 +3006,7 @@ pub const Context = struct {
             .socket_index = @intCast(socket_context_index),
             .candidate_pair = candidate_pair,
             .transaction_context = transaction_context,
-            .flags = .{ .is_triggered_check = is_triggered_check },
+            .flags = .{ .is_triggered_check = is_triggered_check, .is_nomination = is_nominated },
         };
         context_map_gop.value_ptr.* = check_context;
 
@@ -2828,11 +3026,12 @@ pub const Context = struct {
         agent_context.checklist.setPairState(candidate_pair, .in_progress);
     }
 
-    fn handleConnectivityCheckMainTimer(self: *Context, agent_context: *AgentContext) !void {
+    fn handleConnectivityCheckMainTimer(self: *Context, agent_context: *AgentContext, result: xev.Timer.RunError!void) !void {
+        _ = result catch return;
         // TODO(Corendos): handle multiple checklists
 
-        if (tryPopTriggeredCheckQueue(agent_context)) |candidate_pair| {
-            try self.startTransaction(agent_context, candidate_pair, true);
+        if (tryPopTriggeredCheckQueue(agent_context)) |node| {
+            try self.startTransaction(agent_context, node.candidate_pair, true, node.nominate);
 
             agent_context.connectivity_checks_timer.run(
                 self.loop,
@@ -2851,7 +3050,7 @@ pub const Context = struct {
         }
 
         if (agent_context.getWaitingPair()) |candidate_pair| {
-            try self.startTransaction(agent_context, candidate_pair, false);
+            try self.startTransaction(agent_context, candidate_pair, false, false);
 
             agent_context.connectivity_checks_timer.run(
                 self.loop,

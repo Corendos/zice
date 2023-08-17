@@ -160,16 +160,17 @@ pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent_index: u32, res
     if (result == .candidate) {
         std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.as_number(), result.candidate.transport_address });
         context.controlling_agent_candidates.append(result.candidate) catch unreachable;
+    } else if (result == .done) {
+        const parameters = zice.RemoteCandidateParameters{ .candidates = context.controlling_agent_candidates.items, .username_fragment = context.controlling_agent_username, .password = context.controlling_agent_password };
+        context.zice_context.setRemoteCandidates(&context.controlled_set_remote_candidate_completion, context.controlled_agent, parameters) catch unreachable;
     }
 }
 
-pub fn controllingStateChangeCallback(userdata: ?*anyopaque, agent_index: u32, state: zice.GatheringState) void {
+pub fn controllingStateChangeCallback(userdata: ?*anyopaque, agent_index: u32, state: zice.AgentState) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
-    std.log.info("Agent {} new gathering state: {any}", .{ agent_index, state });
-
-    if (state == .done) {
-        const parameters = zice.RemoteCandidateParameters{ .candidates = context.controlling_agent_candidates.items, .username_fragment = context.controlling_agent_username, .password = context.controlling_agent_password };
-        context.zice_context.setRemoteCandidates(&context.controlled_set_remote_candidate_completion, context.controlled_agent, parameters) catch unreachable;
+    std.log.info("Agent {} new state: {any}", .{ agent_index, state });
+    if (state == .completed) {
+        context.controlling_agent_event.set();
     }
 }
 
@@ -178,17 +179,23 @@ pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent_index: u32, resu
     if (result == .candidate) {
         std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.as_number(), result.candidate.transport_address });
         context.controlled_agent_candidates.append(result.candidate) catch unreachable;
-    }
-}
-
-pub fn controlledStateChangeCallback(userdata: ?*anyopaque, agent_index: u32, state: zice.GatheringState) void {
-    const context: *Context = @alignCast(@ptrCast(userdata.?));
-    std.log.info("Agent {} new gathering state: {any}", .{ agent_index, state });
-
-    if (state == .done) {
+    } else if (result == .done) {
         const parameters = zice.RemoteCandidateParameters{ .candidates = context.controlled_agent_candidates.items, .username_fragment = context.controlled_agent_username, .password = context.controlled_agent_password };
         context.zice_context.setRemoteCandidates(&context.controlling_set_remote_candidate_completion, context.controlling_agent, parameters) catch unreachable;
     }
+}
+
+pub fn controlledStateChangeCallback(userdata: ?*anyopaque, agent_index: u32, state: zice.AgentState) void {
+    const context: *Context = @alignCast(@ptrCast(userdata.?));
+    std.log.info("Agent {} new state: {any}", .{ agent_index, state });
+    if (state == .completed) {
+        context.controlled_agent_event.set();
+    }
+}
+
+pub fn dataCallback(userdata: ?*anyopaque, agent_index: u32, component_id: u8, data: []const u8) void {
+    _ = userdata;
+    std.log.info("Agent {} received data for component {}: {any}", .{ agent_index, component_id, data });
 }
 
 const Context = struct {
@@ -207,6 +214,9 @@ const Context = struct {
 
     controlled_agent_username: [8]u8 = undefined,
     controlled_agent_password: [24]u8 = undefined,
+
+    controlling_agent_event: std.Thread.ResetEvent = .{},
+    controlled_agent_event: std.Thread.ResetEvent = .{},
 };
 
 pub fn main() !void {
@@ -249,6 +259,7 @@ pub fn main() !void {
         .userdata = &context,
         .on_candidate_callback = controllingCandidateCallback,
         .on_state_change_callback = controllingStateChangeCallback,
+        .on_data_callback = dataCallback,
     });
     defer zice_context.deleteAgent(controlling_agent);
     const controlling_agent_result = try zice_context.getAgentUsernameAndPassword(controlling_agent);
@@ -259,6 +270,7 @@ pub fn main() !void {
         .userdata = &context,
         .on_candidate_callback = controlledCandidateCallback,
         .on_state_change_callback = controlledStateChangeCallback,
+        .on_data_callback = dataCallback,
     });
     defer zice_context.deleteAgent(controlled_agent);
     const controlled_agent_result = try zice_context.getAgentUsernameAndPassword(controlled_agent);
@@ -271,6 +283,21 @@ pub fn main() !void {
     var gather_completion: zice.Completion = .{};
 
     try zice_context.gatherCandidates(&gather_completion, controlling_agent);
+
+    context.controlling_agent_event.wait();
+    context.controlled_agent_event.wait();
+
+    var send_completion: zice.Completion = undefined;
+    var send_event = std.Thread.ResetEvent{};
+
+    try zice_context.send(&send_completion, &send_event, (struct {
+        pub fn callback(userdata: ?*anyopaque, result: zice.Result) void {
+            _ = result;
+            std.log.debug("Message sent!", .{});
+            const inner_send_event: *std.Thread.ResetEvent = @ptrCast(@alignCast(userdata.?));
+            inner_send_event.set();
+        }
+    }).callback, context.controlling_agent, 1, 1, "Hello");
 
     network_loop_thread.join();
 }
