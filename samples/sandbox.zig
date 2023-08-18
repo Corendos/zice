@@ -3,12 +3,16 @@
 
 const std = @import("std");
 const xev = @import("xev");
+const zice = @import("zice");
 
 const StopHandler = struct {
     storage: [@sizeOf(std.os.linux.signalfd_siginfo)]u8,
     fd: std.os.fd_t,
     mask: std.os.sigset_t,
     completion: xev.Completion = .{},
+
+    //userdata: ?*anyopaque,
+    //callback: *const fn (userdata: ?*anyopaque, loop: *xev.Loop) void = fn (userdata: ?*anyopaque, loop: *xev.Loop) void{},
 
     pub fn init() !StopHandler {
         var self: StopHandler = undefined;
@@ -27,7 +31,7 @@ const StopHandler = struct {
         std.os.close(self.fd);
     }
 
-    pub fn register(self: *StopHandler, loop: *xev.Loop) void {
+    pub fn register(self: *StopHandler, loop: *xev.Loop, comptime Userdata: type, userdata: ?*Userdata, comptime callback: *const fn (userdata: ?*Userdata, loop: *xev.Loop) void) void {
         self.completion = xev.Completion{
             .op = .{
                 .read = .{
@@ -36,18 +40,19 @@ const StopHandler = struct {
                 },
             },
             .callback = (struct {
-                fn callback(
-                    _: ?*anyopaque,
-                    l: *xev.Loop,
+                fn cb(
+                    ud: ?*anyopaque,
+                    inner_loop: *xev.Loop,
                     _: *xev.Completion,
                     _: xev.Result,
                 ) xev.CallbackAction {
-                    std.log.info("Received SIGINT", .{});
-                    l.stop();
+                    const inner_userdata: ?*Userdata = @ptrCast(@alignCast(ud));
+                    @call(.always_inline, callback, .{ inner_userdata, inner_loop });
+
                     return .disarm;
                 }
-            }).callback,
-            .userdata = null,
+            }).cb,
+            .userdata = userdata,
         };
         loop.add(&self.completion);
         std.os.sigprocmask(std.os.SIG.BLOCK, &self.mask, null);
@@ -63,24 +68,41 @@ pub const CandidatePairData = struct {
     data: [10]u8 = undefined,
 };
 
+fn stopHandlerCallback(userdata: ?*Context, loop: *xev.Loop) void {
+    _ = loop;
+    const context = userdata.?;
+    std.log.info("Received SIGINT", .{});
+
+    if (context.zice_context) |zice_context| {
+        zice_context.stop();
+    }
+}
+
+const Context = struct {
+    zice_context: ?*zice.Context = null,
+};
+
 pub fn main() !void {
+    std.log.info("Starting", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
-    defer arena_state.deinit();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
 
-    var logging_allocator_state = std.heap.loggingAllocator(arena_state.allocator());
-    var allocator = logging_allocator_state.allocator();
+    var stop_handle = try StopHandler.init();
+    defer stop_handle.deinit();
 
-    var map = std.AutoHashMap(CandidatePair, CandidatePairData).init(allocator);
-    defer map.deinit();
+    var context = Context{};
 
-    for (0..10) |i| {
-        const gop = try map.getOrPut(.{ .local = i, .remote = 2 });
+    stop_handle.register(&loop, Context, &context, stopHandlerCallback);
 
-        gop.value_ptr.* = .{};
-    }
+    var zice_context = try zice.Context.init(gpa.allocator());
+    defer zice_context.deinit();
 
-    std.log.debug("Used: {}", .{arena_state.queryCapacity()});
+    context.zice_context = &zice_context;
+
+    try zice_context.start(&loop);
+
+    try loop.run(.until_done);
 }

@@ -7,7 +7,7 @@ const xev = @import("xev");
 const zice = @import("main.zig");
 const netlink = @import("zice/linux.zig").netlink;
 
-const NetlinkContextState = enum {
+const NetlinkContextState = enum(u2) {
     initial_interfaces,
     initial_addresses,
     idle,
@@ -25,12 +25,17 @@ pub const NetlinkContext = struct {
     };
 
     read_completion: xev.Completion = .{},
+    read_cancel_completion: xev.Completion = .{},
     write_completion: xev.Completion = .{},
+    write_cancel_completion: xev.Completion = .{},
 
     socket: std.os.fd_t,
 
-    state: NetlinkContextState = .initial_interfaces,
-    multipart: bool = false,
+    flags: packed struct {
+        state: NetlinkContextState = .initial_interfaces,
+        multipart: bool = false,
+        stopped: bool = false,
+    } = .{},
 
     write_buffer: []u8,
     read_buffer: []u8,
@@ -87,6 +92,24 @@ pub const NetlinkContext = struct {
         self.requestInterfaces(loop);
     }
 
+    pub fn stop(self: *NetlinkContext, loop: *xev.Loop) void {
+        if (self.flags.stopped) return;
+        self.write_cancel_completion = xev.Completion{
+            .op = .{ .cancel = .{ .c = &self.write_completion } },
+            .userdata = self,
+            .callback = writeCancelCallback,
+        };
+        loop.add(&self.write_cancel_completion);
+
+        self.read_cancel_completion = xev.Completion{
+            .op = .{ .cancel = .{ .c = &self.read_completion } },
+            .userdata = self,
+            .callback = readCancelCallback,
+        };
+        loop.add(&self.read_cancel_completion);
+        self.flags.stopped = true;
+    }
+
     fn requestInterfaces(self: *NetlinkContext, loop: *xev.Loop) void {
         std.log.debug("Requesting initial Interfaces", .{});
         const request_payload = std.os.linux.ifinfomsg{
@@ -121,7 +144,7 @@ pub const NetlinkContext = struct {
             .callback = writeCallback,
         };
         loop.add(&self.write_completion);
-        self.multipart = false;
+        self.flags.multipart = false;
     }
 
     fn requestAddresses(self: *NetlinkContext, loop: *xev.Loop) void {
@@ -158,7 +181,7 @@ pub const NetlinkContext = struct {
             .callback = writeCallback,
         };
         loop.add(&self.write_completion);
-        self.multipart = false;
+        self.flags.multipart = false;
     }
 
     fn writeCallback(
@@ -174,6 +197,21 @@ pub const NetlinkContext = struct {
         return .disarm;
     }
 
+    fn writeCancelCallback(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = result;
+        _ = loop;
+        _ = completion;
+        var self = @as(*NetlinkContext, @ptrCast(@alignCast(userdata.?)));
+        _ = self;
+
+        return .disarm;
+    }
+
     fn readCallback(
         userdata: ?*anyopaque,
         loop: *xev.Loop,
@@ -184,13 +222,13 @@ pub const NetlinkContext = struct {
         if (result.read) |bytes_read| {
             if (self.handleNetlinkMessage(completion.op.read.buffer.slice[0..bytes_read])) |done| {
                 if (done) {
-                    switch (self.state) {
+                    switch (self.flags.state) {
                         .initial_interfaces => {
-                            self.state = .initial_addresses;
+                            self.flags.state = .initial_addresses;
                             self.requestAddresses(loop);
                         },
                         .initial_addresses => {
-                            self.state = .idle;
+                            self.flags.state = .idle;
                             if (self.on_idle_callback) |callback| {
                                 callback(self.userdata);
                             }
@@ -201,13 +239,29 @@ pub const NetlinkContext = struct {
             } else |err| self.readError(err, loop);
         } else |err| self.readError(err, loop);
 
-        return .rearm;
+        return if (self.flags.stopped) .disarm else .rearm;
+    }
+
+    fn readCancelCallback(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = result;
+        _ = loop;
+        _ = completion;
+        var self = @as(*NetlinkContext, @ptrCast(@alignCast(userdata.?)));
+        _ = self;
+
+        return .disarm;
     }
 
     fn writeError(self: *NetlinkContext, err: anyerror, loop: *xev.Loop) void {
-        std.log.err("Got {} while writing in {s} state, retrying...", .{ err, @tagName(self.state) });
+        if (err == error.Canceled and self.flags.stopped) return;
+        std.log.err("Got {} while writing in {s} state, retrying...", .{ err, @tagName(self.flags.state) });
 
-        switch (self.state) {
+        switch (self.flags.state) {
             .initial_interfaces => self.requestInterfaces(loop),
             .initial_addresses => self.requestAddresses(loop),
             else => unreachable,
@@ -215,9 +269,10 @@ pub const NetlinkContext = struct {
     }
 
     fn readError(self: *NetlinkContext, err: anyerror, loop: *xev.Loop) void {
-        std.log.err("Got {} while reading in {s} state, retrying...", .{ err, @tagName(self.state) });
+        if (err == error.Canceled and self.flags.stopped) return;
+        std.log.err("Got {} while reading in {s} state, retrying...", .{ err, @tagName(self.flags.state) });
 
-        switch (self.state) {
+        switch (self.flags.state) {
             .initial_interfaces => self.requestInterfaces(loop),
             .initial_addresses => self.requestAddresses(loop),
             else => {},
@@ -228,7 +283,7 @@ pub const NetlinkContext = struct {
         var it = netlink.MessageIterator.init(@alignCast(data));
         var done = false;
         while (it.next()) |message| {
-            self.multipart = self.multipart or (message.flags & std.os.linux.NLM_F_MULTI > 0);
+            self.flags.multipart = self.flags.multipart or (message.flags & std.os.linux.NLM_F_MULTI > 0);
             if (message.type == .ERROR) {
                 const error_message = @as(*const netlink.nlmsgerr, @ptrCast(@alignCast(message.data.ptr)));
                 std.log.err("{}", .{error_message.@"error"});
@@ -246,7 +301,7 @@ pub const NetlinkContext = struct {
             }
         }
 
-        return if (self.multipart) done else true;
+        return if (self.flags.multipart) done else true;
     }
 
     fn handleNetlinkAddressMessage(self: *NetlinkContext, message: netlink.ifaddrmsg, raw_attributes: []align(@alignOf(std.os.linux.rtattr)) const u8, is_new_message: bool) void {

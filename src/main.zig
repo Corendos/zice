@@ -1891,6 +1891,10 @@ pub const Context = struct {
     async_handle: xev.Async,
     async_completion: xev.Completion = .{},
 
+    flags: packed struct {
+        stopped: bool = false,
+    } = .{},
+
     // TODO(Corendos): Remove parameter everywhere it's not useful anymore.
     loop: *xev.Loop = undefined,
 
@@ -1937,6 +1941,13 @@ pub const Context = struct {
 
         try self.netlink_context.start(loop);
         self.async_handle.wait(loop, &self.async_completion, Context, self, Context.asyncCallback);
+    }
+
+    pub fn stop(self: *Context) void {
+        if (self.flags.stopped) return;
+        self.netlink_context.stop(self.loop);
+        self.flags.stopped = true;
+        self.async_handle.notify() catch unreachable;
     }
 
     fn onInterface(self: *Context, event: NetlinkContext.InterfaceEvent) void {
@@ -2289,7 +2300,7 @@ pub const Context = struct {
             }
         }
 
-        return .rearm;
+        return if (self.flags.stopped) .disarm else .rearm;
     }
 
     /// Single entrypoint for all gathering related events (STUN message received, transaction completed or main timer fired).
