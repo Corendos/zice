@@ -27,7 +27,6 @@ const NetlinkContext = @import("netlink.zig").NetlinkContext;
 const log = std.log.scoped(.zice);
 
 // TODO(Corendos,@Global):
-// * Handle Triggered checks
 // * Handle peer-reflexive
 // * Properly handle connectivity checks with retry etc.
 // * Handle role conflicts.
@@ -215,7 +214,7 @@ fn makeConnectivityCheckBindingRequest(
 }
 
 /// Convenience to build a STUN response to a request.
-fn makeBindingResponse(request: ztun.Message, source: std.net.Address, password: [24]u8, allocator: std.mem.Allocator) !ztun.Message {
+fn makeBindingResponse(transaction_id: u96, source: std.net.Address, password: [24]u8, allocator: std.mem.Allocator) !ztun.Message {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
 
@@ -223,10 +222,10 @@ fn makeBindingResponse(request: ztun.Message, source: std.net.Address, password:
 
     message_builder.setClass(ztun.Class.success_response);
     message_builder.setMethod(ztun.Method.binding);
-    message_builder.transactionId(request.transaction_id);
+    message_builder.transactionId(transaction_id);
 
     const mapped_address = toStunAddress(source);
-    const xor_mapped_address = ztun.attr.common.encode(mapped_address, request.transaction_id);
+    const xor_mapped_address = ztun.attr.common.encode(mapped_address, transaction_id);
     const xor_mapped_address_attribute = try xor_mapped_address.toAttribute(arena_state.allocator());
     try message_builder.addAttribute(xor_mapped_address_attribute);
 
@@ -1034,6 +1033,12 @@ const StunContext = union(StunContextType) {
     check: ConnectivityCheckContext,
 };
 
+const RequestEntry = struct {
+    socket_index: u32,
+    transaction_id: u96,
+    source: std.net.Address,
+};
+
 pub const AgentContext = struct {
     const StunContextMap = std.AutoHashMap(u96, *StunContext);
     const ConnectivityCheckContextMap = std.AutoHashMap(u96, *ConnectivityCheckContext);
@@ -1105,7 +1110,7 @@ pub const AgentContext = struct {
     connectivity_checks_timer_cancel_completion: xev.Completion = .{},
 
     // TODO(Corendos): This is temporary to test how it could work.
-    binding_request_queue: CircularBuffer(struct { source: std.net.Address, response: ztun.Message, storage: [4096]u8 }, 64) = .{},
+    binding_request_queue: CircularBuffer(RequestEntry, 64) = .{},
 
     binding_request_queue_write_buffer: []u8 = &.{},
     binding_request_queue_write_data: WriteData = .{},
@@ -1577,21 +1582,6 @@ pub const AgentContext = struct {
             const candidate_pair = entry.value_ptr.*;
             self.checklist.setPairState(candidate_pair, .waiting);
         }
-    }
-
-    fn pushResponseFromRequest(self: *AgentContext, request: ztun.Message, source: std.net.Address) !void {
-        const entry = try self.binding_request_queue.pushPtr();
-
-        var arena_state = std.heap.FixedBufferAllocator.init(&entry.storage);
-        entry.response = try makeBindingResponse(request, source, self.password, arena_state.allocator());
-        entry.source = source;
-    }
-
-    fn popResponse(self: *AgentContext) ?struct { response: ztun.Message, source: std.net.Address } {
-        // TODO(Corendos): Don't release slot before the write has been done, that might be risky.
-        const entry = self.binding_request_queue.pop() orelse return null;
-
-        return .{ .response = entry.response, .source = entry.source };
     }
 
     fn getWaitingPair(self: *AgentContext) ?CandidatePair {
@@ -2494,6 +2484,7 @@ pub const Context = struct {
 
                 if (!agent_context.binding_request_queue.empty()) {
                     log.debug("Agent {} - More response to send!", .{agent_context.id});
+                    self.handleQueuedRequest(agent_context);
                 } else {
                     log.debug("Agent {} - Done sending queued response...", .{agent_context.id});
                 }
@@ -2617,6 +2608,41 @@ pub const Context = struct {
         return .disarm;
     }
 
+    fn handleQueuedRequest(self: *Context, agent_context: *AgentContext) void {
+        // Ensure we are not already waiting for a completion.
+        std.debug.assert(agent_context.binding_request_queue_write_completion.state() == .dead);
+
+        const request_entry = agent_context.binding_request_queue.pop() orelse return;
+
+        var buffer: [4096]u8 = undefined;
+        const response = r: {
+            var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
+            break :r makeBindingResponse(request_entry.transaction_id, request_entry.source, agent_context.password, arena_state.allocator()) catch unreachable;
+        };
+
+        const data = d: {
+            var stream = std.io.fixedBufferStream(agent_context.binding_request_queue_write_buffer);
+            response.write(stream.writer()) catch unreachable;
+            break :d stream.getWritten();
+        };
+
+        agent_context.binding_request_queue_write_data.from(request_entry.source, data);
+
+        const socket_context = &agent_context.socket_contexts[request_entry.socket_index];
+        agent_context.binding_request_queue_write_completion = xev.Completion{
+            .op = .{
+                .sendmsg = .{
+                    .fd = socket_context.socket,
+                    .msghdr = &agent_context.binding_request_queue_write_data.message_header,
+                    .buffer = null,
+                },
+            },
+            .userdata = self,
+            .callback = connectivityCheckResponseWriteCallback,
+        };
+        self.loop.add(&agent_context.binding_request_queue_write_completion);
+    }
+
     fn connectivityCheckTimerCallback(
         userdata: ?*Context,
         loop: *xev.Loop,
@@ -2717,32 +2743,15 @@ pub const Context = struct {
         try checkMessageIntegrity(request, &agent_context.password);
 
         // Enqueue response.
-        agent_context.pushResponseFromRequest(request, source) catch unreachable;
+        agent_context.binding_request_queue.push(RequestEntry{
+            .socket_index = @intCast(socket_context.index),
+            .transaction_id = request.transaction_id,
+            .source = source,
+        }) catch unreachable;
 
         // Handle response sending if required.
         if (agent_context.binding_request_queue_write_completion.state() != .active) {
-            const value = agent_context.popResponse().?;
-
-            const data = d: {
-                var stream = std.io.fixedBufferStream(agent_context.binding_request_queue_write_buffer);
-                value.response.write(stream.writer()) catch unreachable;
-                break :d stream.getWritten();
-            };
-
-            agent_context.binding_request_queue_write_data.from(value.source, data);
-
-            agent_context.binding_request_queue_write_completion = xev.Completion{
-                .op = .{
-                    .sendmsg = .{
-                        .fd = socket_context.socket,
-                        .msghdr = &agent_context.binding_request_queue_write_data.message_header,
-                        .buffer = null,
-                    },
-                },
-                .userdata = self,
-                .callback = connectivityCheckResponseWriteCallback,
-            };
-            self.loop.add(&agent_context.binding_request_queue_write_completion);
+            self.handleQueuedRequest(agent_context);
         }
 
         const use_candidate = for (request.attributes) |a| {
