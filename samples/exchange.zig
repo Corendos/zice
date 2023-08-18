@@ -158,7 +158,7 @@ const StopHandler = struct {
 pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
     if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.as_number(), result.candidate.transport_address });
+        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.asNumber(), result.candidate.transport_address });
         context.controlling_agent_candidates.append(result.candidate) catch unreachable;
     } else if (result == .done) {
         const parameters = zice.RemoteCandidateParameters{ .candidates = context.controlling_agent_candidates.items, .username_fragment = context.controlling_agent_username, .password = context.controlling_agent_password };
@@ -177,7 +177,7 @@ pub fn controllingStateChangeCallback(userdata: ?*anyopaque, agent_index: u32, s
 pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
     if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.as_number(), result.candidate.transport_address });
+        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.asNumber(), result.candidate.transport_address });
         context.controlled_agent_candidates.append(result.candidate) catch unreachable;
     } else if (result == .done) {
         const parameters = zice.RemoteCandidateParameters{ .candidates = context.controlled_agent_candidates.items, .username_fragment = context.controlled_agent_username, .password = context.controlled_agent_password };
@@ -293,7 +293,7 @@ pub fn main() !void {
     try zice_context.send(&send_completion, &send_event, (struct {
         pub fn callback(userdata: ?*anyopaque, result: zice.Result) void {
             _ = result;
-            std.log.debug("Message sent!", .{});
+            std.log.debug("Agent 1024 - Message sent!", .{});
             const inner_send_event: *std.Thread.ResetEvent = @ptrCast(@alignCast(userdata.?));
             inner_send_event.set();
         }
