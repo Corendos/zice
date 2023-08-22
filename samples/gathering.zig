@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const xev = @import("xev");
+const utils = @import("utils");
 
 const zice = @import("zice");
 
@@ -11,56 +12,7 @@ pub const std_options = struct {
         //std.log.ScopeLevel{ .scope = .default, .level = .info },
         std.log.ScopeLevel{ .scope = .zice, .level = .debug },
     };
-};
-
-const StopHandler = struct {
-    storage: [@sizeOf(std.os.linux.signalfd_siginfo)]u8,
-    fd: std.os.fd_t,
-    mask: std.os.sigset_t,
-    completion: xev.Completion = .{},
-
-    pub fn init() !StopHandler {
-        var self: StopHandler = undefined;
-        self.mask = m: {
-            var mask = std.os.empty_sigset;
-            std.os.linux.sigaddset(&mask, std.os.SIG.INT);
-            break :m mask;
-        };
-        self.fd = try std.os.signalfd(-1, &self.mask, 0);
-        errdefer std.os.close(self);
-
-        return self;
-    }
-
-    pub fn deinit(self: StopHandler) void {
-        std.os.close(self.fd);
-    }
-
-    pub fn register(self: *StopHandler, loop: *xev.Loop) void {
-        self.completion = xev.Completion{
-            .op = .{
-                .read = .{
-                    .fd = self.fd,
-                    .buffer = .{ .slice = &self.storage },
-                },
-            },
-            .callback = (struct {
-                fn callback(
-                    _: ?*anyopaque,
-                    l: *xev.Loop,
-                    _: *xev.Completion,
-                    _: xev.Result,
-                ) xev.CallbackAction {
-                    std.log.info("Received SIGINT", .{});
-                    l.stop();
-                    return .disarm;
-                }
-            }).callback,
-            .userdata = null,
-        };
-        loop.add(&self.completion);
-        std.os.sigprocmask(std.os.SIG.BLOCK, &self.mask, null);
-    }
+    pub const logFn = utils.logFn;
 };
 
 pub fn candidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
@@ -76,9 +28,29 @@ pub fn stateChangeCallback(userdata: ?*anyopaque, agent_index: u32, state: zice.
 }
 
 const Context = struct {
-    zice_context: *zice.Context,
-    agent: u32 = 0,
+    zice_context: ?*zice.Context = null,
+    agent: ?*zice.AgentContext = null,
 };
+
+fn stopHandlerCallback(userdata: ?*Context, loop: *xev.Loop) void {
+    _ = loop;
+    const context = userdata.?;
+    std.log.info("Received SIGINT", .{});
+
+    if (context.agent) |agent| {
+        agent.stop();
+    }
+
+    if (context.zice_context) |zice_context| {
+        zice_context.stop();
+    }
+}
+
+fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.AgentResult) void {
+    _ = result;
+    _ = userdata;
+    std.log.debug("Started candidate gathering", .{});
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
@@ -87,38 +59,33 @@ pub fn main() !void {
     var network_loop = try xev.Loop.init(.{});
     defer network_loop.deinit();
 
-    var stop_handler = try StopHandler.init();
+    var stop_handler = try utils.StopHandler.init();
     defer stop_handler.deinit();
 
-    stop_handler.register(&network_loop);
+    var context = Context{};
+    stop_handler.register(&network_loop, Context, &context, stopHandlerCallback);
 
     var zice_context = try zice.Context.init(gpa.allocator());
     defer zice_context.deinit();
 
-    try zice_context.start(&network_loop);
+    context.zice_context = &zice_context;
 
     var network_loop_thread = try std.Thread.spawn(.{}, (struct {
-        fn callback(l: *xev.Loop) !void {
+        fn callback(inner_context: *Context, l: *xev.Loop) !void {
+            try inner_context.zice_context.?.start(l);
             try l.run(.until_done);
         }
-    }).callback, .{&network_loop});
+    }).callback, .{ &context, &network_loop });
 
-    var context = Context{
-        .zice_context = &zice_context,
-    };
+    var agent = try zice.AgentContext.init(&zice_context, &network_loop, .{}, gpa.allocator());
+    defer agent.deinit();
 
-    var agent = try zice_context.newAgent(zice.CreateAgentOptions{
-        .userdata = &context,
-        .on_candidate_callback = candidateCallback,
-        .on_state_change_callback = stateChangeCallback,
-    });
-    defer zice_context.deleteAgent(agent);
+    context.agent = &agent;
 
-    context.agent = agent;
+    std.time.sleep(50_000_000);
 
-    var gather_completion: zice.Completion = .{};
-
-    try zice_context.gatherCandidates(&gather_completion, agent);
+    var gather_completion: zice.AgentCompletion = undefined;
+    try agent.gatherCandidates(&gather_completion, null, gatherCandidateCallback);
 
     network_loop_thread.join();
 }

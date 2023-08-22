@@ -4,59 +4,16 @@
 const std = @import("std");
 const xev = @import("xev");
 const zice = @import("zice");
+const utils = @import("utils");
 
-const StopHandler = struct {
-    storage: [@sizeOf(std.os.linux.signalfd_siginfo)]u8,
-    fd: std.os.fd_t,
-    mask: std.os.sigset_t,
-    completion: xev.Completion = .{},
+const StopHandler = utils.StopHandler;
 
-    //userdata: ?*anyopaque,
-    //callback: *const fn (userdata: ?*anyopaque, loop: *xev.Loop) void = fn (userdata: ?*anyopaque, loop: *xev.Loop) void{},
-
-    pub fn init() !StopHandler {
-        var self: StopHandler = undefined;
-        self.mask = m: {
-            var mask = std.os.empty_sigset;
-            std.os.linux.sigaddset(&mask, std.os.SIG.INT);
-            break :m mask;
-        };
-        self.fd = try std.os.signalfd(-1, &self.mask, 0);
-        errdefer std.os.close(self);
-
-        return self;
-    }
-
-    pub fn deinit(self: StopHandler) void {
-        std.os.close(self.fd);
-    }
-
-    pub fn register(self: *StopHandler, loop: *xev.Loop, comptime Userdata: type, userdata: ?*Userdata, comptime callback: *const fn (userdata: ?*Userdata, loop: *xev.Loop) void) void {
-        self.completion = xev.Completion{
-            .op = .{
-                .read = .{
-                    .fd = self.fd,
-                    .buffer = .{ .slice = &self.storage },
-                },
-            },
-            .callback = (struct {
-                fn cb(
-                    ud: ?*anyopaque,
-                    inner_loop: *xev.Loop,
-                    _: *xev.Completion,
-                    _: xev.Result,
-                ) xev.CallbackAction {
-                    const inner_userdata: ?*Userdata = @ptrCast(@alignCast(ud));
-                    @call(.always_inline, callback, .{ inner_userdata, inner_loop });
-
-                    return .disarm;
-                }
-            }).cb,
-            .userdata = userdata,
-        };
-        loop.add(&self.completion);
-        std.os.sigprocmask(std.os.SIG.BLOCK, &self.mask, null);
-    }
+pub const std_options = struct {
+    pub const log_scope_levels = &.{
+        //std.log.ScopeLevel{ .scope = .default, .level = .info },
+        //std.log.ScopeLevel{ .scope = .zice, .level = .debug },
+    };
+    pub const logFn = utils.logFn;
 };
 
 pub const CandidatePair = struct {

@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-pub fn buildSamples(b: *std.build.Builder, optimize: std.builtin.Mode, target: std.zig.CrossTarget) !void {
+pub fn buildSamples(b: *std.build.Builder, sample_utils_module: *std.Build.Module, optimize: std.builtin.Mode, target: std.zig.CrossTarget) !void {
     var arena_state = std.heap.ArenaAllocator.init(b.allocator);
     defer arena_state.deinit();
 
@@ -28,6 +28,7 @@ pub fn buildSamples(b: *std.build.Builder, optimize: std.builtin.Mode, target: s
         });
         executable.addModule("zice", b.modules.get("zice").?);
         executable.addModule("xev", b.dependency("libxev", .{}).module("xev"));
+        executable.addModule("utils", sample_utils_module);
         const install_executable = b.addInstallArtifact(executable, .{});
 
         const build_step_description = std.fmt.allocPrint(b.allocator, "Build the \"{s}\" executable", .{executable_name}) catch unreachable;
@@ -83,7 +84,13 @@ pub fn build(b: *std.build.Builder) void {
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_main_tests.step);
 
-    buildSamples(b, optimize, target) catch unreachable;
+    const sample_utils_module = b.createModule(.{
+        .source_file = .{ .path = thisDir() ++ "/samples/utils/main.zig" },
+        .dependencies = &.{
+            .{ .name = "xev", .module = xev_module },
+        },
+    });
+    buildSamples(b, sample_utils_module, optimize, target) catch unreachable;
 }
 
 inline fn thisDir() []const u8 {
