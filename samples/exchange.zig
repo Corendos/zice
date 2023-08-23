@@ -23,10 +23,17 @@ pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentCon
     } else if (result == .done) {
         const parameters = zice.RemoteCandidateParameters{
             .candidates = context.controlling_agent_candidates.items,
-            .username_fragment = context.controlling_agent.?.username_fragment,
-            .password = context.controlling_agent.?.password,
+            .username_fragment = agent.username_fragment,
+            .password = agent.password,
         };
-        context.controlled_agent.?.setRemoteCandidates(&context.controlling_set_remote_candidate_completion, parameters, null, setRemoteCandidatesCallback) catch unreachable;
+
+        context.zice_context.?.setRemoteCandidates(
+            context.controlled_agent.?,
+            &context.controlling_set_remote_candidate_completion,
+            parameters,
+            null,
+            setRemoteCandidatesCallback,
+        ) catch unreachable;
     }
 }
 
@@ -46,10 +53,17 @@ pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentCont
     } else if (result == .done) {
         const parameters = zice.RemoteCandidateParameters{
             .candidates = context.controlled_agent_candidates.items,
-            .username_fragment = context.controlled_agent.?.username_fragment,
-            .password = context.controlled_agent.?.password,
+            .username_fragment = agent.username_fragment,
+            .password = agent.password,
         };
-        context.controlling_agent.?.setRemoteCandidates(&context.controlled_set_remote_candidate_completion, parameters, null, setRemoteCandidatesCallback) catch unreachable;
+
+        context.zice_context.?.setRemoteCandidates(
+            context.controlling_agent.?,
+            &context.controlled_set_remote_candidate_completion,
+            parameters,
+            null,
+            setRemoteCandidatesCallback,
+        ) catch unreachable;
     }
 }
 
@@ -66,13 +80,13 @@ pub fn dataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_
     std.log.info("Agent {} received data for component {}: {any}", .{ agent.id, component_id, data });
 }
 
-fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.AgentResult) void {
+fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.ContextResult) void {
     _ = result;
     _ = userdata;
     std.log.debug("Started candidate gathering", .{});
 }
 
-fn setRemoteCandidatesCallback(userdata: ?*anyopaque, result: zice.AgentResult) void {
+fn setRemoteCandidatesCallback(userdata: ?*anyopaque, result: zice.ContextResult) void {
     _ = result;
     _ = userdata;
     std.log.debug("Set remote candidates", .{});
@@ -80,11 +94,11 @@ fn setRemoteCandidatesCallback(userdata: ?*anyopaque, result: zice.AgentResult) 
 
 const Context = struct {
     zice_context: ?*zice.Context = null,
-    controlling_agent: ?*zice.AgentContext = null,
-    controlled_agent: ?*zice.AgentContext = null,
+    controlling_agent: ?zice.AgentId = null,
+    controlled_agent: ?zice.AgentId = null,
 
-    controlling_set_remote_candidate_completion: zice.AgentCompletion = undefined,
-    controlled_set_remote_candidate_completion: zice.AgentCompletion = undefined,
+    controlling_set_remote_candidate_completion: zice.ContextCompletion = undefined,
+    controlled_set_remote_candidate_completion: zice.ContextCompletion = undefined,
 
     controlling_agent_candidates: std.ArrayList(zice.Candidate),
     controlled_agent_candidates: std.ArrayList(zice.Candidate),
@@ -98,17 +112,9 @@ fn stopHandlerCallback(userdata: ?*Context, loop: *xev.Loop) void {
     const context = userdata.?;
     std.log.info("Received SIGINT", .{});
 
-    if (context.controlling_agent) |agent| {
-        agent.stop();
-    }
-
-    if (context.controlled_agent) |agent| {
-        agent.stop();
-    }
-
-    if (context.zice_context) |zice_context| {
-        zice_context.stop();
-    }
+    context.zice_context.?.deleteAgent(context.controlling_agent.?) catch {};
+    context.zice_context.?.deleteAgent(context.controlled_agent.?) catch {};
+    context.zice_context.?.stop();
 }
 
 pub fn main() !void {
@@ -116,9 +122,6 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     var allocator = gpa.allocator();
-
-    //var allocator_state = std.heap.loggingAllocator(gpa.allocator());
-    //var allocator = allocator_state.allocator();
 
     var network_loop = try xev.Loop.init(.{});
     defer network_loop.deinit();
@@ -135,51 +138,38 @@ pub fn main() !void {
 
     stop_handler.register(&network_loop, Context, &context, stopHandlerCallback);
 
-    var zice_context = try zice.Context.init(allocator);
+    var zice_context = try zice.Context.init(&network_loop, allocator);
     defer zice_context.deinit();
 
-    try zice_context.start(&network_loop);
-
     var network_loop_thread = try std.Thread.spawn(.{}, (struct {
-        fn callback(l: *xev.Loop) !void {
+        fn callback(l: *xev.Loop, inner_zice_context: *zice.Context) !void {
+            try inner_zice_context.start();
             try l.run(.until_done);
         }
-    }).callback, .{&network_loop});
+    }).callback, .{ &network_loop, &zice_context });
 
-    var controlling_agent = try zice.AgentContext.init(
-        &zice_context,
-        &network_loop,
-        .{
-            .userdata = &context,
-            .on_candidate_callback = controllingCandidateCallback,
-            .on_state_change_callback = controllingStateChangeCallback,
-            .on_data_callback = dataCallback,
-        },
-        gpa.allocator(),
-    );
-    defer controlling_agent.deinit();
+    const controlling_agent = try zice_context.createAgent(.{
+        .userdata = &context,
+        .on_candidate_callback = controllingCandidateCallback,
+        .on_state_change_callback = controllingStateChangeCallback,
+        .on_data_callback = dataCallback,
+    });
 
-    var controlled_agent = try zice.AgentContext.init(
-        &zice_context,
-        &network_loop,
-        .{
-            .userdata = &context,
-            .on_candidate_callback = controlledCandidateCallback,
-            .on_state_change_callback = controlledStateChangeCallback,
-            .on_data_callback = dataCallback,
-        },
-        gpa.allocator(),
-    );
-    defer controlled_agent.deinit();
+    var controlled_agent = try zice_context.createAgent(.{
+        .userdata = &context,
+        .on_candidate_callback = controlledCandidateCallback,
+        .on_state_change_callback = controlledStateChangeCallback,
+        .on_data_callback = dataCallback,
+    });
 
     context.zice_context = &zice_context;
-    context.controlling_agent = &controlling_agent;
-    context.controlled_agent = &controlled_agent;
+    context.controlling_agent = controlling_agent;
+    context.controlled_agent = controlled_agent;
 
     std.time.sleep(50_000_000);
 
-    var gather_completion: zice.AgentCompletion = undefined;
-    try controlling_agent.gatherCandidates(&gather_completion, null, gatherCandidateCallback);
+    var gather_completion: zice.ContextCompletion = undefined;
+    try zice_context.gatherCandidates(controlling_agent, &gather_completion, null, gatherCandidateCallback);
 
     //context.controlling_agent_event.wait();
     //context.controlled_agent_event.wait();

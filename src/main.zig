@@ -9,6 +9,7 @@ const xev = @import("xev");
 
 const DoublyLinkedList = @import("doubly_linked_list.zig").DoublyLinkedList;
 const CircularBuffer = @import("circular_buffer.zig").CircularBuffer;
+const GenerationId = @import("generation_id.zig").GenerationId;
 
 pub const net = @import("net.zig");
 
@@ -1059,63 +1060,11 @@ pub const AuthParameters = struct {
     }
 };
 
-pub const AgentOperationType = enum {
-    gather_candidates,
-    set_remote_candidates,
-    send,
-};
-
-pub const RemoteCandidateParameters = struct {
-    candidates: []Candidate,
-    username_fragment: [8]u8,
-    password: [24]u8,
-};
-
-pub const SendParameters = struct {
-    data_stream_id: u8,
-    component_id: u8,
-    data: []const u8,
-
-    write_completion: xev.Completion = .{},
-    write_data: WriteData = .{},
-};
-
-pub const AgentOperation = union(AgentOperationType) {
-    gather_candidates: void,
-    set_remote_candidates: RemoteCandidateParameters,
-    send: SendParameters,
-};
-
-pub const SendError = xev.WriteError || error{
-    NotReady,
-};
-
-pub const AgentResult = union(AgentOperationType) {
-    gather_candidates: void,
-    set_remote_candidates: void,
-    send: SendError!usize,
-};
-
-pub const AgentCallback = *const fn (userdata: ?*anyopaque, result: AgentResult) void;
-pub fn noopCallback(_: ?*anyopaque, _: AgentResult) void {}
-
-pub const AgentCompletion = struct {
-    op: AgentOperation = undefined,
-
-    userdata: ?*anyopaque = null,
-    callback: AgentCallback = noopCallback,
-
-    context_completion: ContextCompletion,
-
-    next: ?*AgentCompletion = null,
-};
-
 pub const AgentContext = struct {
     const StunContextMap = std.AutoHashMap(u96, *StunContext);
-    var current_id: std.atomic.Atomic(usize) = std.atomic.Atomic(usize).init(1024);
 
     /// The id of this agent.
-    id: usize,
+    id: AgentId,
 
     /// The allocator used by the AgentContext.
     allocator: std.mem.Allocator,
@@ -1209,7 +1158,7 @@ pub const AgentContext = struct {
 
     loop: *xev.Loop,
 
-    pub fn init(context: *Context, loop: *xev.Loop, options: CreateAgentOptions, allocator: std.mem.Allocator) !AgentContext {
+    pub fn init(context: *Context, agent_id: AgentId, loop: *xev.Loop, options: CreateAgentOptions, allocator: std.mem.Allocator) !AgentContext {
         const auth_parameters = AuthParameters.random(std.crypto.random);
         const tiebreaker = std.crypto.random.int(u64);
 
@@ -1230,13 +1179,11 @@ pub const AgentContext = struct {
         var binding_request_queue_write_buffer = try buffer_pool.create();
         errdefer buffer_pool.destroy(binding_request_queue_write_buffer);
 
-        const id = AgentContext.current_id.fetchAdd(1, .Monotonic);
-
         const checklist = try Checklist.init(allocator);
         errdefer checklist.deinit();
 
         return AgentContext{
-            .id = id,
+            .id = agent_id,
             .allocator = allocator,
             .context = context,
             .gathering_main_timer = gathering_main_timer,
@@ -1324,82 +1271,6 @@ pub const AgentContext = struct {
         self.checklist.deinit();
     }
 
-    pub fn gatherCandidates(self: *AgentContext, c: *AgentCompletion, userdata: ?*anyopaque, callback: AgentCallback) !void {
-        c.* = AgentCompletion{
-            .op = .{ .gather_candidates = {} },
-            .userdata = userdata,
-            .callback = callback,
-            .context_completion = ContextCompletion{
-                .userdata = self,
-                .callback = (struct {
-                    fn cb(ud: ?*anyopaque, inner_c: *ContextCompletion, result: ContextResult) void {
-                        _ = result catch unreachable;
-                        const inner_self: *AgentContext = @ptrCast(@alignCast(ud.?));
-                        const inner_agent_completion: *AgentCompletion = @fieldParentPtr(AgentCompletion, "context_completion", inner_c);
-
-                        inner_self.processGatherCandidates() catch unreachable;
-
-                        inner_agent_completion.callback(inner_agent_completion.userdata, AgentResult{ .gather_candidates = {} });
-                    }
-                }).cb,
-            },
-        };
-
-        self.context.async_queue_mutex.lock();
-        defer self.context.async_queue_mutex.unlock();
-        self.context.async_queue.push(&c.context_completion);
-        try self.context.async_handle.notify();
-    }
-
-    pub fn setRemoteCandidates(self: *AgentContext, c: *AgentCompletion, parameters: RemoteCandidateParameters, userdata: ?*anyopaque, callback: AgentCallback) !void {
-        c.* = AgentCompletion{
-            .op = .{ .set_remote_candidates = parameters },
-            .userdata = userdata,
-            .callback = callback,
-            .context_completion = ContextCompletion{
-                .userdata = self,
-                .callback = (struct {
-                    fn cb(ud: ?*anyopaque, inner_c: *ContextCompletion, result: ContextResult) void {
-                        _ = result catch unreachable;
-                        const inner_self: *AgentContext = @ptrCast(@alignCast(ud.?));
-                        const inner_agent_completion: *AgentCompletion = @fieldParentPtr(AgentCompletion, "context_completion", inner_c);
-
-                        inner_self.processSetRemoteCandidates(inner_agent_completion.op.set_remote_candidates) catch unreachable;
-
-                        inner_agent_completion.callback(inner_agent_completion.userdata, AgentResult{ .set_remote_candidates = {} });
-                    }
-                }).cb,
-            },
-        };
-
-        self.context.async_queue_mutex.lock();
-        defer self.context.async_queue_mutex.unlock();
-        self.context.async_queue.push(&c.context_completion);
-        try self.context.async_handle.notify();
-    }
-
-    //pub fn send(self: *Context, c: *AgentCompletion, userdata: ?*anyopaque, callback: AgentCallback, data_stream_id: u8, component_id: u8, data: []const u8) !void {
-    //    c.* = AgentCompletion{
-    //        .op = .{
-    //            .send = SendParameters{
-    //                .data_stream_id = data_stream_id,
-    //                .component_id = component_id,
-    //                .data = data,
-    //            },
-    //        },
-    //        .userdata = userdata,
-    //        .callback = callback,
-    //    };
-
-    //    {
-    //        self.async_queue_mutex.lock();
-    //        defer self.async_queue_mutex.unlock();
-    //        self.async_queue.push(c);
-    //    }
-
-    //    try self.async_handle.notify();
-    //}
-
     pub fn processGatherCandidates(self: *AgentContext) !void {
         // By default, assume that we are in the controlling role if we are explicitly asked to gather candidates.
         if (self.role == null) {
@@ -1482,7 +1353,7 @@ pub const AgentContext = struct {
         }
     }
 
-    fn processSend(self: *AgentContext, completion: *AgentCompletion) !void {
+    fn processSend(self: *AgentContext, completion: *ContextCompletion) !void {
         if (self.checklist.selected_pair) |selected_pair| {
             const local_candidate = self.local_candidates.items[selected_pair.local_candidate_index];
             const remote_candidate = self.remote_candidates.items[selected_pair.remote_candidate_index];
@@ -1510,7 +1381,7 @@ pub const AgentContext = struct {
                     ) xev.CallbackAction {
                         _ = inner_c;
                         _ = inner_loop;
-                        const inner_completion: *AgentCompletion = @ptrCast(@alignCast(userdata.?));
+                        const inner_completion: *ContextCompletion = @ptrCast(@alignCast(userdata.?));
                         const result: SendError!usize = inner_result.sendmsg catch |err| err;
                         inner_completion.callback(inner_completion.userdata, .{ .send = result });
                         return .disarm;
@@ -1519,7 +1390,7 @@ pub const AgentContext = struct {
             };
             self.loop.add(&parameters.write_completion);
         } else {
-            completion.callback(completion.userdata, AgentResult{ .send = error.NotReady });
+            completion.callback(completion.userdata, ContextResult{ .send = error.NotReady });
         }
     }
 
@@ -1534,7 +1405,7 @@ pub const AgentContext = struct {
         self.handleConnectivityCheckMainTimer({}) catch unreachable;
     }
 
-    fn swapAsyncQueue(self: *AgentContext) Intrusive(AgentCompletion) {
+    fn swapAsyncQueue(self: *AgentContext) Intrusive(ContextCompletion) {
         self.async_queue_mutex.lock();
         defer self.async_queue_mutex.unlock();
 
@@ -2986,15 +2857,68 @@ const ConnectivityCheckEventResult = union(enum) {
     main_timer: xev.Timer.RunError!void,
 };
 
-pub const ContextError = error{};
+pub const ContextOperationType = enum {
+    gather_candidates,
+    set_remote_candidates,
+    send,
+};
 
-pub const ContextResult = ContextError!void;
+pub const RemoteCandidateParameters = struct {
+    candidates: []Candidate,
+    username_fragment: [8]u8,
+    password: [24]u8,
+};
+
+pub const SendParameters = struct {
+    data_stream_id: u8,
+    component_id: u8,
+    data: []const u8,
+
+    write_completion: xev.Completion = .{},
+    write_data: WriteData = .{},
+};
+
+pub const ContextOperation = union(ContextOperationType) {
+    gather_candidates: void,
+    set_remote_candidates: RemoteCandidateParameters,
+    send: SendParameters,
+};
+
+pub const InvalidError = error{
+    InvalidId,
+};
+
+pub const SendError = xev.WriteError || InvalidError || error{
+    NotReady,
+};
+
+pub const ContextResult = union(ContextOperationType) {
+    gather_candidates: InvalidError!void,
+    set_remote_candidates: InvalidError!void,
+    send: SendError!usize,
+};
+
+pub const ContextCallback = *const fn (userdata: ?*anyopaque, result: ContextResult) void;
+pub fn noopCallback(_: ?*anyopaque, _: ContextResult) void {}
 
 pub const ContextCompletion = struct {
+    agent_id: AgentId,
+    op: ContextOperation = undefined,
+
     userdata: ?*anyopaque = null,
-    callback: *const fn (_: ?*anyopaque, _: *ContextCompletion, _: ContextResult) void,
+    callback: ContextCallback = noopCallback,
 
     next: ?*ContextCompletion = null,
+};
+
+const context_agent_slot_bit_count = 6;
+const context_agent_slot_count = 1 << context_agent_slot_bit_count;
+
+pub const AgentId = GenerationId(u16, context_agent_slot_bit_count);
+
+const AgentContextEntry = struct {
+    agent_id: AgentId = .{ .raw = 0 },
+    agent_context: ?AgentContext = null,
 };
 
 pub const Context = struct {
@@ -3004,8 +2928,7 @@ pub const Context = struct {
     network_interface_map: std.AutoArrayHashMapUnmanaged(u32, NetworkInterface) = .{},
     interface_addresses: std.ArrayListUnmanaged(InterfaceAddress) = .{},
 
-    agent_map_mutex: std.Thread.Mutex = .{},
-    agent_map: std.AutoArrayHashMapUnmanaged(usize, *AgentContext) = .{},
+    agent_context_entries: [context_agent_slot_count]AgentContextEntry,
 
     string_storage: std.heap.ArenaAllocator,
 
@@ -3023,27 +2946,36 @@ pub const Context = struct {
 
     loop: *xev.Loop = undefined,
 
-    pub fn init(allocator: std.mem.Allocator) !Context {
+    pub fn init(loop: *xev.Loop, allocator: std.mem.Allocator) !Context {
+        var agent_context_entries: [context_agent_slot_count]AgentContextEntry = undefined;
+        for (&agent_context_entries, 0..) |*entry, index| {
+            const agent_id = AgentId{ .parts = .{ .index = @intCast(index), .details = 0 } };
+            entry.* = AgentContextEntry{ .agent_id = agent_id };
+        }
+
         return Context{
             .allocator = allocator,
+            .agent_context_entries = agent_context_entries,
             .string_storage = std.heap.ArenaAllocator.init(allocator),
             .netlink_context = try NetlinkContext.init(allocator),
             .async_handle = try xev.Async.init(),
+            .loop = loop,
         };
     }
 
     pub fn deinit(self: *Context) void {
+        for (&self.agent_context_entries) |*entry| {
+            if (entry.agent_context) |*agent_context| agent_context.deinit();
+        }
+
         self.netlink_context.deinit();
         self.network_interface_map.deinit(self.allocator);
         self.interface_addresses.deinit(self.allocator);
         self.string_storage.deinit();
-        self.agent_map.deinit(self.allocator);
         self.async_handle.deinit();
     }
 
-    pub fn start(self: *Context, loop: *xev.Loop) !void {
-        self.loop = loop;
-
+    pub fn start(self: *Context) !void {
         self.netlink_context.userdata = self;
         self.netlink_context.on_interface_callback = (struct {
             fn callback(userdata: ?*anyopaque, event: NetlinkContext.InterfaceEvent) void {
@@ -3065,7 +2997,7 @@ pub const Context = struct {
         }).callback;
         self.async_handle.wait(self.loop, &self.async_completion, Context, self, asyncCallback);
 
-        try self.netlink_context.start(loop);
+        try self.netlink_context.start(self.loop);
     }
 
     pub fn stop(self: *Context) void {
@@ -3145,28 +3077,85 @@ pub const Context = struct {
         self.async_handle.notify() catch unreachable;
     }
 
-    pub fn registerAgent(self: *Context, agent_context: *AgentContext) !void {
-        self.agent_map_mutex.lock();
-        defer self.agent_map_mutex.unlock();
-
-        const gop = try self.agent_map.getOrPut(self.allocator, agent_context.id);
-
-        if (gop.found_existing) return error.AlreadyExists;
-
-        gop.value_ptr.* = agent_context;
+    inline fn isValidAgentId(self: *const Context, agent_id: AgentId) bool {
+        if (agent_id.parts.index >= self.agent_context_entries.len) return false;
+        const entry = self.agent_context_entries[agent_id.parts.index];
+        return entry.agent_id.raw == agent_id.raw;
     }
 
-    pub fn unregisterAgent(self: *Context, agent_context: *AgentContext) !void {
-        self.agent_map_mutex.lock();
-        defer self.agent_map_mutex.unlock();
-
-        const entry = self.agent_map.fetchSwapRemove(agent_context.id) orelse return error.NotFound;
-        _ = entry;
+    inline fn getAgentContext(self: *Context, agent_id: AgentId) InvalidError!*AgentContext {
+        if (!self.isValidAgentId(agent_id)) return error.InvalidId;
+        return if (self.agent_context_entries[agent_id.parts.index].agent_context) |*agent_context| agent_context else error.InvalidId;
     }
+
+    pub fn createAgent(self: *Context, options: CreateAgentOptions) !AgentId {
+        const unused_entry: *AgentContextEntry = for (&self.agent_context_entries) |*entry| {
+            if (entry.agent_context == null) break entry;
+        } else return error.NoSlotAvailable;
+
+        unused_entry.agent_context = try AgentContext.init(self, unused_entry.agent_id, self.loop, options, self.allocator);
+
+        return unused_entry.agent_id;
+    }
+
+    pub fn deleteAgent(self: *Context, agent_id: AgentId) !void {
+        const agent_context = try self.getAgentContext(agent_id);
+        agent_context.stop();
+    }
+
+    pub fn gatherCandidates(self: *Context, agent_id: AgentId, c: *ContextCompletion, userdata: ?*anyopaque, callback: ContextCallback) !void {
+        c.* = ContextCompletion{
+            .agent_id = agent_id,
+            .op = .{ .gather_candidates = {} },
+            .userdata = userdata,
+            .callback = callback,
+        };
+
+        self.async_queue_mutex.lock();
+        defer self.async_queue_mutex.unlock();
+        self.async_queue.push(c);
+        try self.async_handle.notify();
+    }
+
+    pub fn setRemoteCandidates(self: *Context, agent_id: AgentId, c: *ContextCompletion, parameters: RemoteCandidateParameters, userdata: ?*anyopaque, callback: ContextCallback) !void {
+        c.* = ContextCompletion{
+            .agent_id = agent_id,
+            .op = .{ .set_remote_candidates = parameters },
+            .userdata = userdata,
+            .callback = callback,
+        };
+
+        self.async_queue_mutex.lock();
+        defer self.async_queue_mutex.unlock();
+        self.async_queue.push(c);
+        try self.async_handle.notify();
+    }
+
+    //pub fn send(self: *Context, c: *AgentCompletion, userdata: ?*anyopaque, callback: AgentCallback, data_stream_id: u8, component_id: u8, data: []const u8) !void {
+    //    c.* = AgentCompletion{
+    //        .op = .{
+    //            .send = SendParameters{
+    //                .data_stream_id = data_stream_id,
+    //                .component_id = component_id,
+    //                .data = data,
+    //            },
+    //        },
+    //        .userdata = userdata,
+    //        .callback = callback,
+    //    };
+
+    //    {
+    //        self.async_queue_mutex.lock();
+    //        defer self.async_queue_mutex.unlock();
+    //        self.async_queue.push(c);
+    //    }
+
+    //    try self.async_handle.notify();
+    //}
 
     pub fn getValidCandidateAddresses(self: *Context, allocator: std.mem.Allocator) ![]std.net.Address {
-        self.agent_map_mutex.lock();
-        defer self.agent_map_mutex.unlock();
+        self.addresses_mutex.lock();
+        defer self.addresses_mutex.unlock();
 
         var address_list = try std.ArrayList(std.net.Address).initCapacity(allocator, self.interface_addresses.items.len);
         defer address_list.deinit();
@@ -3204,7 +3193,25 @@ pub const Context = struct {
         };
 
         while (local_queue.pop()) |c| {
-            c.callback(c.userdata, c, {});
+            switch (c.op) {
+                .gather_candidates => {
+                    const gather_result = if (self.getAgentContext(c.agent_id)) |agent_context| b: {
+                        agent_context.processGatherCandidates() catch unreachable;
+                        break :b {};
+                    } else |err| err;
+
+                    c.callback(c.userdata, ContextResult{ .gather_candidates = gather_result });
+                },
+                .set_remote_candidates => |parameters| {
+                    const set_remote_candidates_result = if (self.getAgentContext(c.agent_id)) |agent_context| b: {
+                        agent_context.processSetRemoteCandidates(parameters) catch unreachable;
+                        break :b {};
+                    } else |err| err;
+
+                    c.callback(c.userdata, ContextResult{ .set_remote_candidates = set_remote_candidates_result });
+                },
+                .send => {},
+            }
         }
 
         return if (self.flags.stopped) .disarm else .rearm;
@@ -3213,9 +3220,10 @@ pub const Context = struct {
 
 test "Basic structs size" {
     // TODO(Corendos): Re-enable that when things are settled.
-    try std.testing.expectEqual(@as(usize, 1552), @sizeOf(StunContext));
-    try std.testing.expectEqual(@as(usize, 480), @sizeOf(SocketContext));
+    try std.testing.expectEqual(@as(usize, 1560), @sizeOf(StunContext));
+    try std.testing.expectEqual(@as(usize, 640), @sizeOf(SocketContext));
     //try std.testing.expectEqual(@as(usize, 272952), @sizeOf(AgentContext));
+
 }
 
 test {
@@ -3224,4 +3232,5 @@ test {
     _ = platform;
     _ = net;
     _ = @import("circular_buffer.zig");
+    _ = @import("generation_id.zig");
 }
