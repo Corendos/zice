@@ -166,8 +166,6 @@ pub fn main() !void {
     context.controlling_agent = controlling_agent;
     context.controlled_agent = controlled_agent;
 
-    std.time.sleep(50_000_000);
-
     var gather_completion: zice.ContextCompletion = undefined;
     try zice_context.gatherCandidates(controlling_agent, &gather_completion, null, gatherCandidateCallback);
 

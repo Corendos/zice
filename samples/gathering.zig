@@ -75,8 +75,6 @@ pub fn main() !void {
     const agent = try zice_context.createAgent(.{});
     context.agent = agent;
 
-    std.time.sleep(50_000_000);
-
     var gather_completion: zice.ContextCompletion = undefined;
     try zice_context.gatherCandidates(agent, &gather_completion, null, gatherCandidateCallback);
 

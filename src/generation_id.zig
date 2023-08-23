@@ -13,6 +13,12 @@ pub fn GenerationId(comptime StorageType: type, comptime index_bit_count: u16) t
     return extern union {
         raw: StorageType,
         parts: packed struct { index: IndexType, details: DetailsType },
+
+        pub fn format(self: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            _ = options;
+            _ = fmt;
+            try writer.print("{}", .{self.raw});
+        }
     };
 }
 

@@ -369,9 +369,6 @@ const TransactionCallback = *const fn (userdata: ?*anyopaque, transaction_data: 
 fn noopTransactionCallback(_: ?*anyopaque, _: *TransactionData, _: TransactionResult) void {}
 
 pub const TransactionData = struct {
-    /// The index of associated agent.
-    agent_id: usize,
-
     socket_context: *SocketContext,
     server_address: ?std.net.Address = null,
 
@@ -419,7 +416,7 @@ pub const TransactionData = struct {
     result_storage: []u8 = &.{},
 
     /// Initialize a Candidate context from the given socket.
-    pub fn init(agent_id: usize, socket_context: *SocketContext, transaction_id: u96, write_buffer: []u8, result_storage: []u8) !TransactionData {
+    pub fn init(socket_context: *SocketContext, transaction_id: u96, write_buffer: []u8, result_storage: []u8) !TransactionData {
         const retry_timer = try xev.Timer.init();
         errdefer retry_timer.deinit();
 
@@ -427,7 +424,6 @@ pub const TransactionData = struct {
         errdefer timeout_timer.deinit();
 
         return .{
-            .agent_id = agent_id,
             .socket_context = socket_context,
             .retry_timer = retry_timer,
             .timeout_timer = timeout_timer,
@@ -726,8 +722,6 @@ pub const TransactionData = struct {
 
 // TODO(Corendos): Handle socket closing properly.
 pub const SocketContext = struct {
-    /// The index of associated agent.
-    agent_id: usize,
     /// Our index in the Agent Context.
     index: usize,
 
@@ -747,9 +741,8 @@ pub const SocketContext = struct {
     /// The completion to cancel reads.
     read_cancel_completion: xev.Completion = .{},
 
-    pub fn init(agent_id: usize, index: usize, socket: std.os.fd_t, address: std.net.Address, read_buffer: []u8) SocketContext {
+    pub fn init(index: usize, socket: std.os.fd_t, address: std.net.Address, read_buffer: []u8) SocketContext {
         return SocketContext{
-            .agent_id = agent_id,
             .index = index,
             .socket = socket,
             .address = address,
@@ -1005,7 +998,6 @@ const Checklist = struct {
 };
 
 const ConnectivityCheckContext = struct {
-    agent_id: usize,
     socket_index: usize,
     candidate_pair: CandidatePair,
 
@@ -1019,7 +1011,6 @@ const ConnectivityCheckContext = struct {
 };
 
 const GatheringContext = struct {
-    agent_id: usize,
     socket_index: usize,
     candidate_index: usize,
 
@@ -1294,7 +1285,7 @@ pub const AgentContext = struct {
             const bound_address = try net.getSocketAddress(socket);
 
             const read_buffer = try self.buffer_pool.create();
-            socket_context_list.appendAssumeCapacity(SocketContext.init(self.id, index, socket, bound_address, read_buffer));
+            socket_context_list.appendAssumeCapacity(SocketContext.init(index, socket, bound_address, read_buffer));
         }
         self.socket_contexts = socket_context_list.toOwnedSlice() catch unreachable;
 
@@ -2050,12 +2041,11 @@ pub const AgentContext = struct {
         const result_storage = self.buffer_pool.create() catch unreachable;
         errdefer self.buffer_pool.destroy(result_storage);
 
-        const transaction_data = TransactionData.init(self.id, socket_context, request.transaction_id, write_buffer, result_storage) catch unreachable;
+        const transaction_data = TransactionData.init(socket_context, request.transaction_id, write_buffer, result_storage) catch unreachable;
         errdefer transaction_data.deinit();
 
         stun_context.* = .{
             .gathering = .{
-                .agent_id = self.id,
                 .socket_index = candidate_index,
                 .candidate_index = candidate_index,
                 .transaction_data = transaction_data,
@@ -2658,7 +2648,6 @@ pub const AgentContext = struct {
         errdefer self.buffer_pool.destroy(result_storage);
 
         var transaction_data = try TransactionData.init(
-            self.id,
             socket_context,
             request.transaction_id,
             write_buffer,
@@ -2668,7 +2657,6 @@ pub const AgentContext = struct {
 
         stun_context.* = .{
             .check = ConnectivityCheckContext{
-                .agent_id = self.id,
                 .socket_index = socket_context_index,
                 .candidate_pair = candidate_pair,
                 .transaction_data = transaction_data,
@@ -2917,6 +2905,9 @@ const context_agent_slot_count = 1 << context_agent_slot_bit_count;
 pub const AgentId = GenerationId(u16, context_agent_slot_bit_count);
 
 const AgentContextEntry = struct {
+    flags: packed struct {
+        deleted: bool = false,
+    } = .{},
     agent_id: AgentId = .{ .raw = 0 },
     agent_context: ?AgentContext = null,
 };
@@ -3083,9 +3074,14 @@ pub const Context = struct {
         return entry.agent_id.raw == agent_id.raw;
     }
 
-    inline fn getAgentContext(self: *Context, agent_id: AgentId) InvalidError!*AgentContext {
+    inline fn getAgentEntry(self: *Context, agent_id: AgentId) InvalidError!*AgentContextEntry {
         if (!self.isValidAgentId(agent_id)) return error.InvalidId;
-        return if (self.agent_context_entries[agent_id.parts.index].agent_context) |*agent_context| agent_context else error.InvalidId;
+        return &self.agent_context_entries[agent_id.parts.index];
+    }
+
+    inline fn getAgentContext(self: *Context, agent_id: AgentId) InvalidError!*AgentContext {
+        const entry = try self.getAgentEntry(agent_id);
+        return if (entry.agent_context) |*agent_context| agent_context else error.InvalidId;
     }
 
     pub fn createAgent(self: *Context, options: CreateAgentOptions) !AgentId {
@@ -3099,8 +3095,10 @@ pub const Context = struct {
     }
 
     pub fn deleteAgent(self: *Context, agent_id: AgentId) !void {
-        const agent_context = try self.getAgentContext(agent_id);
-        agent_context.stop();
+        const entry = try self.getAgentEntry(agent_id);
+        if (entry.agent_context == null or entry.flags.deleted) return error.InvalidId;
+        entry.flags.deleted = true;
+        entry.agent_context.?.stop();
     }
 
     pub fn gatherCandidates(self: *Context, agent_id: AgentId, c: *ContextCompletion, userdata: ?*anyopaque, callback: ContextCallback) !void {
@@ -3192,9 +3190,15 @@ pub const Context = struct {
             break :b q;
         };
 
+        var to_reenqueue = Intrusive(ContextCompletion){};
+
         while (local_queue.pop()) |c| {
             switch (c.op) {
                 .gather_candidates => {
+                    if (!self.netlink_context_ready) {
+                        to_reenqueue.push(c);
+                        continue;
+                    }
                     const gather_result = if (self.getAgentContext(c.agent_id)) |agent_context| b: {
                         agent_context.processGatherCandidates() catch unreachable;
                         break :b {};
@@ -3214,16 +3218,21 @@ pub const Context = struct {
             }
         }
 
+        self.async_queue_mutex.lock();
+        defer self.async_queue_mutex.unlock();
+        while (to_reenqueue.pop()) |c| {
+            self.async_queue.push(c);
+        }
+
         return if (self.flags.stopped) .disarm else .rearm;
     }
 };
 
 test "Basic structs size" {
     // TODO(Corendos): Re-enable that when things are settled.
-    try std.testing.expectEqual(@as(usize, 1560), @sizeOf(StunContext));
-    try std.testing.expectEqual(@as(usize, 640), @sizeOf(SocketContext));
-    //try std.testing.expectEqual(@as(usize, 272952), @sizeOf(AgentContext));
-
+    try std.testing.expectEqual(@as(usize, 1544), @sizeOf(StunContext));
+    try std.testing.expectEqual(@as(usize, 632), @sizeOf(SocketContext));
+    try std.testing.expectEqual(@as(usize, 10280), @sizeOf(AgentContext));
 }
 
 test {
