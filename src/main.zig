@@ -1068,17 +1068,12 @@ pub const AgentContext = struct {
     /// The agent role.
     role: ?AgentRole = null,
 
-    /// The username fragment used for connectivity checks.
-    username_fragment: [8]u8,
-    /// The password used for connectivity checks.
-    password: [24]u8,
+    /// The local authentication parameters used for connectivity checks.
+    local_auth: AuthParameters,
+    /// The remote authentication parameters used for connectivity checks.
+    remote_auth: ?AuthParameters = null,
     /// Tiebreaker value.
     tiebreaker: u64,
-
-    /// The remote username fragment used for connectivity checks.
-    remote_username_fragment: ?[8]u8 = null,
-    /// The remote password used for connectivity checks.
-    remote_password: ?[24]u8 = null,
 
     local_candidates: std.ArrayListUnmanaged(Candidate) = .{},
     remote_candidates: std.ArrayListUnmanaged(Candidate) = .{},
@@ -1186,8 +1181,7 @@ pub const AgentContext = struct {
             .connectivity_check_transaction_map = std.AutoHashMap(CandidatePair, u96).init(allocator),
             .connectivity_checks_timer = connectivity_checks_timer,
             .binding_request_queue_write_buffer = binding_request_queue_write_buffer,
-            .username_fragment = auth_parameters.username_fragment,
-            .password = auth_parameters.password,
+            .local_auth = auth_parameters,
             .tiebreaker = tiebreaker,
             .userdata = options.userdata,
             .on_candidate_callback = options.on_candidate_callback,
@@ -1323,9 +1317,11 @@ pub const AgentContext = struct {
 
     fn processSetRemoteCandidates(self: *AgentContext, parameters: RemoteCandidateParameters) !void {
         try self.remote_candidates.appendSlice(self.allocator, parameters.candidates);
+        self.remote_auth = AuthParameters{
+            .username_fragment = parameters.username_fragment,
+            .password = parameters.password,
+        };
         self.has_remote_candidates = true;
-        self.remote_username_fragment = parameters.username_fragment;
-        self.remote_password = parameters.password;
 
         // If we don't have a role yet, we can assume that the other agent is the controlling one.
         if (self.role == null) {
@@ -2279,7 +2275,7 @@ pub const AgentContext = struct {
         var buffer: [4096]u8 = undefined;
         const response = r: {
             var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
-            break :r makeBindingResponse(request_entry.transaction_id, request_entry.source, self.password, arena_state.allocator()) catch unreachable;
+            break :r makeBindingResponse(request_entry.transaction_id, request_entry.source, self.local_auth.password, arena_state.allocator()) catch unreachable;
         };
 
         const data = d: {
@@ -2399,7 +2395,7 @@ pub const AgentContext = struct {
         };
 
         // Check fingerprint/integrity.
-        try checkMessageIntegrity(request, &self.password);
+        try checkMessageIntegrity(request, &self.local_auth.password);
 
         // Enqueue response.
         self.binding_request_queue.push(RequestEntry{
@@ -2622,9 +2618,9 @@ pub const AgentContext = struct {
         const request = r: {
             var allocator = std.heap.FixedBufferAllocator.init(&buffer);
             break :r makeConnectivityCheckBindingRequest(
-                self.username_fragment,
-                self.remote_username_fragment.?,
-                self.remote_password.?,
+                self.local_auth.username_fragment,
+                self.remote_auth.?.username_fragment,
+                self.remote_auth.?.password,
                 local_candidate.priority,
                 self.role.?,
                 self.tiebreaker,

@@ -23,8 +23,8 @@ pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentCon
     } else if (result == .done) {
         const parameters = zice.RemoteCandidateParameters{
             .candidates = context.controlling_agent_candidates.items,
-            .username_fragment = agent.username_fragment,
-            .password = agent.password,
+            .username_fragment = agent.local_auth.username_fragment,
+            .password = agent.local_auth.password,
         };
 
         context.zice_context.?.setRemoteCandidates(
@@ -53,8 +53,8 @@ pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentCont
     } else if (result == .done) {
         const parameters = zice.RemoteCandidateParameters{
             .candidates = context.controlled_agent_candidates.items,
-            .username_fragment = agent.username_fragment,
-            .password = agent.password,
+            .username_fragment = agent.local_auth.username_fragment,
+            .password = agent.local_auth.password,
         };
 
         context.zice_context.?.setRemoteCandidates(
