@@ -9,6 +9,7 @@ const xev = @import("xev");
 
 const DoublyLinkedList = @import("doubly_linked_list.zig").DoublyLinkedList;
 const CircularBuffer = @import("circular_buffer.zig").CircularBuffer;
+const BoundedFifo = @import("bounded_fifo.zig").BoundedFifo;
 const GenerationId = @import("generation_id.zig").GenerationId;
 
 pub const net = @import("net.zig");
@@ -828,14 +829,11 @@ const CandidatePairFoundation = packed struct {
     }
 };
 
-const TriggeredCheckNode = struct {
+const TriggeredCheckEntry = struct {
     candidate_pair: CandidatePair,
     nominate: bool = false,
 
-    next: ?*TriggeredCheckNode = null,
-    prev: ?*TriggeredCheckNode = null,
-
-    pub fn eql(a: TriggeredCheckNode, b: TriggeredCheckNode) bool {
+    pub fn eql(a: TriggeredCheckEntry, b: TriggeredCheckEntry) bool {
         return a.candidate_pair.eql(b.candidate_pair);
     }
 };
@@ -855,7 +853,7 @@ const Checklist = struct {
     valid_pairs_map: std.AutoArrayHashMap(CandidatePair, CandidatePairData),
 
     /// The triggered check FIFO associated with this checklist.
-    triggered_check_queue: DoublyLinkedList(TriggeredCheckNode) = .{},
+    triggered_check_queue: BoundedFifo(TriggeredCheckEntry, 16) = .{},
 
     nomination_in_progress: bool = false,
 
@@ -1103,9 +1101,6 @@ pub const AgentContext = struct {
 
     // Connectivity checks related fields.
 
-    /// A pool of Node used to build triggered checks FIFO.
-    triggered_check_node_pool: std.heap.MemoryPool(TriggeredCheckNode) = undefined,
-
     // TODO(Corendos): handle multiple data-stream.
     /// The checklists used to check candidate pairs.
     checklist: Checklist,
@@ -1159,9 +1154,6 @@ pub const AgentContext = struct {
         var stun_context_pool = std.heap.MemoryPool(StunContext).init(allocator);
         errdefer stun_context_pool.deinit();
 
-        var triggered_check_node_pool = std.heap.MemoryPool(TriggeredCheckNode).init(allocator);
-        errdefer triggered_check_node_pool.deinit();
-
         var binding_request_queue_write_buffer = try buffer_pool.create();
         errdefer buffer_pool.destroy(binding_request_queue_write_buffer);
 
@@ -1176,7 +1168,6 @@ pub const AgentContext = struct {
             .buffer_pool = buffer_pool,
             .stun_context_pool = stun_context_pool,
             .stun_context_map = StunContextMap.init(allocator),
-            .triggered_check_node_pool = triggered_check_node_pool,
             .checklist = checklist,
             .connectivity_check_transaction_map = std.AutoHashMap(CandidatePair, u96).init(allocator),
             .connectivity_checks_timer = connectivity_checks_timer,
@@ -1242,7 +1233,6 @@ pub const AgentContext = struct {
         self.stun_context_pool.deinit();
         self.stun_context_map.deinit();
 
-        self.triggered_check_node_pool.deinit();
         self.connectivity_checks_timer.deinit();
         self.connectivity_check_transaction_map.deinit();
 
@@ -1876,24 +1866,19 @@ pub const AgentContext = struct {
 
         if (self.checklist.state == .running) {
             // Remove pairs with same component ID from the triggered_check_queue.
-            var new_check_queue = DoublyLinkedList(TriggeredCheckNode){};
-            var node_opt: ?*TriggeredCheckNode = self.checklist.triggered_check_queue.head;
-            while (node_opt) |node| {
-                const next = node.next;
-                const node_local_candidate = self.local_candidates.items[node.candidate_pair.local_candidate_index];
-                if (node_local_candidate.component_id == valid_local_candidate.component_id) {
-                    self.triggered_check_node_pool.destroy(node);
-                } else {
-                    node.next = null;
-                    node.prev = null;
-                    new_check_queue.pushBack(node);
+            var index: usize = 0;
+            while (index < self.checklist.triggered_check_queue.count()) {
+                const current = self.checklist.triggered_check_queue.get(index);
+                const current_local_candidate = self.local_candidates.items[current.candidate_pair.local_candidate_index];
+                if (current_local_candidate.component_id == valid_local_candidate.component_id) {
+                    _ = self.checklist.triggered_check_queue.orderedRemove(index);
+                    continue;
                 }
-                node_opt = next;
+                index += 1;
             }
-            self.checklist.triggered_check_queue = new_check_queue;
 
             // Remove pairs with same component ID from the checklist.
-            var index: usize = 0;
+            index = 0;
             while (index < self.checklist.ordered_pairs.items.len) {
                 const current_candidate_pair = self.checklist.ordered_pairs.items[index];
                 const current_local_candidate = self.local_candidates.items[current_candidate_pair.local_candidate_index];
@@ -2457,10 +2442,9 @@ pub const AgentContext = struct {
                 }
                 self.checklist.setPairState(candidate_pair, .waiting);
 
-                if (self.checklist.triggered_check_queue.findFirst(TriggeredCheckNode{ .candidate_pair = candidate_pair }, TriggeredCheckNode.eql) == null) {
-                    const new_node = try self.triggered_check_node_pool.create();
-                    new_node.* = .{ .candidate_pair = candidate_pair, .nominate = use_candidate };
-                    self.checklist.triggered_check_queue.pushBack(new_node);
+                const new_entry = TriggeredCheckEntry{ .candidate_pair = candidate_pair, .nominate = use_candidate };
+                if (self.checklist.triggered_check_queue.findFirst(new_entry, TriggeredCheckEntry.eql) == null) {
+                    self.checklist.triggered_check_queue.push(new_entry) catch unreachable;
                 }
             },
         }
@@ -2565,9 +2549,7 @@ pub const AgentContext = struct {
         if (self.role == .controlling and !self.checklist.nomination_in_progress) {
             self.checklist.nomination_in_progress = true;
             log.debug("Agent {} - Try to nominate pair {}:{}", .{ self.id, valid_candidate_pair.local_candidate_index, valid_candidate_pair.remote_candidate_index });
-            const new_node = try self.triggered_check_node_pool.create();
-            new_node.* = .{ .candidate_pair = valid_candidate_pair, .nominate = true };
-            self.checklist.triggered_check_queue.pushBack(new_node);
+            self.checklist.triggered_check_queue.push(.{ .candidate_pair = valid_candidate_pair, .nominate = true }) catch unreachable;
         }
     }
 
@@ -2582,14 +2564,8 @@ pub const AgentContext = struct {
         check_context.transaction_data.readCallback(self.loop, raw_message, source);
     }
 
-    inline fn tryPopTriggeredCheckQueue(self: *AgentContext) ?TriggeredCheckNode {
-        var node = self.checklist.triggered_check_queue.popFront() orelse return null;
-        defer self.triggered_check_node_pool.destroy(node);
-
-        node.prev = null;
-        node.next = null;
-
-        return node.*;
+    inline fn tryPopTriggeredCheckQueue(self: *AgentContext) ?TriggeredCheckEntry {
+        return self.checklist.triggered_check_queue.pop() orelse return null;
         //while (!self.checklist.triggered_check_queue.empty()) {
         //    var node = self.checklist.triggered_check_queue.popFront().?;
         //    defer self.triggered_check_node_pool.destroy(node);
@@ -3225,10 +3201,9 @@ pub const Context = struct {
 };
 
 test "Basic structs size" {
-    // TODO(Corendos): Re-enable that when things are settled.
     try std.testing.expectEqual(@as(usize, 1544), @sizeOf(StunContext));
     try std.testing.expectEqual(@as(usize, 632), @sizeOf(SocketContext));
-    try std.testing.expectEqual(@as(usize, 10280), @sizeOf(AgentContext));
+    try std.testing.expectEqual(@as(usize, 10624), @sizeOf(AgentContext));
 }
 
 test {
@@ -3237,5 +3212,6 @@ test {
     _ = platform;
     _ = net;
     _ = @import("circular_buffer.zig");
+    _ = @import("bounded_fifo.zig");
     _ = @import("generation_id.zig");
 }
