@@ -23,7 +23,7 @@ pub fn CircularBuffer(comptime T: type, comptime size: usize) type {
         pub fn pop(self: *Self) ?T {
             if (self.head_index == self.tail_index) return null;
             defer self.tail_index += 1;
-            return self.data[self.tail_index];
+            return self.data[self.tail_index % size];
         }
 
         pub inline fn empty(self: Self) bool {
