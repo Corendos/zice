@@ -41,7 +41,13 @@ pub fn controllingStateChangeCallback(userdata: ?*anyopaque, agent: *zice.AgentC
     const context: *Context = @alignCast(@ptrCast(userdata.?));
     std.log.info("Agent {} new state: {any}", .{ agent.id, state });
     if (state == .completed) {
-        context.controlling_agent_event.set();
+        context.zice_context.?.send(context.controlling_agent.?, &context.controlling_send_completion, 1, 1, "Ping!", null, (struct {
+            pub fn callback(ud: ?*anyopaque, result: zice.ContextResult) void {
+                _ = ud;
+                _ = result;
+                std.log.debug("Agent 1024 - Message sent!", .{});
+            }
+        }).callback) catch unreachable;
     }
 }
 
@@ -69,15 +75,26 @@ pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentCont
 
 pub fn controlledStateChangeCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, state: zice.AgentState) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
+    _ = context;
     std.log.info("Agent {} new state: {any}", .{ agent.id, state });
-    if (state == .completed) {
-        context.controlled_agent_event.set();
-    }
+    if (state == .completed) {}
 }
 
-pub fn dataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
+pub fn controllingDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
     _ = userdata;
-    std.log.info("Agent {} received data for component {}: {any}", .{ agent.id, component_id, data });
+    std.log.info("Agent {} received data for component {}: {s}", .{ agent.id, component_id, data });
+}
+
+pub fn controlledDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
+    const context: *Context = @alignCast(@ptrCast(userdata.?));
+    std.log.info("Agent {} received data for component {}: {s}", .{ agent.id, component_id, data });
+    context.zice_context.?.send(context.controlled_agent.?, &context.controlled_send_completion, 1, 1, "Pong!", null, (struct {
+        pub fn callback(ud: ?*anyopaque, result: zice.ContextResult) void {
+            _ = ud;
+            _ = result;
+            std.log.debug("Agent 1025 - Message sent!", .{});
+        }
+    }).callback) catch unreachable;
 }
 
 fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.ContextResult) void {
@@ -103,8 +120,8 @@ const Context = struct {
     controlling_agent_candidates: std.ArrayList(zice.Candidate),
     controlled_agent_candidates: std.ArrayList(zice.Candidate),
 
-    controlling_agent_event: std.Thread.ResetEvent = .{},
-    controlled_agent_event: std.Thread.ResetEvent = .{},
+    controlling_send_completion: zice.ContextCompletion = undefined,
+    controlled_send_completion: zice.ContextCompletion = undefined,
 };
 
 fn stopHandlerCallback(userdata: ?*Context, loop: *xev.Loop) void {
@@ -152,14 +169,14 @@ pub fn main() !void {
         .userdata = &context,
         .on_candidate_callback = controllingCandidateCallback,
         .on_state_change_callback = controllingStateChangeCallback,
-        .on_data_callback = dataCallback,
+        .on_data_callback = controllingDataCallback,
     });
 
     var controlled_agent = try zice_context.createAgent(.{
         .userdata = &context,
         .on_candidate_callback = controlledCandidateCallback,
         .on_state_change_callback = controlledStateChangeCallback,
-        .on_data_callback = dataCallback,
+        .on_data_callback = controlledDataCallback,
     });
 
     context.zice_context = &zice_context;
@@ -168,21 +185,6 @@ pub fn main() !void {
 
     var gather_completion: zice.ContextCompletion = undefined;
     try zice_context.gatherCandidates(controlling_agent, &gather_completion, null, gatherCandidateCallback);
-
-    //context.controlling_agent_event.wait();
-    //context.controlled_agent_event.wait();
-
-    //var send_completion: zice.Completion = undefined;
-    //var send_event = std.Thread.ResetEvent{};
-
-    //try zice_context.send(&send_completion, &send_event, (struct {
-    //    pub fn callback(userdata: ?*anyopaque, result: zice.Result) void {
-    //        _ = result;
-    //        std.log.debug("Agent 1024 - Message sent!", .{});
-    //        const inner_send_event: *std.Thread.ResetEvent = @ptrCast(@alignCast(userdata.?));
-    //        inner_send_event.set();
-    //    }
-    //}).callback, context.controlling_agent, 1, 1, "Hello");
 
     network_loop_thread.join();
 }

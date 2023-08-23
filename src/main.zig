@@ -750,6 +750,10 @@ pub const SocketContext = struct {
             .read_buffer = read_buffer,
         };
     }
+
+    pub fn deinit(self: *SocketContext) void {
+        std.os.close(self.socket);
+    }
 };
 
 /// Represents the role of the agent in an ICE process.
@@ -766,7 +770,7 @@ pub const AgentState = enum {
     running,
     /// The Agent completed all the checklists,
     completed,
-    /// The agent has at least on efailed checklist.
+    /// The agent has at least one failed checklist.
     failed,
 };
 
@@ -1227,7 +1231,18 @@ pub const AgentContext = struct {
         );
     }
 
+    pub fn done(self: *const AgentContext) bool {
+        for (self.socket_contexts) |*ctx| if (ctx.read_completion.state() != .dead or ctx.read_cancel_completion.state() != .dead) return false;
+        if (self.stun_context_map.count() != 0) return false;
+        if (self.gathering_main_timer_completion.state() != .dead or self.gathering_main_timer_cancel_completion.state() != .dead) return false;
+        if (self.connectivity_checks_timer_completion.state() != .dead or self.connectivity_checks_timer_cancel_completion.state() != .dead) return false;
+
+        return true;
+    }
+
     pub fn deinit(self: *AgentContext) void {
+        std.debug.assert(self.done());
+
         self.gathering_main_timer.deinit();
         self.buffer_pool.deinit();
         self.stun_context_pool.deinit();
@@ -1236,6 +1251,7 @@ pub const AgentContext = struct {
         self.connectivity_checks_timer.deinit();
         self.connectivity_check_transaction_map.deinit();
 
+        for (self.socket_contexts) |*ctx| ctx.deinit();
         self.allocator.free(self.socket_contexts);
 
         self.allocator.free(self.gathering_candidate_statuses);
@@ -3070,7 +3086,17 @@ pub const Context = struct {
         const entry = try self.getAgentEntry(agent_id);
         if (entry.agent_context == null or entry.flags.deleted) return error.InvalidId;
         entry.flags.deleted = true;
-        entry.agent_context.?.stop();
+        try self.async_handle.notify();
+    }
+
+    fn addCompletion(self: *Context, c: *ContextCompletion) void {
+        self.async_queue_mutex.lock();
+        defer self.async_queue_mutex.unlock();
+        self.async_queue.push(c);
+    }
+
+    fn submitCompletions(self: *Context) !void {
+        try self.async_handle.notify();
     }
 
     pub fn gatherCandidates(self: *Context, agent_id: AgentId, c: *ContextCompletion, userdata: ?*anyopaque, callback: ContextCallback) !void {
@@ -3081,10 +3107,8 @@ pub const Context = struct {
             .callback = callback,
         };
 
-        self.async_queue_mutex.lock();
-        defer self.async_queue_mutex.unlock();
-        self.async_queue.push(c);
-        try self.async_handle.notify();
+        self.addCompletion(c);
+        try self.submitCompletions();
     }
 
     pub fn setRemoteCandidates(self: *Context, agent_id: AgentId, c: *ContextCompletion, parameters: RemoteCandidateParameters, userdata: ?*anyopaque, callback: ContextCallback) !void {
@@ -3095,33 +3119,25 @@ pub const Context = struct {
             .callback = callback,
         };
 
-        self.async_queue_mutex.lock();
-        defer self.async_queue_mutex.unlock();
-        self.async_queue.push(c);
-        try self.async_handle.notify();
+        self.addCompletion(c);
+        try self.submitCompletions();
     }
 
-    //pub fn send(self: *Context, c: *AgentCompletion, userdata: ?*anyopaque, callback: AgentCallback, data_stream_id: u8, component_id: u8, data: []const u8) !void {
-    //    c.* = AgentCompletion{
-    //        .op = .{
-    //            .send = SendParameters{
-    //                .data_stream_id = data_stream_id,
-    //                .component_id = component_id,
-    //                .data = data,
-    //            },
-    //        },
-    //        .userdata = userdata,
-    //        .callback = callback,
-    //    };
+    pub fn send(self: *Context, agent_id: AgentId, c: *ContextCompletion, data_stream_id: u8, component_id: u8, data: []const u8, userdata: ?*anyopaque, callback: ContextCallback) !void {
+        c.* = ContextCompletion{
+            .agent_id = agent_id,
+            .op = .{ .send = SendParameters{
+                .data_stream_id = data_stream_id,
+                .component_id = component_id,
+                .data = data,
+            } },
+            .userdata = userdata,
+            .callback = callback,
+        };
 
-    //    {
-    //        self.async_queue_mutex.lock();
-    //        defer self.async_queue_mutex.unlock();
-    //        self.async_queue.push(c);
-    //    }
-
-    //    try self.async_handle.notify();
-    //}
+        self.addCompletion(c);
+        try self.submitCompletions();
+    }
 
     pub fn getValidCandidateAddresses(self: *Context, allocator: std.mem.Allocator) ![]std.net.Address {
         self.addresses_mutex.lock();
@@ -3154,6 +3170,19 @@ pub const Context = struct {
         _ = loop;
         const self = userdata.?;
 
+        for (&self.agent_context_entries) |*entry| {
+            if (entry.flags.deleted) {
+                if (entry.agent_context.?.done()) {
+                    entry.agent_context.?.deinit();
+                    entry.flags.deleted = false;
+                    entry.agent_id.bump();
+                    entry.agent_context = null;
+                } else {
+                    entry.agent_context.?.stop();
+                }
+            }
+        }
+
         var local_queue = b: {
             self.async_queue_mutex.lock();
             defer self.async_queue_mutex.unlock();
@@ -3165,6 +3194,7 @@ pub const Context = struct {
         var to_reenqueue = Intrusive(ContextCompletion){};
 
         while (local_queue.pop()) |c| {
+            log.debug("Processing {s}", .{@tagName(c.op)});
             switch (c.op) {
                 .gather_candidates => {
                     if (!self.netlink_context_ready) {
@@ -3186,7 +3216,13 @@ pub const Context = struct {
 
                     c.callback(c.userdata, ContextResult{ .set_remote_candidates = set_remote_candidates_result });
                 },
-                .send => {},
+                .send => {
+                    const send_result = if (self.getAgentContext(c.agent_id)) |agent_context| b: {
+                        agent_context.processSend(c) catch unreachable;
+                        break :b {};
+                    } else |err| err;
+                    _ = send_result catch |err| c.callback(c.userdata, ContextResult{ .send = err });
+                },
             }
         }
 
