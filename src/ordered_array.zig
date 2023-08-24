@@ -25,7 +25,6 @@ pub fn OrderedBoundedArray(comptime T: type, comptime capacity: usize, comptime 
 
         data: [capacity]T = undefined,
         size: usize = 0,
-        items: []T = &.{},
 
         context: Context,
 
@@ -39,9 +38,15 @@ pub fn OrderedBoundedArray(comptime T: type, comptime capacity: usize, comptime 
             return Self{ .context = context };
         }
 
-        pub fn insert(self: *Self, v: T) void {
-            defer self.items = self.data[0..self.size];
+        pub inline fn slice(self: anytype) switch (@TypeOf(&self.data)) {
+            *[capacity]T => []T,
+            *const [capacity]T => []const T,
+            else => unreachable,
+        } {
+            return self.data[0..self.size];
+        }
 
+        pub fn insert(self: *Self, v: T) void {
             if (self.size == 0) {
                 self.data[0] = v;
                 self.size += 1;
@@ -68,7 +73,6 @@ pub fn OrderedBoundedArray(comptime T: type, comptime capacity: usize, comptime 
 
         pub fn remove(self: *Self, index: usize) T {
             std.debug.assert(index < self.size);
-            defer self.items = self.data[0..self.size];
 
             const removed = self.data[index];
             std.mem.copyForwards(T, self.data[index .. self.size - 1], self.data[index + 1 .. self.size]);
@@ -93,10 +97,10 @@ test "OrderedArray" {
     var ordered_array = OrderedBoundedArray(u32, 10, Context).init();
 
     ordered_array.insert(5);
-    try std.testing.expectEqualSlices(u32, &.{5}, ordered_array.items);
+    try std.testing.expectEqualSlices(u32, &.{5}, ordered_array.slice());
 
     ordered_array.insert(4);
-    try std.testing.expectEqualSlices(u32, &.{ 4, 5 }, ordered_array.items);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5 }, ordered_array.slice());
 
     ordered_array.insert(1);
     ordered_array.insert(2);
@@ -107,14 +111,14 @@ test "OrderedArray" {
     ordered_array.insert(9);
     ordered_array.insert(10);
 
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, ordered_array.items);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, ordered_array.slice());
 
     ordered_array.insert(11);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, ordered_array.items);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, ordered_array.slice());
 
     ordered_array.insert(0);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, ordered_array.items);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, ordered_array.slice());
 
     try std.testing.expectEqual(@as(u32, 3), ordered_array.remove(3));
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 4, 5, 6, 7, 8, 9 }, ordered_array.items);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 4, 5, 6, 7, 8, 9 }, ordered_array.slice());
 }
