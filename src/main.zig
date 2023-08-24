@@ -3250,4 +3250,5 @@ test {
     _ = @import("circular_buffer.zig");
     _ = @import("bounded_fifo.zig");
     _ = @import("generation_id.zig");
+    _ = @import("ordered_array.zig");
 }
