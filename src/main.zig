@@ -129,8 +129,12 @@ pub const Configuration = struct {
     const stun_address_ipv4 = std.net.Address.parseIp4("172.253.120.127", 19302) catch unreachable;
     const stun_address_ipv6 = std.net.Address.parseIp6("2a00:1450:400c:c00::7f", 19302) catch unreachable;
 
-    pub inline fn computeRtoMs(candidate_count: u64) u64 {
+    pub inline fn computeRtoGatheringMs(candidate_count: u64) u64 {
         return @max(500, candidate_count * new_transaction_interval_ms);
+    }
+
+    pub inline fn computeRtoCheckMs(check_count: u64, waiting_count: u64, in_progress_count: u64) u64 {
+        return @max(500, check_count * (waiting_count + in_progress_count) * new_transaction_interval_ms);
     }
 };
 
@@ -362,17 +366,17 @@ fn noopDataCallback(_: ?*anyopaque, _: *AgentContext, _: u8, _: []const u8) void
 pub const TransactionError = error{
     Canceled,
     Timeout,
-    Unexpected,
+    NotEnoughSpace,
 };
 
-pub const TransactionResult = TransactionError!struct { message: ztun.Message, source: std.net.Address };
+pub const TransactionResult = TransactionError!struct { raw_message: []const u8, source: std.net.Address };
 
-const TransactionCallback = *const fn (userdata: ?*anyopaque, transaction_data: *TransactionData, result: TransactionResult) void;
-fn noopTransactionCallback(_: ?*anyopaque, _: *TransactionData, _: TransactionResult) void {}
+const TransactionCallback = *const fn (userdata: ?*anyopaque, transaction: *Transaction, result: TransactionResult) void;
+fn noopTransactionCallback(_: ?*anyopaque, _: *Transaction, _: TransactionResult) void {}
 
-pub const TransactionData = struct {
-    socket_context: *SocketContext,
-    server_address: ?std.net.Address = null,
+pub const Transaction = struct {
+    socket: std.os.fd_t,
+    server_address: std.net.Address,
 
     /// The timer that is used for retry.
     retry_timer: xev.Timer,
@@ -410,52 +414,66 @@ pub const TransactionData = struct {
     flags: packed struct {
         canceled: bool = false,
         no_retransmits: bool = false,
+        timeout: bool = false,
     } = .{},
 
     userdata: ?*anyopaque = null,
     callback: TransactionCallback = noopTransactionCallback,
     result: ?TransactionResult = null,
-    result_storage: []u8 = &.{},
+    read_buffer: []u8 = &.{},
 
-    /// Initialize a Candidate context from the given socket.
-    pub fn init(socket_context: *SocketContext, transaction_id: u96, write_buffer: []u8, result_storage: []u8) !TransactionData {
-        const retry_timer = try xev.Timer.init();
-        errdefer retry_timer.deinit();
+    /// Initialize a Transaction with given parameters.
+    pub fn init(socket: std.os.fd_t, destination: std.net.Address, message: ztun.Message, write_buffer: []u8, read_buffer: []u8, userdata: ?*anyopaque, comptime callback: TransactionCallback) Transaction {
+        const retry_timer = xev.Timer.init() catch unreachable;
+        const timeout_timer = xev.Timer.init() catch unreachable;
 
-        const timeout_timer = try xev.Timer.init();
-        errdefer timeout_timer.deinit();
+        const request_data = b: {
+            var stream = std.io.fixedBufferStream(write_buffer);
+            const writer = stream.writer();
+            message.write(writer) catch unreachable;
+            break :b stream.getWritten();
+        };
 
         return .{
-            .socket_context = socket_context,
+            .socket = socket,
+            .server_address = destination,
             .retry_timer = retry_timer,
             .timeout_timer = timeout_timer,
             .write_buffer = write_buffer,
-            .transaction_id = transaction_id,
-            .result_storage = result_storage,
+            .request_data = request_data,
+            .transaction_id = message.transaction_id,
+            .read_buffer = read_buffer,
+            .userdata = userdata,
+            .callback = callback,
         };
     }
 
     /// Deinitialize a candidate context.
-    pub fn deinit(self: *TransactionData) void {
+    pub fn deinit(self: *Transaction) void {
         self.retry_timer.deinit();
         self.timeout_timer.deinit();
     }
 
-    pub fn start(self: *TransactionData, request: ztun.Message, address: std.net.Address, rto: u64, loop: *xev.Loop) void {
-        self.server_address = address;
+    pub fn start(self: *Transaction, rto: u64, loop: *xev.Loop) void {
         self.rto = rto;
-        std.debug.assert(self.transaction_id == request.transaction_id);
-        self.request_data = d: {
-            var stream = std.io.fixedBufferStream(self.write_buffer);
-            request.write(stream.writer()) catch unreachable;
-            break :d stream.getWritten();
-        };
 
-        //log.debug("Transaction {x:12} - Sending request", .{self.transaction_id.?});
-        self.sendRequest(request, loop);
+        self.write_data.from(self.server_address, self.request_data);
+
+        self.write_completion = xev.Completion{
+            .op = .{
+                .sendmsg = .{
+                    .fd = self.socket,
+                    .msghdr = &self.write_data.message_header,
+                    .buffer = null,
+                },
+            },
+            .userdata = self,
+            .callback = writeCallback,
+        };
+        loop.add(&self.write_completion);
     }
 
-    pub fn cancel(self: *TransactionData, loop: *xev.Loop) void {
+    pub fn cancel(self: *Transaction, loop: *xev.Loop) void {
         self.cancelWrite(loop);
         self.cancelRetry(loop);
         self.cancelTimeout(loop);
@@ -467,50 +485,50 @@ pub const TransactionData = struct {
         self.flags.canceled = true;
     }
 
-    pub fn stopRetransmits(self: *TransactionData, loop: *xev.Loop) void {
+    pub fn stopRetransmits(self: *Transaction, loop: *xev.Loop) void {
+        self.cancelWrite(loop);
         self.cancelRetry(loop);
         self.flags.no_retransmits = true;
     }
 
-    pub fn readCallback(self: *TransactionData, loop: *xev.Loop, raw_message: []const u8, source: std.net.Address) void {
-        //log.debug("Transaction {x:12} - Received STUN response", .{self.transaction_id.?});
-
+    pub fn readCallback(self: *Transaction, loop: *xev.Loop, raw_message: []const u8, source: std.net.Address) void {
         self.cancelWrite(loop);
         self.cancelRetry(loop);
         self.cancelTimeout(loop);
 
-        const message = b: {
-            var stream = std.io.fixedBufferStream(raw_message);
-            var allocator = std.heap.FixedBufferAllocator.init(self.result_storage);
-            break :b ztun.Message.readAlloc(stream.reader(), allocator.allocator()) catch unreachable;
-        };
-
         if (self.result == null) {
-            self.result = .{ .message = message, .source = source };
+            // If the transaction has not been canceled or it has not timed out yet, we store the result.
+            if (raw_message.len <= self.read_buffer.len) {
+                self.result = .{ .raw_message = raw_message, .source = source };
+            } else {
+                // If we don't have enough space to store what we receive, we store the error in result.
+                self.result = error.NotEnoughSpace;
+            }
         }
 
+        // If the transaction is complete, we call the callback.
         if (self.state() == .dead) {
             self.callback(self.userdata, self, self.result.?);
         }
     }
 
-    pub inline fn isWriteActive(self: TransactionData) bool {
+    pub inline fn isWriteActive(self: Transaction) bool {
         return self.write_completion.state() != .dead or self.write_cancel_completion.state() != .dead;
     }
 
-    pub inline fn isRetryTimerActive(self: TransactionData) bool {
+    pub inline fn isRetryTimerActive(self: Transaction) bool {
         return self.retry_timer_completion.state() != .dead or self.retry_timer_cancel_completion.state() != .dead;
     }
 
-    pub inline fn isTimeoutTimerActive(self: TransactionData) bool {
+    pub inline fn isTimeoutTimerActive(self: Transaction) bool {
         return self.timeout_completion.state() != .dead or self.timeout_cancel_completion.state() != .dead;
     }
 
-    pub inline fn state(self: TransactionData) xev.CompletionState {
+    pub inline fn state(self: Transaction) xev.CompletionState {
         return if (self.isWriteActive() or self.isRetryTimerActive() or self.isTimeoutTimerActive()) .active else .dead;
     }
 
-    fn cancelWrite(self: *TransactionData, loop: *xev.Loop) void {
+    fn cancelWrite(self: *Transaction, loop: *xev.Loop) void {
         if (self.write_completion.state() == .dead or self.write_cancel_completion.state() == .active) return;
 
         self.write_cancel_completion = xev.Completion{
@@ -521,27 +539,27 @@ pub const TransactionData = struct {
         loop.add(&self.write_cancel_completion);
     }
 
-    fn cancelRetry(self: *TransactionData, loop: *xev.Loop) void {
+    fn cancelRetry(self: *Transaction, loop: *xev.Loop) void {
         if (self.retry_timer_completion.state() == .dead or self.retry_timer_cancel_completion.state() == .active) return;
 
         self.retry_timer.cancel(
             loop,
             &self.retry_timer_completion,
             &self.retry_timer_cancel_completion,
-            TransactionData,
+            Transaction,
             self,
             retryCancelCallback,
         );
     }
 
-    fn cancelTimeout(self: *TransactionData, loop: *xev.Loop) void {
+    fn cancelTimeout(self: *Transaction, loop: *xev.Loop) void {
         if (self.timeout_completion.state() == .dead or self.timeout_cancel_completion.state() == .active) return;
 
         self.timeout_timer.cancel(
             loop,
             &self.timeout_completion,
             &self.timeout_cancel_completion,
-            TransactionData,
+            Transaction,
             self,
             timeoutCancelCallback,
         );
@@ -554,10 +572,10 @@ pub const TransactionData = struct {
         result: xev.Result,
     ) xev.CallbackAction {
         _ = c;
-        const self: *TransactionData = @ptrCast(@alignCast(userdata.?));
+        const self: *Transaction = @ptrCast(@alignCast(userdata.?));
 
         _ = result.sendmsg catch |err| {
-            log.err("Transaction {x:12} - Got {} when sending STUN request", .{ self.transaction_id, err });
+            log.err("Transaction {x:12} - Failed to send STUN request. Reason: {}", .{ self.transaction_id, err });
             if (self.state() == .dead) {
                 self.callback(self.userdata, self, self.result.?);
             }
@@ -566,14 +584,13 @@ pub const TransactionData = struct {
         };
 
         self.request_sent_count += 1;
-        //log.debug("Transaction {x:12} - STUN request sent", .{self.transaction_id.?});
 
         const is_first_request = self.request_sent_count == 1;
         self.retry_timer_timeout_ms = if (is_first_request) self.rto.? else self.retry_timer_timeout_ms * 2;
 
         if (is_first_request) {
             const timeout_ms: u64 = (@as(u64, 1 << Configuration.request_count) - 1 + Configuration.last_request_factor) * self.rto.?;
-            self.timeout_timer.run(loop, &self.timeout_completion, timeout_ms, TransactionData, self, timeoutCallback);
+            self.timeout_timer.run(loop, &self.timeout_completion, timeout_ms, Transaction, self, timeoutCallback);
         }
 
         const is_last_request = self.request_sent_count == Configuration.request_count;
@@ -582,7 +599,7 @@ pub const TransactionData = struct {
                 loop,
                 &self.retry_timer_completion,
                 self.retry_timer_timeout_ms,
-                TransactionData,
+                Transaction,
                 self,
                 retryCallback,
             );
@@ -600,7 +617,7 @@ pub const TransactionData = struct {
         _ = c;
         _ = result;
         _ = loop;
-        const self: *TransactionData = @ptrCast(@alignCast(userdata.?));
+        const self: *Transaction = @ptrCast(@alignCast(userdata.?));
 
         if (self.state() == .dead) {
             self.callback(self.userdata, self, self.result.?);
@@ -610,7 +627,7 @@ pub const TransactionData = struct {
     }
 
     fn retryCallback(
-        userdata: ?*TransactionData,
+        userdata: ?*Transaction,
         loop: *xev.Loop,
         c: *xev.Completion,
         result: xev.Timer.RunError!void,
@@ -624,20 +641,13 @@ pub const TransactionData = struct {
             }
             return .disarm;
         };
-
-        //log.debug("Transaction {x:12} - STUN request {}/{} timed out", .{ self.transaction_id.?, self.request_sent_count, Configuration.request_count });
-        var buffer: [4096]u8 = undefined;
-        const request = r: {
-            var allocator = std.heap.FixedBufferAllocator.init(&buffer);
-            break :r makeBasicBindingRequest(allocator.allocator(), self.transaction_id) catch unreachable;
-        };
-        self.sendRequest(request, loop);
+        loop.add(&self.write_completion);
 
         return .disarm;
     }
 
     fn retryCancelCallback(
-        userdata: ?*TransactionData,
+        userdata: ?*Transaction,
         loop: *xev.Loop,
         c: *xev.Completion,
         result: xev.CancelError!void,
@@ -656,7 +666,7 @@ pub const TransactionData = struct {
     }
 
     fn timeoutCallback(
-        userdata: ?*TransactionData,
+        userdata: ?*Transaction,
         loop: *xev.Loop,
         c: *xev.Completion,
         result: xev.Timer.RunError!void,
@@ -672,10 +682,9 @@ pub const TransactionData = struct {
             return .disarm;
         };
 
-        //log.debug("Transaction {x:12} - Gathering timed out", .{self.transaction_id.?});
-
-        std.debug.assert(self.result == null);
-        self.result = error.Timeout;
+        if (self.result == null) {
+            self.result = error.Timeout;
+        }
 
         if (self.state() == .dead) {
             self.callback(self.userdata, self, self.result.?);
@@ -685,7 +694,7 @@ pub const TransactionData = struct {
     }
 
     fn timeoutCancelCallback(
-        userdata: ?*TransactionData,
+        userdata: ?*Transaction,
         loop: *xev.Loop,
         c: *xev.Completion,
         result: xev.CancelError!void,
@@ -701,24 +710,6 @@ pub const TransactionData = struct {
         }
 
         return .disarm;
-    }
-
-    fn sendRequest(self: *TransactionData, request: ztun.Message, loop: *xev.Loop) void {
-        self.transaction_id = request.transaction_id;
-        self.write_data.from(self.server_address.?, self.request_data);
-
-        self.write_completion = xev.Completion{
-            .op = .{
-                .sendmsg = .{
-                    .fd = self.socket_context.socket,
-                    .msghdr = &self.write_data.message_header,
-                    .buffer = null,
-                },
-            },
-            .userdata = self,
-            .callback = writeCallback,
-        };
-        loop.add(&self.write_completion);
     }
 };
 
@@ -922,6 +913,16 @@ const Checklist = struct {
         _ = self.valid_pairs.remove(index);
     }
 
+    inline fn getPairCount(self: *const Checklist, state: CandidatePairState) usize {
+        var count: usize = 0;
+
+        for (self.pairs.slice()) |entry| {
+            if (entry.data.state == state) count += 1;
+        }
+
+        return count;
+    }
+
     pub fn getValidEntry(self: *Checklist, candidate_pair: CandidatePair) ?*CandidatePairEntry {
         const index = indexOfPair(self.valid_pairs.slice(), candidate_pair) orelse return null;
         return &self.valid_pairs.slice()[index];
@@ -980,14 +981,14 @@ const ConnectivityCheckContext = struct {
         is_canceled: bool = false,
     } = .{},
 
-    transaction_data: TransactionData,
+    transaction: Transaction,
 };
 
 const GatheringContext = struct {
     socket_index: usize,
     candidate_index: usize,
 
-    transaction_data: TransactionData,
+    transaction: Transaction,
 };
 
 const StunContextType = enum {
@@ -1175,10 +1176,10 @@ pub const AgentContext = struct {
         while (it.next()) |entry| {
             switch (entry.value_ptr.*.*) {
                 .gathering => |*v| {
-                    v.transaction_data.cancel(self.loop);
+                    v.transaction.cancel(self.loop);
                 },
                 .check => |*v| {
-                    v.transaction_data.cancel(self.loop);
+                    v.transaction.cancel(self.loop);
                 },
             }
         }
@@ -1716,16 +1717,6 @@ pub const AgentContext = struct {
         return result;
     }
 
-    inline fn getWaitingPairCount(self: *const AgentContext) usize {
-        var count: usize = 0;
-
-        for (self.checklist.pairs.slice()) |entry| {
-            if (entry.data.state == .waiting) count += 1;
-        }
-
-        return count;
-    }
-
     fn unfreezePair(self: *AgentContext) void {
         pair: for (self.checklist.pairs.slice()) |entry| {
             if (entry.data.state != .frozen) continue;
@@ -1744,16 +1735,16 @@ pub const AgentContext = struct {
         }
     }
 
-    fn releaseTransactionData(self: *AgentContext, transaction_data: *TransactionData) void {
-        _ = self.stun_context_map.remove(transaction_data.transaction_id);
-        self.buffer_pool.destroy(@alignCast(transaction_data.write_buffer[0..4096]));
-        self.buffer_pool.destroy(@alignCast(transaction_data.result_storage[0..4096]));
-        transaction_data.deinit();
+    fn releaseTransactionData(self: *AgentContext, transaction: *Transaction) void {
+        _ = self.stun_context_map.remove(transaction.transaction_id);
+        self.buffer_pool.destroy(@alignCast(transaction.write_buffer[0..4096]));
+        self.buffer_pool.destroy(@alignCast(transaction.read_buffer[0..4096]));
+        transaction.deinit();
     }
 
     pub fn releaseStunContext(self: *AgentContext, stun_context: *StunContext) void {
         switch (stun_context.*) {
-            inline else => |*v| self.releaseTransactionData(&v.transaction_data),
+            inline else => |*v| self.releaseTransactionData(&v.transaction),
         }
         self.stun_context_pool.destroy(stun_context);
     }
@@ -1790,7 +1781,7 @@ pub const AgentContext = struct {
                     while (it.next()) |current_stun_context| {
                         if (current_stun_context.*.* != .check) continue;
                         if (current_stun_context.*.check.candidate_pair.eql(current_entry.pair)) {
-                            current_stun_context.*.check.transaction_data.stopRetransmits(loop);
+                            current_stun_context.*.check.transaction.stopRetransmits(loop);
                             current_stun_context.*.check.flags.is_canceled = true;
                         }
                     }
@@ -1857,7 +1848,7 @@ pub const AgentContext = struct {
         const candidate = self.local_candidates.items[gathering_context.candidate_index];
         log.debug("Agent {} - Received STUN response for base address \"{}\"", .{ self.id, candidate.base_address });
 
-        gathering_context.transaction_data.readCallback(self.loop, raw_message, undefined);
+        gathering_context.transaction.readCallback(self.loop, raw_message, undefined);
     }
 
     fn handleGatheringTransactionCompleted(
@@ -1873,7 +1864,15 @@ pub const AgentContext = struct {
             return;
         };
 
-        if (getMappedAddressFromStunMessage(payload.message)) |transport_address| {
+        var buffer: [4096]u8 = undefined;
+        const message = b: {
+            var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
+            var stream = std.io.fixedBufferStream(payload.raw_message);
+            var reader = stream.reader();
+            break :b ztun.Message.readAlloc(reader, arena_state.allocator()) catch unreachable;
+        };
+
+        if (getMappedAddressFromStunMessage(message)) |transport_address| {
             const candidate = Candidate{
                 .type = .server_reflexive,
                 .transport_address = transport_address,
@@ -1921,21 +1920,29 @@ pub const AgentContext = struct {
         const write_buffer = self.buffer_pool.create() catch unreachable;
         errdefer self.buffer_pool.destroy(write_buffer);
 
-        const result_storage = self.buffer_pool.create() catch unreachable;
-        errdefer self.buffer_pool.destroy(result_storage);
+        const read_buffer = self.buffer_pool.create() catch unreachable;
+        errdefer self.buffer_pool.destroy(read_buffer);
 
-        const transaction_data = TransactionData.init(socket_context, request.transaction_id, write_buffer, result_storage) catch unreachable;
-        errdefer transaction_data.deinit();
+        const transaction = Transaction.init(
+            socket_context.socket,
+            address,
+            request,
+            write_buffer,
+            read_buffer,
+            self,
+            gatheringTransactionCompleteCallback,
+        );
+        errdefer transaction.deinit();
 
         stun_context.* = .{
             .gathering = .{
                 .socket_index = candidate_index,
                 .candidate_index = candidate_index,
-                .transaction_data = transaction_data,
+                .transaction = transaction,
             },
         };
 
-        const gop = self.stun_context_map.getOrPut(transaction_data.transaction_id) catch unreachable;
+        const gop = self.stun_context_map.getOrPut(transaction.transaction_id) catch unreachable;
         std.debug.assert(!gop.found_existing);
 
         gop.value_ptr.* = stun_context;
@@ -1966,12 +1973,8 @@ pub const AgentContext = struct {
         self.loop.add(&socket_context.read_completion);
 
         log.debug("Agent {} - Starting transaction for base address \"{}\"", .{ self.id, socket_context.address });
-        stun_context.gathering.transaction_data.userdata = self;
-        stun_context.gathering.transaction_data.callback = gatheringTransactionCompleteCallback;
-        stun_context.gathering.transaction_data.start(
-            request,
-            address,
-            Configuration.computeRtoMs(self.socket_contexts.len),
+        stun_context.gathering.transaction.start(
+            Configuration.computeRtoGatheringMs(self.socket_contexts.len),
             self.loop,
         );
 
@@ -2117,9 +2120,9 @@ pub const AgentContext = struct {
         return .disarm;
     }
 
-    fn gatheringTransactionCompleteCallback(userdata: ?*anyopaque, transaction_data: *TransactionData, result: TransactionResult) void {
+    fn gatheringTransactionCompleteCallback(userdata: ?*anyopaque, transaction: *Transaction, result: TransactionResult) void {
         const self = @as(*AgentContext, @ptrCast(@alignCast(userdata.?)));
-        const stun_context = self.stun_context_map.get(transaction_data.transaction_id).?;
+        const stun_context = self.stun_context_map.get(transaction.transaction_id).?;
 
         self.handleGatheringEvent(.{ .completed = .{ .stun_context = stun_context, .result = result } });
     }
@@ -2239,11 +2242,11 @@ pub const AgentContext = struct {
 
     fn connectivityCheckTransactionCompletedCallback(
         userdata: ?*anyopaque,
-        transaction_data: *TransactionData,
+        transaction: *Transaction,
         result: TransactionResult,
     ) void {
         const self = @as(*AgentContext, @ptrCast(@alignCast(userdata.?)));
-        const stun_context = self.stun_context_map.get(transaction_data.transaction_id).?;
+        const stun_context = self.stun_context_map.get(transaction.transaction_id).?;
 
         self.handleConnectivityCheckEvent(.{ .completed = .{ .stun_context = stun_context, .result = result } });
     }
@@ -2342,7 +2345,7 @@ pub const AgentContext = struct {
                     const transaction_id = self.connectivity_check_transaction_map.get(candidate_pair).?;
                     const stun_context = self.stun_context_map.get(transaction_id).?;
                     const check_context = &stun_context.check;
-                    check_context.transaction_data.stopRetransmits(self.loop);
+                    check_context.transaction.stopRetransmits(self.loop);
                     check_context.flags.is_canceled = true;
                 }
                 self.checklist.setPairState(candidate_pair, .waiting);
@@ -2401,7 +2404,15 @@ pub const AgentContext = struct {
             return;
         };
 
-        const is_success_response = payload.message.type.class == .success_response;
+        var buffer: [4096]u8 = undefined;
+        const message = b: {
+            var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
+            var stream = std.io.fixedBufferStream(payload.raw_message);
+            var reader = stream.reader();
+            break :b ztun.Message.readAlloc(reader, arena_state.allocator()) catch unreachable;
+        };
+
+        const is_success_response = message.type.class == .success_response;
 
         // TODO(Corendos): handle response errors.
         std.debug.assert(is_success_response);
@@ -2410,7 +2421,7 @@ pub const AgentContext = struct {
         const remote_candidate = self.remote_candidates.items[candidate_pair.remote_candidate_index];
 
         // TODO(Corendos): Discover peer-reflexive candidates.
-        const mapped_address = getMappedAddressFromStunMessage(payload.message) orelse @panic("TODO");
+        const mapped_address = getMappedAddressFromStunMessage(message) orelse @panic("TODO");
 
         // NOTE(Corendos): handle https://www.rfc-editor.org/rfc/rfc8445#section-7.2.5.2.1.
         if (!areTransportAddressesSymmetric(local_candidate.transport_address, remote_candidate.transport_address, payload.source, mapped_address)) {
@@ -2462,7 +2473,7 @@ pub const AgentContext = struct {
     ) !void {
         const check_context = &stun_context.check;
 
-        check_context.transaction_data.readCallback(self.loop, raw_message, source);
+        check_context.transaction.readCallback(self.loop, raw_message, source);
     }
 
     inline fn tryPopTriggeredCheckQueue(self: *AgentContext) ?TriggeredCheckEntry {
@@ -2502,22 +2513,25 @@ pub const AgentContext = struct {
         const write_buffer = try self.buffer_pool.create();
         errdefer self.buffer_pool.destroy(write_buffer);
 
-        const result_storage = try self.buffer_pool.create();
-        errdefer self.buffer_pool.destroy(result_storage);
+        const read_buffer = try self.buffer_pool.create();
+        errdefer self.buffer_pool.destroy(read_buffer);
 
-        var transaction_data = try TransactionData.init(
-            socket_context,
-            request.transaction_id,
+        var transaction = Transaction.init(
+            socket_context.socket,
+            remote_candidate.transport_address,
+            request,
             write_buffer,
-            result_storage,
+            read_buffer,
+            self,
+            connectivityCheckTransactionCompletedCallback,
         );
-        errdefer transaction_data.deinit();
+        errdefer transaction.deinit();
 
         stun_context.* = .{
             .check = ConnectivityCheckContext{
                 .socket_index = socket_context_index,
                 .candidate_pair = candidate_pair,
-                .transaction_data = transaction_data,
+                .transaction = transaction,
                 .flags = .{ .is_triggered_check = is_triggered_check, .is_nomination = is_nominated },
             },
         };
@@ -2532,9 +2546,11 @@ pub const AgentContext = struct {
             candidate_pair.local_candidate_index,
             candidate_pair.remote_candidate_index,
         });
-        stun_context.check.transaction_data.userdata = self;
-        stun_context.check.transaction_data.callback = connectivityCheckTransactionCompletedCallback;
-        stun_context.check.transaction_data.start(request, remote_candidate.transport_address, 500, self.loop);
+
+        const check_count = self.checklist.pairs.slice().len;
+        const waiting_count = self.checklist.getPairCount(.waiting);
+        const in_progress_count = self.checklist.getPairCount(.in_progress);
+        stun_context.check.transaction.start(Configuration.computeRtoCheckMs(check_count, waiting_count, in_progress_count), self.loop);
 
         self.checklist.setPairState(candidate_pair, .in_progress);
     }
@@ -2565,8 +2581,7 @@ pub const AgentContext = struct {
             return;
         }
 
-        const waiting_pair_count = self.getWaitingPairCount();
-        if (waiting_pair_count == 0) {
+        if (self.checklist.getPairCount(.waiting) == 0) {
             self.unfreezePair();
         }
 
