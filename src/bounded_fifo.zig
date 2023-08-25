@@ -1,3 +1,6 @@
+// Copyright 2023 - Corentin Godeau and the zice contributors
+// SPDX-License-Identifier: MIT
+
 const std = @import("std");
 
 const CircularBuffer = @import("circular_buffer.zig").CircularBuffer;

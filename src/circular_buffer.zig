@@ -1,3 +1,6 @@
+// Copyright 2023 - Corentin Godeau and the zice contributors
+// SPDX-License-Identifier: MIT
+
 const std = @import("std");
 
 pub fn CircularBuffer(comptime T: type, comptime size: usize) type {
