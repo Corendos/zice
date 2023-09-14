@@ -3,36 +3,32 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-
 const ztun = @import("ztun");
 const xev = @import("xev");
+
+pub const net = @import("net.zig");
+pub const io = @import("io.zig");
+pub const sdp = @import("sdp.zig");
+pub const fmt = @import("fmt.zig");
+pub const platform = switch (builtin.os.tag) {
+    .linux => @import("zice/linux.zig"),
+    else => @compileError("\"" ++ @tagName(builtin.os.tag) ++ "\" platform not supported"),
+};
 
 const DoublyLinkedList = @import("doubly_linked_list.zig").DoublyLinkedList;
 const CircularBuffer = @import("circular_buffer.zig").CircularBuffer;
 const BoundedFifo = @import("bounded_fifo.zig").BoundedFifo;
 const OrderedBoundedArray = @import("ordered_array.zig").OrderedBoundedArray;
 const GenerationId = @import("generation_id.zig").GenerationId;
-
-pub const net = @import("net.zig");
-
-const platform = switch (builtin.os.tag) {
-    .linux => @import("zice/linux.zig"),
-    else => @compileError("\"" ++ @tagName(builtin.os.tag) ++ "\" platform not supported"),
-};
-
-pub usingnamespace platform;
-
-pub const Intrusive = @import("queue.zig").Intrusive;
-pub const Worker = @import("zice/Worker.zig");
-
 const NetlinkContext = @import("netlink.zig").NetlinkContext;
+const Intrusive = @import("queue.zig").Intrusive;
 
 const log = std.log.scoped(.zice);
 
 // TODO(Corendos,@Global):
 // * Handle peer-reflexive
-// * Properly handle connectivity checks with retry etc.
 // * Handle role conflicts.
+// * Implement https://www.rfc-editor.org/rfc/rfc8421#section-4 for local preference computation
 
 /// Represents an ICE candidate type. See https://www.rfc-editor.org/rfc/rfc8445#section-4 for definitions.
 pub const CandidateType = enum(u2) {
@@ -41,12 +37,23 @@ pub const CandidateType = enum(u2) {
     peer_reflexive,
     relay,
 
+    /// Returns the numerical preference associated with a candidate type.
     pub inline fn preference(self: CandidateType) u32 {
         return switch (self) {
             .host => 126,
             .server_reflexive => 100,
             .peer_reflexive => 110,
             .relay => 0,
+        };
+    }
+
+    /// Returns a string representation of a candidate type.
+    pub inline fn toString(self: CandidateType) [:0]const u8 {
+        return switch (self) {
+            .host => "host",
+            .server_reflexive => "srflx",
+            .peer_reflexive => "prflx",
+            .relay => "relay",
         };
     }
 };
@@ -61,17 +68,26 @@ pub const Protocol = enum(u2) {
     // NOTE(Corendos): TCP is not supported yet.
 };
 
+/// Represents the Foundation of a candidate. See https://www.rfc-editor.org/rfc/rfc8445#section-4 for definitions.
+/// The Foundations of two candidates must be identical if they have the same type, base address, protocol and STUN/TURN servers.
+/// We store these and interpret the struct as a integer.
 pub const Foundation = packed struct {
+    /// The type of the candidate.
     type: CandidateType,
+    /// The protocol used by the candidate.
     protocol: Protocol,
+    /// The index of the address associated with the candidate. This is simpler than storing the full address.
     address_index: u8,
 
+    /// Backing integer of the struct.
     pub const IntType = std.meta.Int(.unsigned, @bitSizeOf(Foundation));
 
+    /// Returns the struct as an integer.
     pub inline fn asNumber(self: Foundation) IntType {
         return @intCast(@as(IntType, @bitCast(self)));
     }
 
+    /// Compare two Foundations.
     pub inline fn eql(a: Foundation, b: Foundation) bool {
         return a.asNumber() == b.asNumber();
     }
@@ -81,8 +97,6 @@ test "Foundation conversions" {
     const f = Foundation{ .address_index = 1, .type = .server_reflexive, .protocol = .udp };
     try std.testing.expectEqual(@as(u16, 17), f.asNumber());
 }
-
-// TODO(Corendos): Implement https://www.rfc-editor.org/rfc/rfc8421#section-4 for local preference computation
 
 /// Represents an ICE candidate.
 pub const Candidate = struct {
@@ -102,6 +116,7 @@ pub const Candidate = struct {
     // TODO(Corendos): multiple component ID support
 };
 
+/// Compute the priority using the type preference, local preference and component ID according to https://www.rfc-editor.org/rfc/rfc8445#section-5.1.2.1.
 inline fn computePriority(type_preference: u32, local_preference: u32, component_id: u8) u32 {
     return (type_preference << 24) + (local_preference << 8) + (256 - @as(u32, component_id));
 }
@@ -129,10 +144,12 @@ pub const Configuration = struct {
     const stun_address_ipv4 = std.net.Address.parseIp4("172.253.120.127", 19302) catch unreachable;
     const stun_address_ipv6 = std.net.Address.parseIp6("2a00:1450:400c:c00::7f", 19302) catch unreachable;
 
+    /// Compute the RTO in milliseconds for the gathering step.
     pub inline fn computeRtoGatheringMs(candidate_count: u64) u64 {
         return @max(500, candidate_count * new_transaction_interval_ms);
     }
 
+    /// Compute the RTO in millisconds for the connectivity checks.
     pub inline fn computeRtoCheckMs(check_count: u64, waiting_count: u64, in_progress_count: u64) u64 {
         return @max(500, check_count * (waiting_count + in_progress_count) * new_transaction_interval_ms);
     }
@@ -279,6 +296,7 @@ pub fn getMappedAddressFromStunMessage(message: ztun.Message) ?std.net.Address {
     return null;
 }
 
+/// Compute the priority for a candidate pair according to https://www.rfc-editor.org/rfc/rfc8445#section-6.1.2.3.
 inline fn computePairPriority(local_candidate_priority: u32, remote_candidate_priority: u32, role: AgentRole) u64 {
     const g: u64 = if (role == .controlling) local_candidate_priority else remote_candidate_priority;
     const d: u64 = if (role == .controlled) local_candidate_priority else remote_candidate_priority;
@@ -360,22 +378,36 @@ fn noopCandidateCallback(_: ?*anyopaque, _: *AgentContext, _: CandidateResult) v
 pub const OnStateChangeCallback = *const fn (userdata: ?*anyopaque, agent: *AgentContext, state: AgentState) void;
 fn noopStateChangeCallback(_: ?*anyopaque, _: *AgentContext, _: AgentState) void {}
 
+/// Callback that is called when the agent receives data.
 pub const OnDataCallback = *const fn (userdate: ?*anyopaque, agent: *AgentContext, component_id: u8, data: []const u8) void;
 fn noopDataCallback(_: ?*anyopaque, _: *AgentContext, _: u8, _: []const u8) void {}
 
+/// Represents the errors that can occur while performing a STUN transaction.
 pub const TransactionError = error{
+    /// The transaction was canceled.
     Canceled,
+    /// The transaction timed out (this is for the final timeout, not for retries).
     Timeout,
+    /// The given storage buffer for the response is not big enough.
     NotEnoughSpace,
 };
 
-pub const TransactionResult = TransactionError!struct { raw_message: []const u8, source: std.net.Address };
+/// Represents the result of a STUN transaction.
+pub const TransactionResult = TransactionError!struct {
+    /// The raw STUN response
+    raw_message: []const u8,
+    /// The source address of the response.
+    source: std.net.Address,
+};
 
+/// Callback that is called when a STUN transaction completed.
 const TransactionCallback = *const fn (userdata: ?*anyopaque, transaction: *Transaction, result: TransactionResult) void;
 fn noopTransactionCallback(_: ?*anyopaque, _: *Transaction, _: TransactionResult) void {}
 
 pub const Transaction = struct {
+    /// The socket to use for the STUN transaction.
     socket: std.os.fd_t,
+    /// The address to which the request should be sent.
     server_address: std.net.Address,
 
     /// The timer that is used for retry.
@@ -411,15 +443,23 @@ pub const Transaction = struct {
     /// The current RTO (see RFC).
     rto: ?u64 = null,
 
+    /// Transaction status flags.
     flags: packed struct {
+        /// The transaction was canceled.
         canceled: bool = false,
+        /// Retransmits were canceled.
         no_retransmits: bool = false,
+        /// The transaction timed out.
         timeout: bool = false,
     } = .{},
 
+    /// Userdata to use in completion callback.
     userdata: ?*anyopaque = null,
+    /// The completion callback.
     callback: TransactionCallback = noopTransactionCallback,
+    /// Storage for the transaction result.
     result: ?TransactionResult = null,
+    /// Storage for the response.
     read_buffer: []u8 = &.{},
 
     /// Initialize a Transaction with given parameters.
@@ -454,6 +494,7 @@ pub const Transaction = struct {
         self.timeout_timer.deinit();
     }
 
+    /// Start a transaction with the given retransmit timout and event-loop.
     pub fn start(self: *Transaction, rto: u64, loop: *xev.Loop) void {
         self.rto = rto;
 
@@ -473,6 +514,7 @@ pub const Transaction = struct {
         loop.add(&self.write_completion);
     }
 
+    /// Cancel the transaction.
     pub fn cancel(self: *Transaction, loop: *xev.Loop) void {
         self.cancelWrite(loop);
         self.cancelRetry(loop);
@@ -485,12 +527,16 @@ pub const Transaction = struct {
         self.flags.canceled = true;
     }
 
+    /// Cancel retransmits.
     pub fn stopRetransmits(self: *Transaction, loop: *xev.Loop) void {
         self.cancelWrite(loop);
         self.cancelRetry(loop);
         self.flags.no_retransmits = true;
     }
 
+    /// Handle the STUN response.
+    /// Unlike writes, this need to be called from outside because the socket might receive various messages and we are only interested in
+    /// STUN response associated with this transaction.
     pub fn readCallback(self: *Transaction, loop: *xev.Loop, raw_message: []const u8, source: std.net.Address) void {
         self.cancelWrite(loop);
         self.cancelRetry(loop);
@@ -512,22 +558,27 @@ pub const Transaction = struct {
         }
     }
 
+    /// Returns true if a write (or a cancellation of a write) is currently active.
     pub inline fn isWriteActive(self: Transaction) bool {
         return self.write_completion.state() != .dead or self.write_cancel_completion.state() != .dead;
     }
 
+    /// Returns true if the retry timer (or a cancellation of it) is currently active.
     pub inline fn isRetryTimerActive(self: Transaction) bool {
         return self.retry_timer_completion.state() != .dead or self.retry_timer_cancel_completion.state() != .dead;
     }
 
+    /// Returns true if the timeout timer (or a cancellation of it) is currently active.
     pub inline fn isTimeoutTimerActive(self: Transaction) bool {
         return self.timeout_completion.state() != .dead or self.timeout_cancel_completion.state() != .dead;
     }
 
+    /// Returns the state of the transaction in terms of xev.CompletionState.
     pub inline fn state(self: Transaction) xev.CompletionState {
         return if (self.isWriteActive() or self.isRetryTimerActive() or self.isTimeoutTimerActive()) .active else .dead;
     }
 
+    /// Cancel a potentially active write.
     fn cancelWrite(self: *Transaction, loop: *xev.Loop) void {
         if (self.write_completion.state() == .dead or self.write_cancel_completion.state() == .active) return;
 
@@ -539,6 +590,7 @@ pub const Transaction = struct {
         loop.add(&self.write_cancel_completion);
     }
 
+    /// Cancel a potentially active retry timer.
     fn cancelRetry(self: *Transaction, loop: *xev.Loop) void {
         if (self.retry_timer_completion.state() == .dead or self.retry_timer_cancel_completion.state() == .active) return;
 
@@ -552,6 +604,7 @@ pub const Transaction = struct {
         );
     }
 
+    /// Cancel a potentially active timeout timer.
     fn cancelTimeout(self: *Transaction, loop: *xev.Loop) void {
         if (self.timeout_completion.state() == .dead or self.timeout_cancel_completion.state() == .active) return;
 
@@ -565,6 +618,7 @@ pub const Transaction = struct {
         );
     }
 
+    /// Callback used when a write has been completed.
     fn writeCallback(
         userdata: ?*anyopaque,
         loop: *xev.Loop,
@@ -608,6 +662,7 @@ pub const Transaction = struct {
         return .disarm;
     }
 
+    /// Callback used when a write cancellation has been completed.
     fn writeCancelCallback(
         userdata: ?*anyopaque,
         loop: *xev.Loop,
@@ -626,6 +681,7 @@ pub const Transaction = struct {
         return .disarm;
     }
 
+    /// Callback used when the retry timer fired.
     fn retryCallback(
         userdata: ?*Transaction,
         loop: *xev.Loop,
@@ -646,6 +702,7 @@ pub const Transaction = struct {
         return .disarm;
     }
 
+    /// Callback used when the retry timer has been cancelled.
     fn retryCancelCallback(
         userdata: ?*Transaction,
         loop: *xev.Loop,
@@ -665,6 +722,7 @@ pub const Transaction = struct {
         return .disarm;
     }
 
+    /// Callback used when the timeout timer fired.
     fn timeoutCallback(
         userdata: ?*Transaction,
         loop: *xev.Loop,
@@ -693,6 +751,7 @@ pub const Transaction = struct {
         return .disarm;
     }
 
+    /// Callback used when the timeout timer has been cancelled.
     fn timeoutCancelCallback(
         userdata: ?*Transaction,
         loop: *xev.Loop,
@@ -713,6 +772,7 @@ pub const Transaction = struct {
     }
 };
 
+/// Contains the additional data associated with an open socket.
 pub const SocketContext = struct {
     /// Our index in the Agent Context.
     index: usize,
@@ -839,10 +899,14 @@ const CandidatePairEntry = struct {
     }
 };
 
+/// Represents an entry in a list/array of triggered check.
 const TriggeredCheckEntry = struct {
+    /// The candidate pair for which a triggered check should be done.
     candidate_pair: CandidatePair,
+    /// Is this triggered check a nomination.
     nominate: bool = false,
 
+    /// Compares two entries.
     pub fn eql(a: TriggeredCheckEntry, b: TriggeredCheckEntry) bool {
         return a.candidate_pair.eql(b.candidate_pair);
     }
@@ -853,15 +917,19 @@ const Checklist = struct {
     const OrderedPairArray = OrderedBoundedArray(CandidatePairEntry, 16, CandidatePairEntry.Context);
     /// The state of the checklist.
     state: ChecklistState = .running,
+    /// The candidate pairs to check ordered by priority.
     pairs: OrderedPairArray,
 
+    /// The valid candidate pairs.
     valid_pairs: OrderedPairArray,
 
     /// The triggered check FIFO associated with this checklist.
     triggered_check_queue: BoundedFifo(TriggeredCheckEntry, 16) = .{},
 
+    // NOTE(Corentin): Temporary flag to avoid multiple nomination in parallel.
     nomination_in_progress: bool = false,
 
+    /// The pair that has been selected.
     selected_pair: ?CandidatePair = null,
 
     pub fn init(allocator: std.mem.Allocator) !Checklist {
