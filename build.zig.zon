@@ -3,8 +3,8 @@
     .version = "0.0.1",
     .dependencies = .{
         .ztun = .{
-            .url = "https://github.com/Corendos/ztun/archive/53a6e964243bd034080d1e7381af99407252e5dd.tar.gz",
-            .hash = "122094eff1c58ac6e68730e262e70811a156dd40795953c7f1cbc6ca8bb85e46b6fa",
+            .url = "https://github.com/Corendos/ztun/archive/cba495083df623e97f324c69182d2c16c147d577.tar.gz",
+            .hash = "122038c4c3fad5ef85c82d6a62af7595f2042b589395809daeb415c198ba51ae9795",
         },
         .libxev = .{
             .url = "https://github.com/mitchellh/libxev/archive/432e906ef883214d08cd35871e3f5e46933388ba.tar.gz",
