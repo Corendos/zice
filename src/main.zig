@@ -25,7 +25,6 @@ const log = std.log.scoped(.zice);
 
 // TODO(Corendos,@Global):
 // * Handle peer-reflexive
-// * Handle role conflicts.
 // * Implement https://www.rfc-editor.org/rfc/rfc8421#section-4 for local preference computation
 
 /// Represents an ICE candidate type. See https://www.rfc-editor.org/rfc/rfc8445#section-4 for definitions.
@@ -817,6 +816,7 @@ pub const SocketContext = struct {
     /// The completion to cancel reads.
     read_cancel_completion: xev.Completion = .{},
 
+    /// Initialize the socket context from its index, fd, address and buffer for read data.
     pub fn init(index: usize, socket: std.os.fd_t, address: std.net.Address, read_buffer: []u8) SocketContext {
         return SocketContext{
             .index = index,
@@ -889,7 +889,9 @@ const CandidatePair = struct {
 
 /// Represents the foundation of a pair of candidate.
 const CandidatePairFoundation = packed struct {
+    /// The local candidate foundation.
     local: Foundation,
+    /// The remote candidate foundation.
     remote: Foundation,
 
     pub inline fn eql(a: CandidatePairFoundation, b: CandidatePairFoundation) bool {
@@ -971,43 +973,51 @@ const Checklist = struct {
         };
     }
 
+    /// Returns the index of the pair in the given list of entries.
     fn indexOfPair(entries: []const CandidatePairEntry, candidate_pair: CandidatePair) ?usize {
         return for (entries, 0..) |entry, i| {
             if (entry.pair.eql(candidate_pair)) break i;
         } else null;
     }
 
+    /// Returns true if the checklist contains the given pair.
     pub fn containsPair(self: *const Checklist, candidate_pair: CandidatePair) bool {
         return indexOfPair(self.pairs.slice(), candidate_pair) != null;
     }
 
+    /// Returns true if the checklist contains the given pair in its valid list.
     pub fn containsValidPair(self: *const Checklist, candidate_pair: CandidatePair) bool {
         return indexOfPair(self.valid_pairs.slice(), candidate_pair) != null;
     }
 
+    /// Adds the candidate pair and its associated data to the checklist.
     pub fn addPair(self: *Checklist, candidate_pair: CandidatePair, candidate_pair_data: CandidatePairData) !void {
         if (indexOfPair(self.pairs.slice(), candidate_pair) != null) return error.AlreadyExists;
 
         self.pairs.insert(.{ .pair = candidate_pair, .data = candidate_pair_data });
     }
 
+    /// Removes the candidate pair from the checklist.
     pub fn removePair(self: *Checklist, candidate_pair: CandidatePair) !void {
         const index = indexOfPair(self.pairs.slice(), candidate_pair) orelse return error.NotFound;
         _ = self.pairs.remove(index);
     }
 
+    /// Adds the pair and its associated data to the valid list of the checklist.
     pub fn addValidPair(self: *Checklist, candidate_pair: CandidatePair, candidate_pair_data: CandidatePairData) !void {
         if (indexOfPair(self.valid_pairs.slice(), candidate_pair) != null) return error.AlreadyExists;
 
         self.valid_pairs.insert(.{ .pair = candidate_pair, .data = candidate_pair_data });
     }
 
+    /// Removez the pair from the valid list of the checklist.
     pub fn removeValidPair(self: *Checklist, candidate_pair: CandidatePair) !void {
         const index = indexOfPair(self.valid_pairs.slice(), candidate_pair) orelse return error.NotFound;
 
         _ = self.valid_pairs.remove(index);
     }
 
+    /// Returns the number of pairs in the given state.
     inline fn getPairCount(self: *const Checklist, state: CandidatePairState) usize {
         var count: usize = 0;
 
@@ -1018,21 +1028,25 @@ const Checklist = struct {
         return count;
     }
 
+    /// Returns a pointer to the CandidatePairEntry in the valid list corresponding to the given candidate pair, or null if there is none.
     pub fn getValidEntry(self: *Checklist, candidate_pair: CandidatePair) ?*CandidatePairEntry {
         const index = indexOfPair(self.valid_pairs.slice(), candidate_pair) orelse return null;
         return &self.valid_pairs.slice()[index];
     }
 
+    /// Returns a pointer to the CandidatePairEntry corresponding to the given candidate pair, or null if there is none.
     fn getEntry(self: *Checklist, candidate_pair: CandidatePair) ?*CandidatePairEntry {
         const index = indexOfPair(self.pairs.slice(), candidate_pair) orelse return null;
         return &self.pairs.slice()[index];
     }
 
+    /// Sets the state of the candidate pair to the given state.
     pub inline fn setPairState(self: *Checklist, candidate_pair: CandidatePair, state: CandidatePairState) void {
         const entry = self.getEntry(candidate_pair).?;
         entry.data.state = state;
     }
 
+    /// Updates the checklist state from the state of each candidate pair.
     pub fn updateState(self: *Checklist) void {
         const new_state: ChecklistState = b: {
             const has_nominated_pair_for_component = for (self.valid_pairs.slice()) |entry| {
@@ -1065,6 +1079,7 @@ const Checklist = struct {
         }
     }
 
+    /// Recompute the pairs priorities using the given role.
     pub fn recomputePriorities(self: *Checklist, local_candidates: []const Candidate, remote_candidates: []const Candidate, role: AgentRole) void {
         for (self.pairs.slice()) |*entry| {
             const local_candidate = local_candidates[entry.pair.local_candidate_index];
@@ -1086,50 +1101,77 @@ const Checklist = struct {
     }
 };
 
+/// Represents the context used in a connectivity check.
 const ConnectivityCheckContext = struct {
+    /// The socket associated with the check.
     socket_index: usize,
+    /// The candidate pair associated with the check.
     candidate_pair: CandidatePair,
 
+    /// Various flags used for bookkeeping.
     flags: packed struct {
+        /// Is this check a triggered check.
         is_triggered_check: bool = false,
+        /// Is this check a nomination.
         is_nomination: bool = false,
+        /// Has this check been canceled.
         is_canceled: bool = false,
+        /// What role had the agent when the check was queued.
         role: AgentRole = undefined,
     } = .{},
 
+    /// The STUN transaction associated with the check.
     transaction: Transaction,
 };
 
+/// Represents the context used when gathering candidates.
 const GatheringContext = struct {
+    /// The socket used to gather the candidate.
     socket_index: usize,
+    /// The index of the candidate in the local list of candidates.
     candidate_index: usize,
 
+    /// The associated STUN transaction.
     transaction: Transaction,
 };
 
+/// Represents the type of operation associated with a STUN transaction.
 const StunContextType = enum {
+    /// The transaction is used to gather candidates.
     gathering,
+    /// The transaction is used to perform a connectivity check.
     check,
 };
 
+/// Represents the context used when performing a connectivity check or when gathering candidates.
 const StunContext = union(StunContextType) {
     gathering: GatheringContext,
     check: ConnectivityCheckContext,
 };
 
+/// An entry associated with a response that must be sent when possible.
 const ResponseEntry = struct {
+    /// The index of the socket in which we want to send the response.
     socket_index: usize,
+    /// The transaction ID of the request associated with this response.
     transaction_id: u96,
+    /// The source of the associated request.
     source: std.net.Address,
+    /// Various flags.
     flags: packed struct {
+        /// Did the associated request trigger a role conflict.
         role_conflict: bool,
     },
 };
 
+/// Represents the parameters used to authenticate STUN transaction.
 pub const AuthParameters = struct {
+    /// The fragment of the user attribute.
     username_fragment: [8]u8,
+    /// The password used for authentication.
     password: [24]u8,
 
+    /// Generates random parameters using the given random object.
     pub inline fn random(rand: std.rand.Random) AuthParameters {
         var buffer: [6 + 18]u8 = undefined;
         rand.bytes(&buffer);
@@ -1144,14 +1186,23 @@ pub const AuthParameters = struct {
     }
 };
 
+/// Represents an entry in an array of STUN contexts.
+/// The AgentContext stores a fixed array of entries that can be used to gather candidates or perform connectivity checks.
 const StunContextEntry = struct {
+    /// The transaction ID of the associated STUN transaction.
+    transaction_id: u96,
+    /// The context of the STUN transaction.
+    stun_context: StunContext,
+
+    /// Various flags.
     flags: packed struct {
+        /// Is this entry currently in use.
         in_use: bool = false,
     } = .{},
-    transaction_id: u96,
-    stun_context: StunContext,
 };
 
+/// Represents the context associated with an ICE agent.
+/// This stores all the required data to handle all the lifecycle of an ICE agent.
 pub const AgentContext = struct {
     /// The id of this agent.
     id: AgentId,
@@ -1174,12 +1225,17 @@ pub const AgentContext = struct {
     /// Tiebreaker value.
     tiebreaker: u64,
 
+    /// The list of local candidates.
     local_candidates: std.ArrayListUnmanaged(Candidate) = .{},
+    /// The list of remote candidates.
     remote_candidates: std.ArrayListUnmanaged(Candidate) = .{},
+    /// Have we received the remote candidates.
     has_remote_candidates: bool = false,
 
+    /// A pool of buffer that can be used for network IO.
     buffer_pool: std.heap.MemoryPool([4096]u8),
 
+    /// A fixed size array of STUN context entry that can be used to gather candidates or perform connectivity checks.
     stun_context_entries: *[64]StunContextEntry,
 
     /// Contexts for each bound sockets.
@@ -1222,6 +1278,7 @@ pub const AgentContext = struct {
     // Other fields.
 
     flags: packed struct {
+        /// Has this agent been stopped.
         stopped: bool = false,
     } = .{},
 
@@ -1234,8 +1291,10 @@ pub const AgentContext = struct {
     /// Callbacks to call when data is available.
     on_data_callback: OnDataCallback,
 
+    /// The zice.Context event loop.
     loop: *xev.Loop,
 
+    /// Initializes an agent.
     pub fn init(context: *Context, agent_id: AgentId, loop: *xev.Loop, options: CreateAgentOptions, allocator: std.mem.Allocator) !AgentContext {
         const auth_parameters = AuthParameters.random(std.crypto.random);
         const tiebreaker = std.crypto.random.int(u64);
@@ -1282,6 +1341,8 @@ pub const AgentContext = struct {
         };
     }
 
+    /// Stops the agent
+    /// This will cancel any on-going operation.
     pub fn stop(self: *AgentContext) void {
         if (self.flags.stopped) return;
         self.flags.stopped = true;
@@ -1323,6 +1384,7 @@ pub const AgentContext = struct {
         );
     }
 
+    /// Returns true if the agent is done with all potential ongoing operations.
     pub fn done(self: *const AgentContext) bool {
         for (self.socket_contexts) |*ctx| if (ctx.read_completion.state() != .dead or ctx.read_cancel_completion.state() != .dead) return false;
         for (self.stun_context_entries) |*entry| if (entry.flags.in_use) return false;
@@ -1332,6 +1394,7 @@ pub const AgentContext = struct {
         return true;
     }
 
+    /// Deinitializes an agent.
     pub fn deinit(self: *AgentContext) void {
         std.debug.assert(self.done());
 
@@ -1352,6 +1415,8 @@ pub const AgentContext = struct {
         self.allocator.destroy(self.check_response_queue);
     }
 
+    /// Starts any required operation to gather candidates.
+    /// This should only be called by the zice Context.
     pub fn processGatherCandidates(self: *AgentContext) !void {
         // By default, assume that we are in the controlling role if we are explicitly asked to gather candidates.
         if (self.role == null) {
@@ -1411,6 +1476,8 @@ pub const AgentContext = struct {
         );
     }
 
+    /// Sets the remote candidates and starts any required operations.
+    /// This should only be called by the zice Context.
     fn processSetRemoteCandidates(self: *AgentContext, parameters: RemoteCandidateParameters) !void {
         try self.remote_candidates.appendSlice(self.allocator, parameters.candidates);
         self.remote_auth = AuthParameters{
@@ -1436,6 +1503,8 @@ pub const AgentContext = struct {
         }
     }
 
+    /// Starts any required operation to send the given message to the other agents.
+    /// This should only be called by the zice Context.
     fn processSend(self: *AgentContext, completion: *ContextCompletion) !void {
         if (self.checklist.selected_pair) |selected_pair| {
             const local_candidate = self.local_candidates.items[selected_pair.local_candidate_index];
@@ -1477,6 +1546,7 @@ pub const AgentContext = struct {
         }
     }
 
+    /// Starts connectivity checks.
     fn startChecks(
         self: *AgentContext,
     ) void {
@@ -1520,6 +1590,7 @@ pub const AgentContext = struct {
         } else null;
     }
 
+    /// Computes the priority of every local candidate.
     fn computePriorities(self: *AgentContext) void {
         // TODO(Corendos): Handle component ID as well.
 
@@ -1580,6 +1651,7 @@ pub const AgentContext = struct {
         }
     }
 
+    /// Remove redundant local candidates.
     fn removeRedundantCandidates(self: *AgentContext) void {
         var current_index: usize = 0;
         while (current_index < self.local_candidates.items.len - 1) : (current_index += 1) {
@@ -1604,6 +1676,7 @@ pub const AgentContext = struct {
         }
     }
 
+    /// Computes the candidate pairs.
     fn computeCandidatePairs(self: *AgentContext) !void {
         var pair_list = std.ArrayList(CandidatePair).init(self.allocator);
         defer pair_list.deinit();
@@ -1759,6 +1832,7 @@ pub const AgentContext = struct {
         }
     }
 
+    /// Returns the candidate pair in "waiting" state with the highest priority and lowest component ID, or null if there is none.
     fn getWaitingPair(self: *AgentContext) ?CandidatePair {
         var result: ?CandidatePair = null;
 
@@ -1787,6 +1861,7 @@ pub const AgentContext = struct {
         return result;
     }
 
+    /// Tries to unfreeze a candidate pair.
     fn unfreezePair(self: *AgentContext) void {
         pair: for (self.checklist.pairs.slice()) |entry| {
             if (entry.data.state != .frozen) continue;
