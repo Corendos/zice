@@ -112,6 +112,8 @@ pub const Candidate = struct {
     foundation: Foundation = undefined,
     /// The component ID associated to the candidate.
     component_id: u8 = 1,
+    /// Is this candidate the default candidate.
+    default: bool = false,
 
     // TODO(Corendos): multiple component ID support
 };
@@ -252,6 +254,28 @@ fn makeBindingResponse(transaction_id: u96, source: std.net.Address, password: [
     const xor_mapped_address = ztun.attr.common.encode(mapped_address, transaction_id);
     const xor_mapped_address_attribute = try xor_mapped_address.toAttribute(arena_state.allocator());
     try message_builder.addAttribute(xor_mapped_address_attribute);
+
+    const authentication = ztun.auth.Authentication{ .short_term = .{ .password = &password } };
+    message_builder.addMessageIntegrity(authentication);
+
+    message_builder.addFingerprint();
+
+    return try message_builder.build();
+}
+
+/// Convenience to build a STUN error response caused by a role conflict.
+fn makeRoleConflictResponse(transaction_id: u96, password: [24]u8, allocator: std.mem.Allocator) !ztun.Message {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+
+    var message_builder = ztun.MessageBuilder.init(arena_state.allocator());
+
+    message_builder.setClass(ztun.Class.error_response);
+    message_builder.setMethod(ztun.Method.binding);
+    message_builder.transactionId(transaction_id);
+
+    const error_code_attribute = try (ztun.attr.common.ErrorCode{ .value = .role_conflict, .reason = "Role Conflict" }).toAttribute(arena_state.allocator());
+    try message_builder.addAttribute(error_code_attribute);
 
     const authentication = ztun.auth.Authentication{ .short_term = .{ .password = &password } };
     message_builder.addMessageIntegrity(authentication);
@@ -545,7 +569,9 @@ pub const Transaction = struct {
         if (self.result == null) {
             // If the transaction has not been canceled or it has not timed out yet, we store the result.
             if (raw_message.len <= self.read_buffer.len) {
-                self.result = .{ .raw_message = raw_message, .source = source };
+                const dest = self.read_buffer[0..raw_message.len];
+                @memcpy(dest, raw_message);
+                self.result = .{ .raw_message = dest, .source = source };
             } else {
                 // If we don't have enough space to store what we receive, we store the error in result.
                 self.result = error.NotEnoughSpace;
@@ -808,7 +834,7 @@ pub const SocketContext = struct {
 };
 
 /// Represents the role of the agent in an ICE process.
-const AgentRole = enum {
+const AgentRole = enum(u1) {
     /// The agent is controlling the ICE process.
     controlling,
     /// The agent is controlled by another agent.
@@ -885,15 +911,22 @@ const CandidatePairData = struct {
     nominated: bool = false,
 };
 
+/// Represents an association between a candidate pair and its associated data.
+/// This is used in an array of entries.
 const CandidatePairEntry = struct {
+    /// The candidate pair.
+    pair: CandidatePair,
+    /// The data associated with a candidate pair.
+    data: CandidatePairData,
+
+    /// Context used in struct requiring ordering.
     pub const Context = struct {
         pub fn lessThan(_: *@This(), a: CandidatePairEntry, b: CandidatePairEntry) bool {
             return a.data.priority > b.data.priority;
         }
     };
-    pair: CandidatePair,
-    data: CandidatePairData,
 
+    /// Compares two entries.
     pub inline fn eql(a: CandidatePairEntry, b: CandidatePairEntry) bool {
         return CandidatePair.eql(a.pair, b.pair);
     }
@@ -932,16 +965,12 @@ const Checklist = struct {
     /// The pair that has been selected.
     selected_pair: ?CandidatePair = null,
 
-    pub fn init(allocator: std.mem.Allocator) !Checklist {
-        _ = allocator;
+    /// Initializes a checklist.
+    pub fn init() Checklist {
         return Checklist{
             .pairs = OrderedPairArray.init(),
             .valid_pairs = OrderedPairArray.init(),
         };
-    }
-
-    pub fn deinit(self: *Checklist) void {
-        _ = self;
     }
 
     fn indexOfPair(entries: []const CandidatePairEntry, candidate_pair: CandidatePair) ?usize {
@@ -1037,6 +1066,26 @@ const Checklist = struct {
             self.state = new_state;
         }
     }
+
+    pub fn recomputePriorities(self: *Checklist, local_candidates: []const Candidate, remote_candidates: []const Candidate, role: AgentRole) void {
+        for (self.pairs.slice()) |*entry| {
+            const local_candidate = local_candidates[entry.pair.local_candidate_index];
+            const remote_candidate = remote_candidates[entry.pair.remote_candidate_index];
+            entry.data.priority = computePairPriority(local_candidate.priority, remote_candidate.priority, role);
+        }
+
+        const SortContext = struct {
+            entries: []CandidatePairEntry,
+            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                return ctx.entries[a].data.priority > ctx.entries[b].data.priority;
+            }
+            pub fn swap(ctx: @This(), a: usize, b: usize) void {
+                std.mem.swap(CandidatePairEntry, &ctx.entries[a], &ctx.entries[b]);
+            }
+        };
+
+        std.sort.heapContext(0, self.pairs.slice().len, SortContext{ .entries = self.pairs.slice() });
+    }
 };
 
 const ConnectivityCheckContext = struct {
@@ -1047,6 +1096,7 @@ const ConnectivityCheckContext = struct {
         is_triggered_check: bool = false,
         is_nomination: bool = false,
         is_canceled: bool = false,
+        role: AgentRole = undefined,
     } = .{},
 
     transaction: Transaction,
@@ -1069,10 +1119,13 @@ const StunContext = union(StunContextType) {
     check: ConnectivityCheckContext,
 };
 
-const RequestEntry = struct {
+const ResponseEntry = struct {
     socket_index: usize,
     transaction_id: u96,
     source: std.net.Address,
+    flags: packed struct {
+        role_conflict: bool,
+    },
 };
 
 pub const AuthParameters = struct {
@@ -1102,8 +1155,6 @@ const StunContextEntry = struct {
 };
 
 pub const AgentContext = struct {
-    const StunContextMap = std.AutoHashMap(u96, *StunContext);
-
     /// The id of this agent.
     id: AgentId,
 
@@ -1162,12 +1213,13 @@ pub const AgentContext = struct {
     /// The completion used to cancel the connectivity checks timer.
     connectivity_checks_timer_cancel_completion: xev.Completion = .{},
 
-    // TODO(Corendos): This is temporary to test how it could work.
-    binding_request_queue: *CircularBuffer(RequestEntry, 64),
+    /// Queue of response to send when ready.
+    check_response_queue: *CircularBuffer(ResponseEntry, 64),
+    check_response_queue_write_buffer: []u8 = &.{},
+    check_response_queue_write_data: WriteData = .{},
+    check_response_queue_write_completion: xev.Completion = .{},
 
-    binding_request_queue_write_buffer: []u8 = &.{},
-    binding_request_queue_write_data: WriteData = .{},
-    binding_request_queue_write_completion: xev.Completion = .{},
+    // NOTE(Corendos): ^ We could have one completion/buffer/data per socket.
 
     // Other fields.
 
@@ -1198,19 +1250,18 @@ pub const AgentContext = struct {
         var buffer_pool = std.heap.MemoryPool([4096]u8).init(allocator);
         errdefer buffer_pool.deinit();
 
-        var binding_request_queue_write_buffer = try buffer_pool.create();
-        errdefer buffer_pool.destroy(binding_request_queue_write_buffer);
+        var check_response_queue_write_buffer = try buffer_pool.create();
+        errdefer buffer_pool.destroy(check_response_queue_write_buffer);
 
         const stun_context_entries = try allocator.create([64]StunContextEntry);
         errdefer allocator.destroy(stun_context_entries);
         @memset(stun_context_entries[0..], .{ .transaction_id = undefined, .stun_context = undefined });
 
-        var checklist = try Checklist.init(allocator);
-        errdefer checklist.deinit();
+        var checklist = Checklist.init();
 
-        const binding_request_queue = try allocator.create(CircularBuffer(RequestEntry, 64));
-        errdefer allocator.destroy(binding_request_queue);
-        binding_request_queue.* = .{};
+        const check_response_queue = try allocator.create(CircularBuffer(ResponseEntry, 64));
+        errdefer allocator.destroy(check_response_queue);
+        check_response_queue.* = .{};
 
         return AgentContext{
             .id = agent_id,
@@ -1221,10 +1272,10 @@ pub const AgentContext = struct {
             .stun_context_entries = stun_context_entries,
             .checklist = checklist,
             .connectivity_checks_timer = connectivity_checks_timer,
-            .binding_request_queue_write_buffer = binding_request_queue_write_buffer,
+            .check_response_queue_write_buffer = check_response_queue_write_buffer,
             .local_auth = auth_parameters,
             .tiebreaker = tiebreaker,
-            .binding_request_queue = binding_request_queue,
+            .check_response_queue = check_response_queue,
             .userdata = options.userdata,
             .on_candidate_callback = options.on_candidate_callback,
             .on_state_change_callback = options.on_state_change_callback,
@@ -1300,9 +1351,7 @@ pub const AgentContext = struct {
         self.local_candidates.deinit(self.allocator);
         self.remote_candidates.deinit(self.allocator);
 
-        self.checklist.deinit();
-
-        self.allocator.destroy(self.binding_request_queue);
+        self.allocator.destroy(self.check_response_queue);
     }
 
     pub fn processGatherCandidates(self: *AgentContext) !void {
@@ -1439,50 +1488,6 @@ pub const AgentContext = struct {
         self.printPairStates();
 
         self.handleConnectivityCheckMainTimer({}) catch unreachable;
-    }
-
-    fn swapAsyncQueue(self: *AgentContext) Intrusive(ContextCompletion) {
-        self.async_queue_mutex.lock();
-        defer self.async_queue_mutex.unlock();
-
-        var temp = self.async_queue;
-        self.async_queue = .{};
-        return temp;
-    }
-
-    fn asyncCallback(
-        userdata: ?*AgentContext,
-        loop: *xev.Loop,
-        _: *xev.Completion,
-        result: xev.Async.WaitError!void,
-    ) xev.CallbackAction {
-        const self = userdata orelse unreachable;
-        _ = result catch {};
-
-        var local_async_queue = self.swapAsyncQueue();
-
-        while (local_async_queue.pop()) |completion| {
-            switch (completion.op) {
-                .gather_candidates => {
-                    if (!self.netlink_context_ready) {
-                        log.debug("Waiting for Netlink completion", .{});
-                        self.waiting_netlink_queue.push(completion);
-                        continue;
-                    }
-                    self.processGatherCandidates() catch @panic("TODO");
-                    completion.callback(completion.userdata, .{ .gather_candidates = {} });
-                },
-                .set_remote_candidates => |candidates| {
-                    self.processSetRemoteCandidates(candidates, loop) catch @panic("TODO");
-                    completion.callback(completion.userdata, .{ .set_remote_candidates = {} });
-                },
-                .send => {
-                    self.processSend(completion, loop) catch @panic("TODO");
-                },
-            }
-        }
-
-        return if (self.flags.stopped) .disarm else .rearm;
     }
 
     inline fn getSocketContextIndexFromAddress(self: *AgentContext, address: std.net.Address) ?usize {
@@ -1699,7 +1704,7 @@ pub const AgentContext = struct {
             try pair_list.resize(Configuration.candidate_pair_limit);
         }
 
-        var checklist = try Checklist.init(self.allocator);
+        var checklist = Checklist.init();
 
         for (pair_list.items) |candidate_pair| {
             checklist.addPair(candidate_pair, self.makeCandidatePairData(candidate_pair)) catch {};
@@ -1802,10 +1807,6 @@ pub const AgentContext = struct {
         }
     }
 
-    fn releaseTransaction(self: *AgentContext, transaction: *Transaction) void {
-        _ = self.stun_context_map.remove(transaction.transaction_id);
-    }
-
     pub fn releaseStunContext(self: *AgentContext, stun_context: *StunContext) void {
         for (self.stun_context_entries) |*entry| {
             if (&entry.stun_context == stun_context) {
@@ -1906,6 +1907,14 @@ pub const AgentContext = struct {
 
         self.computePriorities();
         self.removeRedundantCandidates();
+
+        // Select the first server reflexive candidate to be the default candidate.
+        for (self.local_candidates.items) |*candidate| {
+            if (candidate.type == .server_reflexive) {
+                candidate.default = true;
+                break;
+            }
+        }
 
         if (self.has_remote_candidates) {
             self.startChecks();
@@ -2086,13 +2095,6 @@ pub const AgentContext = struct {
             },
             .response_write => {
                 log.debug("Agent {} - Stun response sent !", .{self.id});
-
-                if (!self.binding_request_queue.empty()) {
-                    log.debug("Agent {} - More response to send!", .{self.id});
-                    self.handleQueuedRequest();
-                } else {
-                    log.debug("Agent {} - Done sending queued response...", .{self.id});
-                }
             },
             .response_read => |payload| {
                 self.handleConnectivityCheckResponseRead(payload.raw_message, payload.address, payload.stun_context) catch @panic("TODO");
@@ -2106,6 +2108,11 @@ pub const AgentContext = struct {
             .main_timer => |payload| {
                 self.handleConnectivityCheckMainTimer(payload) catch @panic("TODO");
             },
+        }
+
+        // Handle response sending if required.
+        if (self.check_response_queue_write_completion.state() != .active) {
+            self.handleQueuedResponse();
         }
 
         if (result == .request_read or result == .completed) {
@@ -2240,39 +2247,43 @@ pub const AgentContext = struct {
         return .disarm;
     }
 
-    fn handleQueuedRequest(self: *AgentContext) void {
+    fn handleQueuedResponse(self: *AgentContext) void {
         // Ensure we are not already waiting for a completion.
-        std.debug.assert(self.binding_request_queue_write_completion.state() == .dead);
+        std.debug.assert(self.check_response_queue_write_completion.state() == .dead);
 
-        const request_entry = self.binding_request_queue.pop() orelse return;
+        const response_entry = self.check_response_queue.pop() orelse return;
 
         var buffer: [4096]u8 = undefined;
         const response = r: {
             var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
-            break :r makeBindingResponse(request_entry.transaction_id, request_entry.source, self.local_auth.password, arena_state.allocator()) catch unreachable;
+            if (response_entry.flags.role_conflict) {
+                break :r makeRoleConflictResponse(response_entry.transaction_id, self.local_auth.password, arena_state.allocator()) catch unreachable;
+            } else {
+                break :r makeBindingResponse(response_entry.transaction_id, response_entry.source, self.local_auth.password, arena_state.allocator()) catch unreachable;
+            }
         };
 
         const data = d: {
-            var stream = std.io.fixedBufferStream(self.binding_request_queue_write_buffer);
+            var stream = std.io.fixedBufferStream(self.check_response_queue_write_buffer);
             response.write(stream.writer()) catch unreachable;
             break :d stream.getWritten();
         };
 
-        self.binding_request_queue_write_data.from(request_entry.source, data);
+        self.check_response_queue_write_data.from(response_entry.source, data);
 
-        const socket_context = &self.socket_contexts[request_entry.socket_index];
-        self.binding_request_queue_write_completion = xev.Completion{
+        const socket_context = &self.socket_contexts[response_entry.socket_index];
+        self.check_response_queue_write_completion = xev.Completion{
             .op = .{
                 .sendmsg = .{
                     .fd = socket_context.socket,
-                    .msghdr = &self.binding_request_queue_write_data.message_header,
+                    .msghdr = &self.check_response_queue_write_data.message_header,
                     .buffer = null,
                 },
             },
             .userdata = self,
             .callback = connectivityCheckResponseWriteCallback,
         };
-        self.loop.add(&self.binding_request_queue_write_completion);
+        self.loop.add(&self.check_response_queue_write_completion);
     }
 
     fn connectivityCheckTimerCallback(
@@ -2350,6 +2361,47 @@ pub const AgentContext = struct {
         if (!try request.checkMessageIntegrity(.classic, attribute_index, key, arena_state.allocator())) return error.InvalidMessageIntegrity;
     }
 
+    fn getRoleAndTiebreakerFromRequest(message: ztun.Message) ?struct { role: AgentRole, tiebreaker: u64 } {
+        for (message.attributes) |*a| {
+            if (a.type == ztun.attr.Type.ice_controlling) {
+                const ice_controlling_attribute = ztun.attr.common.IceControlling.fromAttribute(a.*) catch return null;
+                return .{ .role = .controlling, .tiebreaker = ice_controlling_attribute.value };
+            } else if (a.type == ztun.attr.Type.ice_controlled) {
+                const ice_controlled_attribute = ztun.attr.common.IceControlled.fromAttribute(a.*) catch return null;
+                return .{ .role = .controlled, .tiebreaker = ice_controlled_attribute.value };
+            }
+        }
+        return null;
+    }
+
+    /// Switch Agent role
+    fn switchRole(self: *AgentContext) void {
+        const old_role = self.role.?;
+        self.role = if (old_role == .controlling) .controlled else .controlling;
+        log.debug("Agent {} - Switching role from {s} to {s}", .{ self.id, @tagName(old_role), @tagName(self.role.?) });
+        self.checklist.recomputePriorities(self.local_candidates.items, self.remote_candidates.items, self.role.?);
+    }
+
+    /// Detect and repair a potential role conflict. Returns true if there was a role conflict that requires an error response.
+    fn detectAndRepairRoleConflict(self: *AgentContext, request: ztun.Message) bool {
+        const remote_role_and_tiebreaker = getRoleAndTiebreakerFromRequest(request) orelse @panic("TODO: Request is missing a ICE-CONTROLLING or ICE-CONTROLLED attribute");
+        if (self.role.? == .controlling and remote_role_and_tiebreaker.role == .controlling) {
+            if (self.tiebreaker >= remote_role_and_tiebreaker.tiebreaker) {
+                return true;
+            } else {
+                self.switchRole();
+            }
+        } else if (self.role.? == .controlled and remote_role_and_tiebreaker.role == .controlled) {
+            if (self.tiebreaker >= remote_role_and_tiebreaker.tiebreaker) {
+                self.switchRole();
+            } else {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     fn handleConnectivityCheckRequestRead(
         self: *AgentContext,
         raw_message: []const u8,
@@ -2371,17 +2423,27 @@ pub const AgentContext = struct {
         // Check fingerprint/integrity.
         try checkMessageIntegrity(request, &self.local_auth.password);
 
+        // Detecting and repairing role conflicts.
+        if (self.detectAndRepairRoleConflict(request)) {
+            // Enqueue a 487 STUN response.
+            self.check_response_queue.push(ResponseEntry{
+                .socket_index = socket_context.index,
+                .transaction_id = request.transaction_id,
+                .source = source,
+                .flags = .{ .role_conflict = true },
+            }) catch unreachable;
+
+            // No further processing.
+            return;
+        }
+
         // Enqueue response.
-        self.binding_request_queue.push(RequestEntry{
+        self.check_response_queue.push(ResponseEntry{
             .socket_index = socket_context.index,
             .transaction_id = request.transaction_id,
             .source = source,
+            .flags = .{ .role_conflict = false },
         }) catch unreachable;
-
-        // Handle response sending if required.
-        if (self.binding_request_queue_write_completion.state() != .active) {
-            self.handleQueuedRequest();
-        }
 
         const use_candidate = for (request.attributes) |a| {
             if (a.type == ztun.attr.Type.use_candidate) break true;
@@ -2475,35 +2537,8 @@ pub const AgentContext = struct {
         return valid_candidate_pair;
     }
 
-    fn handleConnectivityCheckTransactionCompleted(
-        self: *AgentContext,
-        stun_context: *StunContext,
-        result: TransactionResult,
-    ) !void {
-        const check_context = &stun_context.check;
+    fn handleConnectivityCheckSuccessResponse(self: *AgentContext, check_context: *ConnectivityCheckContext, message: ztun.Message, source: std.net.Address) !void {
         const candidate_pair = check_context.candidate_pair;
-
-        const payload = result catch |err| {
-            // Due to triggered check, we might never receive the answer but must not treat the lack of response as a failure.
-            if (!check_context.flags.is_canceled) {
-                log.debug("Agent {} - Check failed for candidate pair ({}:{}) with {}", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, err });
-                self.checklist.setPairState(candidate_pair, .failed);
-            }
-            return;
-        };
-
-        var buffer: [4096]u8 = undefined;
-        const message = b: {
-            var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
-            var stream = std.io.fixedBufferStream(payload.raw_message);
-            var reader = stream.reader();
-            break :b ztun.Message.readAlloc(reader, arena_state.allocator()) catch unreachable;
-        };
-
-        const is_success_response = message.type.class == .success_response;
-
-        // TODO(Corendos): handle response errors.
-        std.debug.assert(is_success_response);
 
         const local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
         const remote_candidate = self.remote_candidates.items[candidate_pair.remote_candidate_index];
@@ -2512,7 +2547,7 @@ pub const AgentContext = struct {
         const mapped_address = getMappedAddressFromStunMessage(message) orelse @panic("TODO");
 
         // NOTE(Corendos): handle https://www.rfc-editor.org/rfc/rfc8445#section-7.2.5.2.1.
-        if (!areTransportAddressesSymmetric(local_candidate.transport_address, remote_candidate.transport_address, payload.source, mapped_address)) {
+        if (!areTransportAddressesSymmetric(local_candidate.transport_address, remote_candidate.transport_address, source, mapped_address)) {
             log.debug("Agent {} - Check failed for candidate pair ({}:{}) because source and destination are not symmetric", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
 
             self.checklist.setPairState(candidate_pair, .failed);
@@ -2550,6 +2585,70 @@ pub const AgentContext = struct {
             self.checklist.nomination_in_progress = true;
             log.debug("Agent {} - Try to nominate pair {}:{}", .{ self.id, valid_candidate_pair.local_candidate_index, valid_candidate_pair.remote_candidate_index });
             self.checklist.triggered_check_queue.push(.{ .candidate_pair = valid_candidate_pair, .nominate = true }) catch unreachable;
+        }
+    }
+
+    fn handleConnectivityCheckErrorResponse(self: *AgentContext, check_context: *ConnectivityCheckContext, message: ztun.Message) !void {
+        const candidate_pair = check_context.candidate_pair;
+
+        const error_code_attribute_opt: ?ztun.attr.common.ErrorCode = for (message.attributes) |attr| {
+            if (attr.type == ztun.attr.Type.error_code) break try ztun.attr.common.ErrorCode.fromAttribute(attr);
+        } else null;
+
+        const error_code_attribute = error_code_attribute_opt orelse {
+            self.checklist.setPairState(candidate_pair, .failed);
+            return;
+        };
+
+        switch (error_code_attribute.value) {
+            .role_conflict => {
+                if (check_context.flags.role == self.role.?) {
+                    self.switchRole();
+
+                    const new_entry = TriggeredCheckEntry{ .candidate_pair = candidate_pair };
+                    if (self.checklist.triggered_check_queue.findFirst(new_entry, TriggeredCheckEntry.eql) == null) {
+                        self.checklist.setPairState(candidate_pair, .waiting);
+                        self.checklist.triggered_check_queue.push(new_entry) catch unreachable;
+                    }
+
+                    self.tiebreaker = std.crypto.random.int(u64);
+                }
+            },
+            else => {
+                self.checklist.setPairState(candidate_pair, .failed);
+            },
+        }
+    }
+
+    fn handleConnectivityCheckTransactionCompleted(
+        self: *AgentContext,
+        stun_context: *StunContext,
+        result: TransactionResult,
+    ) !void {
+        const check_context = &stun_context.check;
+        const candidate_pair = check_context.candidate_pair;
+
+        const payload = result catch |err| {
+            // Due to triggered check, we might never receive the answer but must not treat the lack of response as a failure.
+            if (!check_context.flags.is_canceled) {
+                log.debug("Agent {} - Check failed for candidate pair ({}:{}) with {}", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, err });
+                self.checklist.setPairState(candidate_pair, .failed);
+            }
+            return;
+        };
+
+        var buffer: [4096]u8 = undefined;
+        const message = b: {
+            var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
+            var stream = std.io.fixedBufferStream(payload.raw_message);
+            var reader = stream.reader();
+            break :b ztun.Message.readAlloc(reader, arena_state.allocator()) catch unreachable;
+        };
+
+        if (message.type.class == .success_response) {
+            try self.handleConnectivityCheckSuccessResponse(check_context, message, payload.source);
+        } else {
+            try self.handleConnectivityCheckErrorResponse(check_context, message);
         }
     }
 
@@ -2616,7 +2715,11 @@ pub const AgentContext = struct {
                 .socket_index = socket_context_index,
                 .candidate_pair = candidate_pair,
                 .transaction = transaction,
-                .flags = .{ .is_triggered_check = is_triggered_check, .is_nomination = is_nominated },
+                .flags = .{
+                    .is_triggered_check = is_triggered_check,
+                    .is_nomination = is_nominated,
+                    .role = self.role.?,
+                },
             },
         };
 
@@ -2698,9 +2801,9 @@ pub const AgentContext = struct {
 
     const PairsFormatter = struct {
         ctx: *const AgentContext,
-        pub fn format(self: PairsFormatter, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        pub fn format(self: PairsFormatter, comptime fmt_s: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
             _ = options;
-            _ = fmt;
+            _ = fmt_s;
             try writer.print("Agent {} Candidate pairs\n", .{self.ctx.id});
 
             for (self.ctx.checklist.pairs.slice()) |entry| {
@@ -2717,9 +2820,9 @@ pub const AgentContext = struct {
 
     const ValidPairsFormatter = struct {
         ctx: *const AgentContext,
-        pub fn format(self: ValidPairsFormatter, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        pub fn format(self: ValidPairsFormatter, comptime fmt_s: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
             _ = options;
-            _ = fmt;
+            _ = fmt_s;
             try writer.print("Agent {} Valid pairs\n", .{self.ctx.id});
 
             for (self.ctx.checklist.valid_pairs.slice()) |entry| {
@@ -2736,13 +2839,17 @@ pub const AgentContext = struct {
 
     const CandidateFormatter = struct {
         ctx: *const AgentContext,
-        pub fn format(self: CandidateFormatter, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        pub fn format(self: CandidateFormatter, comptime fmt_s: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
             _ = options;
-            _ = fmt;
+            _ = fmt_s;
             try writer.print("Agent {}\n", .{self.ctx.id});
 
             for (self.ctx.local_candidates.items, 0..) |candidate, index| {
-                try writer.print("    Local {} - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
+                if (candidate.default) {
+                    try writer.print("    Local {} (d) - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
+                } else {
+                    try writer.print("    Local {} - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
+                }
             }
 
             for (self.ctx.remote_candidates.items, 0..) |candidate, index| {
@@ -2866,9 +2973,10 @@ pub const Context = struct {
     network_interface_map: std.AutoArrayHashMapUnmanaged(u32, NetworkInterface) = .{},
     interface_addresses: std.ArrayListUnmanaged(InterfaceAddress) = .{},
 
-    agent_context_entries: [context_agent_slot_count]AgentContextEntry,
-
     string_storage: std.heap.ArenaAllocator,
+
+    agent_context_entries_mutex: std.Thread.Mutex = .{},
+    agent_context_entries: [context_agent_slot_count]AgentContextEntry,
 
     netlink_context: NetlinkContext,
     netlink_context_ready: bool = false,
@@ -2878,13 +2986,14 @@ pub const Context = struct {
     async_handle: xev.Async,
     async_completion: xev.Completion = .{},
 
+    flags_mutex: std.Thread.Mutex = .{},
     flags: packed struct {
         stopped: bool = false,
     } = .{},
 
-    loop: *xev.Loop = undefined,
+    loop: xev.Loop,
 
-    pub fn init(loop: *xev.Loop, allocator: std.mem.Allocator) !Context {
+    pub fn init(allocator: std.mem.Allocator) !Context {
         var agent_context_entries: [context_agent_slot_count]AgentContextEntry = undefined;
         for (&agent_context_entries, 0..) |*entry, index| {
             const agent_id = AgentId{ .parts = .{ .index = @intCast(index), .details = 0 } };
@@ -2897,11 +3006,13 @@ pub const Context = struct {
             .string_storage = std.heap.ArenaAllocator.init(allocator),
             .netlink_context = try NetlinkContext.init(allocator),
             .async_handle = try xev.Async.init(),
-            .loop = loop,
+            .loop = try xev.Loop.init(.{}),
         };
     }
 
     pub fn deinit(self: *Context) void {
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
         for (&self.agent_context_entries) |*entry| {
             if (entry.agent_context) |*agent_context| agent_context.deinit();
         }
@@ -2911,9 +3022,10 @@ pub const Context = struct {
         self.interface_addresses.deinit(self.allocator);
         self.string_storage.deinit();
         self.async_handle.deinit();
+        self.loop.deinit();
     }
 
-    pub fn start(self: *Context) !void {
+    pub fn run(self: *Context) !void {
         self.netlink_context.userdata = self;
         self.netlink_context.on_interface_callback = (struct {
             fn callback(userdata: ?*anyopaque, event: NetlinkContext.InterfaceEvent) void {
@@ -2933,16 +3045,20 @@ pub const Context = struct {
                 inner_self.netlinkContextReady();
             }
         }).callback;
-        self.async_handle.wait(self.loop, &self.async_completion, Context, self, asyncCallback);
+        self.async_handle.wait(&self.loop, &self.async_completion, Context, self, asyncCallback);
 
-        try self.netlink_context.start(self.loop);
+        try self.netlink_context.start(&self.loop);
+        try self.loop.run(.until_done);
     }
 
     pub fn stop(self: *Context) void {
+        self.flags_mutex.lock();
+        defer self.flags_mutex.unlock();
         if (self.flags.stopped) return;
-        self.netlink_context.stop(self.loop);
-        self.async_handle.notify() catch unreachable;
+
         self.flags.stopped = true;
+        self.netlink_context.stop(&self.loop);
+        self.async_handle.notify() catch unreachable;
     }
 
     fn onInterface(self: *Context, event: NetlinkContext.InterfaceEvent) void {
@@ -3032,16 +3148,22 @@ pub const Context = struct {
     }
 
     pub fn createAgent(self: *Context, options: CreateAgentOptions) !AgentId {
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
+
         const unused_entry: *AgentContextEntry = for (&self.agent_context_entries) |*entry| {
             if (entry.agent_context == null) break entry;
         } else return error.NoSlotAvailable;
 
-        unused_entry.agent_context = try AgentContext.init(self, unused_entry.agent_id, self.loop, options, self.allocator);
+        unused_entry.agent_context = try AgentContext.init(self, unused_entry.agent_id, &self.loop, options, self.allocator);
 
         return unused_entry.agent_id;
     }
 
     pub fn deleteAgent(self: *Context, agent_id: AgentId) !void {
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
+
         const entry = try self.getAgentEntry(agent_id);
         if (entry.agent_context == null or entry.flags.deleted) return error.InvalidId;
         entry.flags.deleted = true;
@@ -3176,11 +3298,10 @@ pub const Context = struct {
                     c.callback(c.userdata, ContextResult{ .set_remote_candidates = set_remote_candidates_result });
                 },
                 .send => {
-                    const send_result = if (self.getAgentContext(c.agent_id)) |agent_context| b: {
+                    if (self.getAgentContext(c.agent_id)) |agent_context| b: {
                         agent_context.processSend(c) catch unreachable;
                         break :b {};
-                    } else |err| err;
-                    _ = send_result catch |err| c.callback(c.userdata, ContextResult{ .send = err });
+                    } else |err| c.callback(c.userdata, ContextResult{ .send = err });
                 },
             }
         }
@@ -3191,7 +3312,14 @@ pub const Context = struct {
             self.async_queue.push(c);
         }
 
-        return if (self.flags.stopped) .disarm else .rearm;
+        const stopped = b: {
+            self.flags_mutex.lock();
+            defer self.flags_mutex.unlock();
+
+            break :b self.flags.stopped;
+        };
+
+        return if (stopped) .disarm else .rearm;
     }
 };
 
@@ -3202,7 +3330,6 @@ test "Basic structs size" {
 }
 
 test {
-    _ = Worker;
     _ = Intrusive;
     _ = platform;
     _ = net;

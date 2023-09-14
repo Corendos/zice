@@ -4,6 +4,8 @@
 const std = @import("std");
 const xev = @import("xev");
 
+pub const time = @import("time.zig");
+
 pub const LogColor = enum(u8) {
     black,
     red,
@@ -38,41 +40,35 @@ pub const LogColor = enum(u8) {
 };
 
 const Datetime = struct {
-    ns: u16,
-    us: u16,
-    ms: u16,
-    s: u8,
-    m: u8,
-    h: u64,
+    value: std.os.linux.timeval,
 
-    pub inline fn fromTimestamp(timestamp: i128) Datetime {
-        var t: u128 = @intCast(timestamp);
-        const ns = t % 1000;
-        t = t / 1000;
-        const us = t % 1000;
-        t = t / 1000;
-        const ms = t % 1000;
-        t = t / 1000;
-        const s = t % 60;
-        t = t / 60;
-        const m = t % 60;
-        t = t / 60;
-        const h = t;
-        return Datetime{
-            .ns = @intCast(ns),
-            .us = @intCast(us),
-            .ms = @intCast(ms),
-            .s = @intCast(s),
-            .m = @intCast(m),
-            .h = @intCast(h),
-        };
+    pub fn now() Datetime {
+        var tv: std.os.linux.timeval = undefined;
+        var tz: std.os.linux.timezone = undefined;
+        _ = std.os.linux.gettimeofday(&tv, &tz);
+        return Datetime{ .value = tv };
     }
 
     pub fn format(self: Datetime, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = options;
         _ = fmt;
-        try writer.print("{}:{:0>2}:{:0>2}.{:0>3}.{:0>3}.{:0>3}", .{
-            self.h, self.m, self.s, self.ms, self.us, self.ns,
+
+        const local_time = time.localTime(self.value.tv_sec) catch unreachable;
+
+        var value: u64 = @intCast(self.value.tv_usec);
+        const us = value % 1000;
+        value /= 1000;
+        const ms = value % 1000;
+
+        try writer.print("{:0>2}-{:0>2}-{:0>4} {:0>2}:{:0>2}:{:0>2}.{:0>3}.{:0>3}", .{
+            @as(u64, @intCast(local_time.tm_mday)),
+            @as(u64, @intCast(local_time.tm_mon + 1)),
+            @as(u64, @intCast(1900 + local_time.tm_year)),
+            @as(u64, @intCast(local_time.tm_hour)),
+            @as(u64, @intCast(local_time.tm_min)),
+            @as(u64, @intCast(local_time.tm_sec)),
+            ms,
+            us,
         });
     }
 };
@@ -90,20 +86,39 @@ pub fn logFn(
     std.debug.getStderrMutex().lock();
     defer std.debug.getStderrMutex().unlock();
 
-    const datetime = Datetime.fromTimestamp(std.time.nanoTimestamp());
+    const datetime = Datetime.now();
 
-    nosuspend stderr.print(level_color_escape.escapeString() ++ "{} ", .{datetime}) catch return;
+    nosuspend stderr.print(level_color_escape.escapeString() ++ "[{}] ", .{datetime}) catch return;
     nosuspend stderr.print(level_txt ++ prefix2 ++ format ++ "\n" ++ "\x1b[0m", args) catch return;
 }
 
 pub const StopHandler = struct {
-    storage: [@sizeOf(std.os.linux.signalfd_siginfo)]u8,
-    fd: std.os.fd_t,
-    mask: std.os.sigset_t,
+    pub const Error = xev.ReadError;
+    pub const Result = Error!void;
+    pub const StopHandlerCallback = *const fn (userdata: ?*anyopaque, loop: *xev.Loop, result: Result) void;
+
+    fn noopCallback(userdata: ?*anyopaque, loop: *xev.Loop, result: Result) void {
+        _ = result catch {};
+        _ = loop;
+        _ = userdata;
+    }
+
+    storage: [@sizeOf(std.os.linux.signalfd_siginfo)]u8 = undefined,
+    fd: std.os.fd_t = undefined,
+    mask: std.os.sigset_t = undefined,
     completion: xev.Completion = .{},
+    cancel_completion: xev.Completion = .{},
+
+    flags: packed struct {
+        is_canceled: bool = false,
+    } = .{},
+
+    result: ?Result = null,
+    userdata: ?*anyopaque = null,
+    callback: StopHandlerCallback = noopCallback,
 
     pub fn init() !StopHandler {
-        var self: StopHandler = undefined;
+        var self: StopHandler = .{};
         self.mask = m: {
             var mask = std.os.empty_sigset;
             std.os.linux.sigaddset(&mask, std.os.SIG.INT);
@@ -119,7 +134,10 @@ pub const StopHandler = struct {
         std.os.close(self.fd);
     }
 
-    pub fn register(self: *StopHandler, loop: *xev.Loop, comptime Userdata: type, userdata: ?*Userdata, comptime callback: *const fn (userdata: ?*Userdata, loop: *xev.Loop) void) void {
+    pub fn register(self: *StopHandler, loop: *xev.Loop, userdata: ?*anyopaque, cb: StopHandlerCallback) void {
+        self.userdata = userdata;
+        self.callback = cb;
+
         self.completion = xev.Completion{
             .op = .{
                 .read = .{
@@ -127,22 +145,50 @@ pub const StopHandler = struct {
                     .buffer = .{ .slice = &self.storage },
                 },
             },
-            .callback = (struct {
-                fn cb(
-                    ud: ?*anyopaque,
-                    inner_loop: *xev.Loop,
-                    _: *xev.Completion,
-                    _: xev.Result,
-                ) xev.CallbackAction {
-                    const inner_userdata: ?*Userdata = @ptrCast(@alignCast(ud));
-                    @call(.always_inline, callback, .{ inner_userdata, inner_loop });
-
-                    return .disarm;
-                }
-            }).cb,
-            .userdata = userdata,
+            .callback = callback,
+            .userdata = self,
         };
         loop.add(&self.completion);
         std.os.sigprocmask(std.os.SIG.BLOCK, &self.mask, null);
+    }
+
+    fn callback(userdata: ?*anyopaque, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) xev.CallbackAction {
+        _ = c;
+        const self: *StopHandler = @ptrCast(@alignCast(userdata.?));
+
+        const actual_result: Result = if (result.read) |_| {} else |err| err;
+        if (self.result == null) {
+            self.result = actual_result;
+        }
+
+        if (self.completion.state() == .dead and self.cancel_completion.state() == .dead) {
+            self.callback(self.userdata, loop, self.result.?);
+        }
+        return .disarm;
+    }
+
+    fn cancelCallback(userdata: ?*anyopaque, loop: *xev.Loop, c: *xev.Completion, result: xev.Result) xev.CallbackAction {
+        _ = c;
+        const self: *StopHandler = @ptrCast(@alignCast(userdata.?));
+
+        const actual_result: Result = if (result.cancel) |_| error.Canceled else |_| unreachable;
+        if (self.result == null) {
+            self.result = actual_result;
+        }
+
+        if (self.completion.state() == .dead and self.cancel_completion.state() == .dead) {
+            self.callback(self.userdata, loop, self.result.?);
+        }
+        return .disarm;
+    }
+
+    pub fn cancel(self: *StopHandler, loop: *xev.Loop) void {
+        self.cancel_completion = .{
+            .op = .{ .cancel = .{ .c = &self.completion } },
+            .userdata = self,
+            .callback = cancelCallback,
+        };
+        self.flags.is_canceled = true;
+        loop.add(&self.cancel_completion);
     }
 };
