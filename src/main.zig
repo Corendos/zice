@@ -7,8 +7,6 @@ const ztun = @import("ztun");
 const xev = @import("xev");
 
 pub const net = @import("net.zig");
-pub const io = @import("io.zig");
-pub const sdp = @import("sdp.zig");
 pub const fmt = @import("fmt.zig");
 pub const platform = switch (builtin.os.tag) {
     .linux => @import("zice/linux.zig"),

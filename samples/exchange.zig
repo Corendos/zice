@@ -124,9 +124,10 @@ const Context = struct {
     controlled_send_completion: zice.ContextCompletion = undefined,
 };
 
-fn stopHandlerCallback(userdata: ?*Context, loop: *xev.Loop) void {
+fn stopHandlerCallback(userdata: ?*anyopaque, loop: *xev.Loop, result: utils.StopHandler.Result) void {
+    _ = result catch unreachable;
     _ = loop;
-    const context = userdata.?;
+    const context: *Context = @ptrCast(@alignCast(userdata.?));
     std.log.info("Received SIGINT", .{});
 
     context.zice_context.?.deleteAgent(context.controlling_agent.?) catch {};
@@ -140,8 +141,8 @@ pub fn main() !void {
 
     var allocator = gpa.allocator();
 
-    var network_loop = try xev.Loop.init(.{});
-    defer network_loop.deinit();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
 
     var stop_handler = try utils.StopHandler.init();
     defer stop_handler.deinit();
@@ -153,17 +154,10 @@ pub fn main() !void {
     defer context.controlling_agent_candidates.deinit();
     defer context.controlled_agent_candidates.deinit();
 
-    stop_handler.register(&network_loop, Context, &context, stopHandlerCallback);
+    stop_handler.register(&loop, &context, stopHandlerCallback);
 
-    var zice_context = try zice.Context.init(&network_loop, allocator);
+    var zice_context = try zice.Context.init(allocator);
     defer zice_context.deinit();
-
-    var network_loop_thread = try std.Thread.spawn(.{}, (struct {
-        fn callback(l: *xev.Loop, inner_zice_context: *zice.Context) !void {
-            try inner_zice_context.start();
-            try l.run(.until_done);
-        }
-    }).callback, .{ &network_loop, &zice_context });
 
     const controlling_agent = try zice_context.createAgent(.{
         .userdata = &context,
@@ -183,8 +177,15 @@ pub fn main() !void {
     context.controlling_agent = controlling_agent;
     context.controlled_agent = controlled_agent;
 
+    var t = try std.Thread.spawn(.{}, (struct {
+        pub fn f(inner_context: *Context) !void {
+            try inner_context.zice_context.?.run();
+        }
+    }).f, .{&context});
+    defer t.join();
+
     var gather_completion: zice.ContextCompletion = undefined;
     try zice_context.gatherCandidates(controlling_agent, &gather_completion, null, gatherCandidateCallback);
 
-    network_loop_thread.join();
+    try loop.run(.until_done);
 }

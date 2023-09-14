@@ -32,9 +32,10 @@ const Context = struct {
     agent: ?zice.AgentId = null,
 };
 
-fn stopHandlerCallback(userdata: ?*Context, loop: *xev.Loop) void {
+fn stopHandlerCallback(userdata: ?*anyopaque, loop: *xev.Loop, result: utils.StopHandler.Result) void {
+    _ = result catch unreachable;
     _ = loop;
-    const context = userdata.?;
+    const context: *Context = @ptrCast(@alignCast(userdata.?));
     std.log.info("Received SIGINT", .{});
 
     context.zice_context.?.deleteAgent(context.agent.?) catch {};
@@ -51,26 +52,26 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
     defer _ = gpa.deinit();
 
-    var network_loop = try xev.Loop.init(.{});
-    defer network_loop.deinit();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
 
     var stop_handler = try utils.StopHandler.init();
     defer stop_handler.deinit();
 
     var context = Context{};
-    stop_handler.register(&network_loop, Context, &context, stopHandlerCallback);
+    stop_handler.register(&loop, &context, stopHandlerCallback);
 
-    var zice_context = try zice.Context.init(&network_loop, gpa.allocator());
+    var zice_context = try zice.Context.init(gpa.allocator());
     defer zice_context.deinit();
 
     context.zice_context = &zice_context;
 
-    var network_loop_thread = try std.Thread.spawn(.{}, (struct {
-        fn callback(inner_context: *Context, l: *xev.Loop) !void {
-            try inner_context.zice_context.?.start();
-            try l.run(.until_done);
+    var t = try std.Thread.spawn(.{}, (struct {
+        pub fn f(inner_context: *Context) !void {
+            try inner_context.zice_context.?.run();
         }
-    }).callback, .{ &context, &network_loop });
+    }).f, .{&context});
+    defer t.join();
 
     const agent = try zice_context.createAgent(.{});
     context.agent = agent;
@@ -78,5 +79,5 @@ pub fn main() !void {
     var gather_completion: zice.ContextCompletion = undefined;
     try zice_context.gatherCandidates(agent, &gather_completion, null, gatherCandidateCallback);
 
-    network_loop_thread.join();
+    try loop.run(.until_done);
 }

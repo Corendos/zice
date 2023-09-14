@@ -25,9 +25,10 @@ pub const CandidatePairData = struct {
     data: [10]u8 = undefined,
 };
 
-fn stopHandlerCallback(userdata: ?*Context, loop: *xev.Loop) void {
+fn stopHandlerCallback(userdata: ?*anyopaque, loop: *xev.Loop, result: utils.StopHandler.Result) void {
+    _ = result catch unreachable;
     _ = loop;
-    const context = userdata.?;
+    const context: *Context = @ptrCast(@alignCast(userdata.?));
     std.log.info("Received SIGINT", .{});
 
     if (context.zice_context) |zice_context| {
@@ -47,19 +48,24 @@ pub fn main() !void {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    var stop_handle = try StopHandler.init();
-    defer stop_handle.deinit();
+    var stop_handler = try StopHandler.init();
+    defer stop_handler.deinit();
 
     var context = Context{};
 
-    stop_handle.register(&loop, Context, &context, stopHandlerCallback);
+    stop_handler.register(&loop, &context, stopHandlerCallback);
 
     var zice_context = try zice.Context.init(gpa.allocator());
     defer zice_context.deinit();
 
     context.zice_context = &zice_context;
 
-    try zice_context.start(&loop);
+    var t = try std.Thread.spawn(.{}, (struct {
+        pub fn f(inner_context: *Context) !void {
+            try inner_context.zice_context.?.run();
+        }
+    }).f, .{&context});
+    defer t.join();
 
     try loop.run(.until_done);
 }
