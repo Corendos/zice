@@ -171,7 +171,10 @@ pub const StopHandler = struct {
         _ = c;
         const self: *StopHandler = @ptrCast(@alignCast(userdata.?));
 
-        const actual_result: Result = if (result.cancel) |_| error.Canceled else |_| unreachable;
+        const actual_result: Result = if (result.cancel) |_| error.Canceled else |e| {
+            std.log.err("{}", .{e});
+            unreachable;
+        };
         if (self.result == null) {
             self.result = actual_result;
         }
@@ -183,6 +186,7 @@ pub const StopHandler = struct {
     }
 
     pub fn cancel(self: *StopHandler, loop: *xev.Loop) void {
+        if (self.completion.state() == .dead) return;
         self.cancel_completion = .{
             .op = .{ .cancel = .{ .c = &self.completion } },
             .userdata = self,
