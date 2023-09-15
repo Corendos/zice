@@ -13,13 +13,13 @@ pub const platform = switch (builtin.os.tag) {
     else => @compileError("\"" ++ @tagName(builtin.os.tag) ++ "\" platform not supported"),
 };
 
-const DoublyLinkedList = @import("doubly_linked_list.zig").DoublyLinkedList;
-const CircularBuffer = @import("circular_buffer.zig").CircularBuffer;
-const BoundedFifo = @import("bounded_fifo.zig").BoundedFifo;
-const OrderedBoundedArray = @import("ordered_array.zig").OrderedBoundedArray;
-const GenerationId = @import("generation_id.zig").GenerationId;
+pub const DoublyLinkedList = @import("doubly_linked_list.zig").DoublyLinkedList;
+pub const CircularBuffer = @import("circular_buffer.zig").CircularBuffer;
+pub const BoundedFifo = @import("bounded_fifo.zig").BoundedFifo;
+pub const OrderedBoundedArray = @import("ordered_array.zig").OrderedBoundedArray;
+pub const GenerationId = @import("generation_id.zig").GenerationId;
 const NetlinkContext = @import("netlink.zig").NetlinkContext;
-const Intrusive = @import("queue.zig").Intrusive;
+pub const Intrusive = @import("queue.zig").Intrusive;
 
 const log = std.log.scoped(.zice);
 
@@ -3215,7 +3215,11 @@ pub const Context = struct {
         return &self.agent_context_entries[agent_id.parts.index];
     }
 
-    inline fn getAgentContext(self: *Context, agent_id: AgentId) InvalidError!*AgentContext {
+    pub inline fn getAgentContext(self: anytype, agent_id: AgentId) InvalidError!switch (@TypeOf(self)) {
+        *Context => *AgentContext,
+        *const Context => *const AgentContext,
+        else => unreachable,
+    } {
         const entry = try self.getAgentEntry(agent_id);
         return if (entry.agent_context) |*agent_context| agent_context else error.InvalidId;
     }
