@@ -44,10 +44,10 @@ test "Basic usage of CircularBuffer" {
     try std.testing.expect(buffer.empty());
     try std.testing.expectEqual(@as(?u32, null), buffer.pop());
 
-    try std.testing.expectEqual({}, buffer.push(1));
-    try std.testing.expectEqual({}, buffer.push(2));
+    try std.testing.expectEqual({}, try buffer.push(1));
+    try std.testing.expectEqual({}, try buffer.push(2));
     try std.testing.expectError(error.NoSpaceLeft, buffer.push(3));
 
     _ = buffer.pop();
-    try std.testing.expectEqual({}, buffer.push(3));
+    try std.testing.expectEqual({}, try buffer.push(3));
 }

@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-pub fn buildSamples(b: *std.build.Builder, sample_utils_module: *std.Build.Module, optimize: std.builtin.Mode, target: std.zig.CrossTarget) !void {
+pub fn buildSamples(b: *std.build.Builder, sample_utils_module: *std.Build.Module, xev_module: *std.Build.Module, optimize: std.builtin.Mode, target: std.zig.CrossTarget) !void {
     var arena_state = std.heap.ArenaAllocator.init(b.allocator);
     defer arena_state.deinit();
 
@@ -27,7 +27,7 @@ pub fn buildSamples(b: *std.build.Builder, sample_utils_module: *std.Build.Modul
             .optimize = optimize,
         });
         executable.addModule("zice", b.modules.get("zice").?);
-        executable.addModule("xev", b.dependency("libxev", .{}).module("xev"));
+        executable.addModule("xev", xev_module);
         executable.addModule("utils", sample_utils_module);
         const install_executable = b.addInstallArtifact(executable, .{});
 
@@ -93,7 +93,7 @@ pub fn build(b: *std.build.Builder) void {
             .{ .name = "xev", .module = xev_module },
         },
     });
-    buildSamples(b, sample_utils_module, optimize, target) catch unreachable;
+    buildSamples(b, sample_utils_module, xev_module, optimize, target) catch unreachable;
 }
 
 inline fn thisDir() []const u8 {
