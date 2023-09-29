@@ -2589,12 +2589,36 @@ pub const AgentContext = struct {
         return response_source.eql(request_destination) and response_destination.eql(request_source);
     }
 
-    fn constructValidPair(self: *AgentContext, candidate_pair: CandidatePair, mapped_address: std.net.Address, request_destination: std.net.Address) ?CandidatePair {
+    fn constructValidPair(self: *AgentContext, mapped_address: std.net.Address, request_destination: std.net.Address) CandidatePair {
         const valid_local_candidate_index = self.getLocalCandidateIndexFromTransportAddress(mapped_address) orelse @panic("Probably a peer reflexive candidate");
         const valid_remote_candidate_index = self.getRemoteCandidateIndexFromTransportAddress(request_destination) orelse unreachable;
 
-        const valid_candidate_pair = CandidatePair{ .local_candidate_index = valid_local_candidate_index, .remote_candidate_index = valid_remote_candidate_index };
+        return CandidatePair{ .local_candidate_index = valid_local_candidate_index, .remote_candidate_index = valid_remote_candidate_index };
+    }
 
+    fn handleConnectivityCheckSuccessResponse(self: *AgentContext, check_context: *ConnectivityCheckContext, message: ztun.Message, source: std.net.Address) !void {
+        const candidate_pair = check_context.candidate_pair;
+
+        const local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
+        const remote_candidate = self.remote_candidates.items[candidate_pair.remote_candidate_index];
+
+        const mapped_address = getMappedAddressFromStunMessage(message) orelse @panic("TODO: Failed to get mapped address from STUN message");
+
+        // NOTE(Corendos): handle https://www.rfc-editor.org/rfc/rfc8445#section-7.2.5.2.1.
+        if (!areTransportAddressesSymmetric(local_candidate.transport_address, remote_candidate.transport_address, source, mapped_address)) {
+            log.debug("Agent {} - Check failed for candidate pair ({}:{}) because source and destination are not symmetric", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
+
+            self.checklist.setPairState(candidate_pair, .failed);
+            return;
+        }
+
+        // Discovering Peer-Reflexive Candidates
+        // TODO(Corendos): implement peer-reflexive candidates handling here.
+
+        // Constructing a Valid Pair
+        const valid_candidate_pair = self.constructValidPair(candidate_pair, mapped_address, remote_candidate.transport_address);
+
+        // Add the valid pair to the valid list if needed.
         if (valid_candidate_pair.eql(candidate_pair) or self.checklist.containsPair(valid_candidate_pair)) {
             // TODO(Corentin): Be careful with peer-reflexive priority.
 
@@ -2611,35 +2635,6 @@ pub const AgentContext = struct {
                 self.checklist.addValidPair(valid_candidate_pair, valid_candidate_pair_data) catch unreachable;
             }
         }
-
-        return valid_candidate_pair;
-    }
-
-    fn handleConnectivityCheckSuccessResponse(self: *AgentContext, check_context: *ConnectivityCheckContext, message: ztun.Message, source: std.net.Address) !void {
-        const candidate_pair = check_context.candidate_pair;
-
-        const local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
-        const remote_candidate = self.remote_candidates.items[candidate_pair.remote_candidate_index];
-
-        // TODO(Corendos): Discover peer-reflexive candidates.
-        const mapped_address = getMappedAddressFromStunMessage(message) orelse @panic("TODO: Failed to get mapped address from STUN message");
-
-        // NOTE(Corendos): handle https://www.rfc-editor.org/rfc/rfc8445#section-7.2.5.2.1.
-        if (!areTransportAddressesSymmetric(local_candidate.transport_address, remote_candidate.transport_address, source, mapped_address)) {
-            log.debug("Agent {} - Check failed for candidate pair ({}:{}) because source and destination are not symmetric", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
-
-            self.checklist.setPairState(candidate_pair, .failed);
-            return;
-        }
-
-        // Discovering Peer-Reflexive Candidates
-        // TODO(Corendos): implement peer-reflexive candidates handling here.
-
-        // Constructing a Valid Pair
-        const valid_candidate_pair = self.constructValidPair(candidate_pair, mapped_address, remote_candidate.transport_address) orelse {
-            self.checklist.setPairState(candidate_pair, .failed);
-            return;
-        };
 
         // TODO(Corendos): What to do with response when a pair has been nominated ?
         if (!self.checklist.containsPair(candidate_pair)) {
@@ -2667,6 +2662,7 @@ pub const AgentContext = struct {
             self.handleNomination(valid_candidate_pair, self.loop);
         }
 
+        // TODO(Corendos): This might need to be put elsewhere.
         // Try to nominate pair
         if (self.role == .controlling and !self.checklist.nomination_in_progress) {
             self.checklist.nomination_in_progress = true;
