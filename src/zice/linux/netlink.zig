@@ -8,8 +8,6 @@ const zice = @import("../../main.zig");
 const net = zice.net;
 const linux = std.os.linux;
 
-pub const Cache = @import("netlink/cache.zig").Cache;
-
 // From rtnetlink.h
 pub const RTMGRP = struct {
     pub const LINK = 0x01;
