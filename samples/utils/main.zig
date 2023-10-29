@@ -94,7 +94,7 @@ pub fn logFn(
 }
 
 pub const StopHandler = struct {
-    pub const Error = xev.ReadError;
+    pub const Error = xev.ReadError || error{Canceled};
     pub const Result = Error!void;
     pub const StopHandlerCallback = *const fn (userdata: ?*anyopaque, loop: *xev.Loop, result: Result) void;
 

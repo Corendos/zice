@@ -76,7 +76,7 @@ pub const NetlinkContext = struct {
         self.allocator.free(self.read_buffer);
     }
 
-    pub fn start(self: *NetlinkContext, loop: *xev.Loop) !void {
+    fn enqueueRead(self: *NetlinkContext, loop: *xev.Loop) void {
         self.read_completion = xev.Completion{
             .op = .{
                 .read = .{
@@ -87,19 +87,31 @@ pub const NetlinkContext = struct {
             .userdata = self,
             .callback = NetlinkContext.readCallback,
         };
+
+        if (xev.backend == .epoll) {
+            self.read_completion.flags.dup = true;
+        }
+
         loop.add(&self.read_completion);
+    }
+
+    pub fn start(self: *NetlinkContext, loop: *xev.Loop) !void {
+        self.enqueueRead(loop);
 
         self.requestInterfaces(loop);
     }
 
     pub fn stop(self: *NetlinkContext, loop: *xev.Loop) void {
         if (self.flags.stopped) return;
-        self.write_cancel_completion = xev.Completion{
-            .op = .{ .cancel = .{ .c = &self.write_completion } },
-            .userdata = self,
-            .callback = writeCancelCallback,
-        };
-        loop.add(&self.write_cancel_completion);
+
+        if (self.write_completion.state() == .active) {
+            self.write_cancel_completion = xev.Completion{
+                .op = .{ .cancel = .{ .c = &self.write_completion } },
+                .userdata = self,
+                .callback = writeCancelCallback,
+            };
+            loop.add(&self.write_cancel_completion);
+        }
 
         self.read_cancel_completion = xev.Completion{
             .op = .{ .cancel = .{ .c = &self.read_completion } },
@@ -108,6 +120,25 @@ pub const NetlinkContext = struct {
         };
         loop.add(&self.read_cancel_completion);
         self.flags.stopped = true;
+    }
+
+    fn enqueueWrite(self: *NetlinkContext, buffer: xev.WriteBuffer, loop: *xev.Loop) void {
+        self.write_completion = xev.Completion{
+            .op = .{
+                .write = .{
+                    .fd = self.socket,
+                    .buffer = buffer,
+                },
+            },
+            .userdata = self,
+            .callback = writeCallback,
+        };
+
+        if (xev.backend == .epoll) {
+            self.write_completion.flags.dup = true;
+        }
+
+        loop.add(&self.write_completion);
     }
 
     fn requestInterfaces(self: *NetlinkContext, loop: *xev.Loop) void {
@@ -133,17 +164,7 @@ pub const NetlinkContext = struct {
         writer.writeStruct(request_header) catch unreachable;
         writer.writeStruct(request_payload) catch unreachable;
 
-        self.write_completion = xev.Completion{
-            .op = .{
-                .write = .{
-                    .fd = self.socket,
-                    .buffer = .{ .slice = stream.getWritten() },
-                },
-            },
-            .userdata = self,
-            .callback = writeCallback,
-        };
-        loop.add(&self.write_completion);
+        self.enqueueWrite(.{ .slice = stream.getWritten() }, loop);
         self.flags.multipart = false;
     }
 
@@ -170,17 +191,7 @@ pub const NetlinkContext = struct {
         writer.writeStruct(request_header) catch unreachable;
         writer.writeStruct(request_payload) catch unreachable;
 
-        self.write_completion = xev.Completion{
-            .op = .{
-                .write = .{
-                    .fd = self.socket,
-                    .buffer = .{ .slice = stream.getWritten() },
-                },
-            },
-            .userdata = self,
-            .callback = writeCallback,
-        };
-        loop.add(&self.write_completion);
+        self.enqueueWrite(.{ .slice = stream.getWritten() }, loop);
         self.flags.multipart = false;
     }
 

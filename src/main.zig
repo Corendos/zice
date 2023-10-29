@@ -3,9 +3,16 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const ztun = @import("ztun");
-const xev = @import("xev");
 
+pub const xev = if (builtin.os.tag == .linux)
+    switch (build_options.linux_backend) {
+        .io_uring => @import("xev").IO_Uring,
+        .epoll => @import("xev").Epoll,
+    }
+else
+    @import("xev");
 pub const net = @import("net.zig");
 pub const fmt = @import("fmt.zig");
 pub const platform = switch (builtin.os.tag) {
@@ -515,10 +522,7 @@ pub const Transaction = struct {
         self.timeout_timer.deinit();
     }
 
-    /// Start a transaction with the given retransmit timout and event-loop.
-    pub fn start(self: *Transaction, rto: u64, loop: *xev.Loop) void {
-        self.rto = rto;
-
+    fn enqueueWrite(self: *Transaction, loop: *xev.Loop) void {
         self.write_data.from(self.server_address, self.request_data);
 
         self.write_completion = xev.Completion{
@@ -532,7 +536,18 @@ pub const Transaction = struct {
             .userdata = self,
             .callback = writeCallback,
         };
+
+        if (xev.backend == .epoll) {
+            self.write_completion.flags.dup = true;
+        }
+
         loop.add(&self.write_completion);
+    }
+
+    /// Start a transaction with the given retransmit timout and event-loop.
+    pub fn start(self: *Transaction, rto: u64, loop: *xev.Loop) void {
+        self.rto = rto;
+        self.enqueueWrite(loop);
     }
 
     /// Cancel the transaction.
@@ -1348,6 +1363,7 @@ pub const AgentContext = struct {
         self.flags.stopped = true;
 
         for (self.socket_contexts) |*ctx| {
+            if (ctx.read_completion.state() == .dead) continue;
             ctx.read_cancel_completion = .{
                 .op = .{ .cancel = .{ .c = &ctx.read_completion } },
                 .userdata = self,
@@ -1365,23 +1381,27 @@ pub const AgentContext = struct {
             }
         }
 
-        self.gathering_main_timer.cancel(
-            self.loop,
-            &self.gathering_main_timer_completion,
-            &self.gathering_main_timer_cancel_completion,
-            AgentContext,
-            self,
-            mainTimerCancelCallback,
-        );
+        if (self.gathering_main_timer_completion.state() == .active) {
+            self.gathering_main_timer.cancel(
+                self.loop,
+                &self.gathering_main_timer_completion,
+                &self.gathering_main_timer_cancel_completion,
+                AgentContext,
+                self,
+                mainTimerCancelCallback,
+            );
+        }
 
-        self.connectivity_checks_timer.cancel(
-            self.loop,
-            &self.connectivity_checks_timer_completion,
-            &self.connectivity_checks_timer_cancel_completion,
-            AgentContext,
-            self,
-            connectivityCheckTimerCancelCallback,
-        );
+        if (self.connectivity_checks_timer_completion.state() == .active) {
+            self.connectivity_checks_timer.cancel(
+                self.loop,
+                &self.connectivity_checks_timer_completion,
+                &self.connectivity_checks_timer_cancel_completion,
+                AgentContext,
+                self,
+                connectivityCheckTimerCancelCallback,
+            );
+        }
     }
 
     /// Returns true if the agent is done with all potential ongoing operations.
@@ -1540,6 +1560,12 @@ pub const AgentContext = struct {
                     }
                 }).callback,
             };
+
+            // TODO(Corendos): hide implementation details
+            if (xev.backend == .epoll) {
+                parameters.write_completion.flags.dup = true;
+            }
+
             self.loop.add(&parameters.write_completion);
         } else {
             completion.callback(completion.userdata, ContextResult{ .send = error.NotReady });
@@ -2135,6 +2161,12 @@ pub const AgentContext = struct {
             .userdata = self,
             .callback = readCallback,
         };
+
+        // TODO(Corendos): Hide implementation details
+        if (xev.backend == .epoll) {
+            socket_context.read_completion.flags.dup = true;
+        }
+
         self.loop.add(&socket_context.read_completion);
 
         log.debug("Agent {} - Starting transaction for base address \"{}\"", .{ self.id, socket_context.address });
@@ -2356,6 +2388,12 @@ pub const AgentContext = struct {
             .userdata = self,
             .callback = connectivityCheckResponseWriteCallback,
         };
+
+        // TODO(Corendos): Hide implementation details
+        if (xev.backend == .epoll) {
+            self.check_response_queue_write_completion = true;
+        }
+
         self.loop.add(&self.check_response_queue_write_completion);
     }
 
@@ -3405,6 +3443,10 @@ pub const Context = struct {
 
             break :b self.flags.stopped;
         };
+
+        if (stopped) {
+            self.netlink_context.stop(&self.loop);
+        }
 
         return if (stopped) .disarm else .rearm;
     }

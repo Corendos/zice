@@ -3,7 +3,18 @@
 
 const std = @import("std");
 
-pub fn buildSamples(b: *std.build.Builder, sample_utils_module: *std.Build.Module, xev_module: *std.Build.Module, optimize: std.builtin.Mode, target: std.zig.CrossTarget) !void {
+const LinuxBackend = enum {
+    io_uring,
+    epoll,
+};
+
+pub fn buildSamples(
+    b: *std.build.Builder,
+    sample_utils_module: *std.Build.Module,
+    xev_module: *std.Build.Module,
+    optimize: std.builtin.Mode,
+    target: std.zig.CrossTarget,
+) !void {
     _ = xev_module;
     var arena_state = std.heap.ArenaAllocator.init(b.allocator);
     defer arena_state.deinit();
@@ -54,6 +65,8 @@ pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const linux_backend = b.option(LinuxBackend, "linux_backend", "The backend to use for libxev on Linux") orelse .io_uring;
+
     const ztun_module = b.dependency("ztun", .{
         .target = target,
         .optimize = optimize,
@@ -63,11 +76,15 @@ pub fn build(b: *std.build.Builder) void {
         .optimize = optimize,
     }).module("xev");
 
+    const options = b.addOptions();
+    options.addOption(LinuxBackend, "linux_backend", linux_backend);
+
     _ = b.addModule("zice", std.Build.CreateModuleOptions{
         .source_file = .{ .path = thisDir() ++ "/src/main.zig" },
         .dependencies = &.{
             .{ .name = "ztun", .module = ztun_module },
             .{ .name = "xev", .module = xev_module },
+            .{ .name = "build_options", .module = options.createModule() },
         },
     });
 
