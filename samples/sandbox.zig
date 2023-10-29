@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
-const xev = @import("xev");
+const xev = zice.xev;
 const zice = @import("zice");
 const utils = @import("utils");
 

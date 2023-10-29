@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
-const xev = @import("xev");
 
 const zice = @import("main.zig");
+const xev = zice.xev;
 const netlink = @import("zice/linux.zig").netlink;
 
 const NetlinkContextState = enum(u2) {

@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
-const xev = @import("xev");
 
 const zice = @import("../../main.zig");
 const net = zice.net;
+const xev = zice.xev;
 const linux = std.os.linux;
 
 // From rtnetlink.h

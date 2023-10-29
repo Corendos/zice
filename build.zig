@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub fn buildSamples(b: *std.build.Builder, sample_utils_module: *std.Build.Module, xev_module: *std.Build.Module, optimize: std.builtin.Mode, target: std.zig.CrossTarget) !void {
+    _ = xev_module;
     var arena_state = std.heap.ArenaAllocator.init(b.allocator);
     defer arena_state.deinit();
 
@@ -27,7 +28,7 @@ pub fn buildSamples(b: *std.build.Builder, sample_utils_module: *std.Build.Modul
             .optimize = optimize,
         });
         executable.addModule("zice", b.modules.get("zice").?);
-        executable.addModule("xev", xev_module);
+        executable.addModule("websocket", b.dependency("websocket", .{ .target = target, .optimize = optimize }).module("websocket"));
         executable.addModule("utils", sample_utils_module);
         const install_executable = b.addInstallArtifact(executable, .{});
 
@@ -90,7 +91,7 @@ pub fn build(b: *std.build.Builder) void {
     const sample_utils_module = b.createModule(.{
         .source_file = .{ .path = thisDir() ++ "/samples/utils/main.zig" },
         .dependencies = &.{
-            .{ .name = "xev", .module = xev_module },
+            .{ .name = "zice", .module = b.modules.get("zice").? },
         },
     });
     buildSamples(b, sample_utils_module, xev_module, optimize, target) catch unreachable;

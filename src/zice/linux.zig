@@ -3,10 +3,10 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const xev = @import("xev");
 
 pub const netlink = @import("linux/netlink.zig");
 const zice = @import("../main.zig");
+const xev = zice.xev;
 const net = zice.net;
 
 test {
