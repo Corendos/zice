@@ -27,6 +27,7 @@ pub const OrderedBoundedArray = @import("ordered_array.zig").OrderedBoundedArray
 pub const GenerationId = @import("generation_id.zig").GenerationId;
 const NetlinkContext = @import("netlink.zig").NetlinkContext;
 pub const Intrusive = @import("queue.zig").Intrusive;
+pub const Future = @import("future.zig").Future;
 
 const log = std.log.scoped(.zice);
 
@@ -3021,18 +3022,22 @@ const ConnectivityCheckEventResult = union(enum) {
 };
 
 pub const ContextOperationType = enum {
+    create_agent,
+    delete_agent,
     gather_candidates,
     set_remote_candidates,
     send,
 };
 
 pub const RemoteCandidateParameters = struct {
-    candidates: []Candidate,
+    agent_id: AgentId = undefined,
+    candidates: []const Candidate,
     username_fragment: [8]u8,
     password: [24]u8,
 };
 
 pub const SendParameters = struct {
+    agent_id: AgentId,
     data_stream_id: u8,
     component_id: u8,
     data: []const u8,
@@ -3042,7 +3047,9 @@ pub const SendParameters = struct {
 };
 
 pub const ContextOperation = union(ContextOperationType) {
-    gather_candidates: void,
+    create_agent: CreateAgentOptions,
+    delete_agent: AgentId,
+    gather_candidates: AgentId,
     set_remote_candidates: RemoteCandidateParameters,
     send: SendParameters,
 };
@@ -3055,7 +3062,13 @@ pub const SendError = xev.WriteError || InvalidError || error{
     NotReady,
 };
 
+pub const CreateAgentError = error{ NoSlotAvailable, Canceled, Unexpected };
+
+pub const DeleteAgentError = InvalidError || error{ Canceled, Unexpected };
+
 pub const ContextResult = union(ContextOperationType) {
+    create_agent: CreateAgentError!AgentId,
+    delete_agent: DeleteAgentError!void,
     gather_candidates: InvalidError!void,
     set_remote_candidates: InvalidError!void,
     send: SendError!usize,
@@ -3065,7 +3078,6 @@ pub const ContextCallback = *const fn (userdata: ?*anyopaque, result: ContextRes
 pub fn noopCallback(_: ?*anyopaque, _: ContextResult) void {}
 
 pub const ContextCompletion = struct {
-    agent_id: AgentId,
     op: ContextOperation = undefined,
 
     userdata: ?*anyopaque = null,
@@ -3096,7 +3108,6 @@ pub const Context = struct {
 
     string_storage: std.heap.ArenaAllocator,
 
-    agent_context_entries_mutex: std.Thread.Mutex = .{},
     agent_context_entries: [context_agent_slot_count]AgentContextEntry,
 
     netlink_context: NetlinkContext,
@@ -3132,8 +3143,6 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
-        self.agent_context_entries_mutex.lock();
-        defer self.agent_context_entries_mutex.unlock();
         for (&self.agent_context_entries) |*entry| {
             if (entry.agent_context) |*agent_context| agent_context.deinit();
         }
@@ -3272,27 +3281,42 @@ pub const Context = struct {
         return if (entry.agent_context) |*agent_context| agent_context else error.InvalidId;
     }
 
-    pub fn createAgent(self: *Context, options: CreateAgentOptions) !AgentId {
-        self.agent_context_entries_mutex.lock();
-        defer self.agent_context_entries_mutex.unlock();
-
-        const unused_entry: *AgentContextEntry = for (&self.agent_context_entries) |*entry| {
-            if (entry.agent_context == null) break entry;
-        } else return error.NoSlotAvailable;
-
-        unused_entry.agent_context = try AgentContext.init(self, unused_entry.agent_id, &self.loop, options, self.allocator);
-
-        return unused_entry.agent_id;
+    fn createAgentCallback(userdata: ?*anyopaque, result: ContextResult) void {
+        var f: *Future(CreateAgentError!AgentId) = @ptrCast(@alignCast(userdata.?));
+        f.set(result.create_agent);
     }
 
-    pub fn deleteAgent(self: *Context, agent_id: AgentId) !void {
-        self.agent_context_entries_mutex.lock();
-        defer self.agent_context_entries_mutex.unlock();
+    pub fn createAgent(self: *Context, options: CreateAgentOptions) CreateAgentError!AgentId {
+        var f = Future(CreateAgentError!AgentId){};
+        var c = ContextCompletion{
+            .op = .{ .create_agent = options },
+            .userdata = &f,
+            .callback = createAgentCallback,
+        };
 
-        const entry = try self.getAgentEntry(agent_id);
-        if (entry.agent_context == null or entry.flags.deleted) return error.InvalidId;
-        entry.flags.deleted = true;
-        try self.async_handle.notify();
+        self.addCompletion(&c);
+        self.submitCompletions() catch return error.Unexpected;
+
+        return f.get();
+    }
+
+    fn deleteAgentCallback(userdata: ?*anyopaque, result: ContextResult) void {
+        var f: *Future(DeleteAgentError!void) = @ptrCast(@alignCast(userdata.?));
+        f.set(result.delete_agent);
+    }
+
+    pub fn deleteAgent(self: *Context, agent_id: AgentId) DeleteAgentError!void {
+        var f = Future(DeleteAgentError!void){};
+        var c = ContextCompletion{
+            .op = .{ .delete_agent = agent_id },
+            .userdata = &f,
+            .callback = deleteAgentCallback,
+        };
+
+        self.addCompletion(&c);
+        self.submitCompletions() catch return error.Unexpected;
+
+        return f.get();
     }
 
     fn addCompletion(self: *Context, c: *ContextCompletion) void {
@@ -3307,8 +3331,7 @@ pub const Context = struct {
 
     pub fn gatherCandidates(self: *Context, agent_id: AgentId, c: *ContextCompletion, userdata: ?*anyopaque, callback: ContextCallback) !void {
         c.* = ContextCompletion{
-            .agent_id = agent_id,
-            .op = .{ .gather_candidates = {} },
+            .op = .{ .gather_candidates = agent_id },
             .userdata = userdata,
             .callback = callback,
         };
@@ -3318,9 +3341,12 @@ pub const Context = struct {
     }
 
     pub fn setRemoteCandidates(self: *Context, agent_id: AgentId, c: *ContextCompletion, parameters: RemoteCandidateParameters, userdata: ?*anyopaque, callback: ContextCallback) !void {
+        // TODO(Corendos): Improve that
+        var parameters_copy = parameters;
+        parameters_copy.agent_id = agent_id;
+
         c.* = ContextCompletion{
-            .agent_id = agent_id,
-            .op = .{ .set_remote_candidates = parameters },
+            .op = .{ .set_remote_candidates = parameters_copy },
             .userdata = userdata,
             .callback = callback,
         };
@@ -3331,8 +3357,8 @@ pub const Context = struct {
 
     pub fn send(self: *Context, agent_id: AgentId, c: *ContextCompletion, data_stream_id: u8, component_id: u8, data: []const u8, userdata: ?*anyopaque, callback: ContextCallback) !void {
         c.* = ContextCompletion{
-            .agent_id = agent_id,
             .op = .{ .send = SendParameters{
+                .agent_id = agent_id,
                 .data_stream_id = data_stream_id,
                 .component_id = component_id,
                 .data = data,
@@ -3366,6 +3392,24 @@ pub const Context = struct {
         return try address_list.toOwnedSlice();
     }
 
+    fn handleCreateAgent(self: *Context, options: CreateAgentOptions) CreateAgentError!AgentId {
+        const unused_entry: *AgentContextEntry = for (&self.agent_context_entries) |*entry| {
+            if (entry.agent_context == null) break entry;
+        } else return error.NoSlotAvailable;
+
+        // TODO(Corendos): Improve returned error.
+        unused_entry.agent_context = AgentContext.init(self, unused_entry.agent_id, &self.loop, options, self.allocator) catch return error.Unexpected;
+
+        return unused_entry.agent_id;
+    }
+
+    fn handleDeleteAgent(self: *Context, agent_id: AgentId) DeleteAgentError!void {
+        const entry = try self.getAgentEntry(agent_id);
+        if (entry.agent_context == null or entry.flags.deleted) return error.InvalidId;
+        entry.flags.deleted = true;
+        entry.agent_context.?.stop();
+    }
+
     fn asyncCallback(
         userdata: ?*Context,
         loop: *xev.Loop,
@@ -3377,15 +3421,11 @@ pub const Context = struct {
         const self = userdata.?;
 
         for (&self.agent_context_entries) |*entry| {
-            if (entry.flags.deleted) {
-                if (entry.agent_context.?.done()) {
-                    entry.agent_context.?.deinit();
-                    entry.flags.deleted = false;
-                    entry.agent_id.bump();
-                    entry.agent_context = null;
-                } else {
-                    entry.agent_context.?.stop();
-                }
+            if (entry.flags.deleted and entry.agent_context.?.done()) {
+                entry.agent_context.?.deinit();
+                entry.flags.deleted = false;
+                entry.agent_id.bump();
+                entry.agent_context = null;
             }
         }
 
@@ -3402,12 +3442,22 @@ pub const Context = struct {
         while (local_queue.pop()) |c| {
             log.debug("Processing {s}", .{@tagName(c.op)});
             switch (c.op) {
-                .gather_candidates => {
+                .create_agent => |options| {
+                    const create_agent_result = self.handleCreateAgent(options);
+
+                    c.callback(c.userdata, ContextResult{ .create_agent = create_agent_result });
+                },
+                .delete_agent => |agent_id| {
+                    const delete_agent_result = self.handleDeleteAgent(agent_id);
+
+                    c.callback(c.userdata, ContextResult{ .delete_agent = delete_agent_result });
+                },
+                .gather_candidates => |agent_id| {
                     if (!self.netlink_context_ready) {
                         to_reenqueue.push(c);
                         continue;
                     }
-                    const gather_result = if (self.getAgentContext(c.agent_id)) |agent_context| b: {
+                    const gather_result = if (self.getAgentContext(agent_id)) |agent_context| b: {
                         agent_context.processGatherCandidates() catch unreachable;
                         break :b {};
                     } else |err| err;
@@ -3415,15 +3465,15 @@ pub const Context = struct {
                     c.callback(c.userdata, ContextResult{ .gather_candidates = gather_result });
                 },
                 .set_remote_candidates => |parameters| {
-                    const set_remote_candidates_result = if (self.getAgentContext(c.agent_id)) |agent_context| b: {
+                    const set_remote_candidates_result = if (self.getAgentContext(parameters.agent_id)) |agent_context| b: {
                         agent_context.processSetRemoteCandidates(parameters) catch unreachable;
                         break :b {};
                     } else |err| err;
 
                     c.callback(c.userdata, ContextResult{ .set_remote_candidates = set_remote_candidates_result });
                 },
-                .send => {
-                    if (self.getAgentContext(c.agent_id)) |agent_context| b: {
+                .send => |parameters| {
+                    if (self.getAgentContext(parameters.agent_id)) |agent_context| b: {
                         agent_context.processSend(c) catch unreachable;
                         break :b {};
                     } else |err| c.callback(c.userdata, ContextResult{ .send = err });

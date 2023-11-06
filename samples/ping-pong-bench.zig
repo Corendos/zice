@@ -381,6 +381,15 @@ pub fn main() !void {
     var zice_context = try zice.Context.init(allocator);
     defer zice_context.deinit();
 
+    context.zice_context = &zice_context;
+
+    var t = try std.Thread.spawn(.{}, (struct {
+        pub fn f(inner_context: *Context) !void {
+            try inner_context.zice_context.?.run();
+        }
+    }).f, .{&context});
+    defer t.join();
+
     const controlling_agent = try zice_context.createAgent(.{
         .userdata = &context,
         .on_candidate_callback = controllingCandidateCallback,
@@ -395,16 +404,8 @@ pub fn main() !void {
         .on_data_callback = controlledDataCallback,
     });
 
-    context.zice_context = &zice_context;
     context.controlling_agent_data = try AgentData.init(controlling_agent, allocator);
     context.controlled_agent_data = try AgentData.init(controlled_agent, allocator);
-
-    var t = try std.Thread.spawn(.{}, (struct {
-        pub fn f(inner_context: *Context) !void {
-            try inner_context.zice_context.?.run();
-        }
-    }).f, .{&context});
-    defer t.join();
 
     var gather_completion: zice.ContextCompletion = undefined;
     try zice_context.gatherCandidates(controlling_agent, &gather_completion, null, gatherCandidateCallback);

@@ -164,18 +164,18 @@ pub fn main() !void {
 
     context.zice_context = &zice_context;
 
-    const agent_ids = try createAgents(&zice_context, &context);
-    context.agent_data[0] = try AgentData.init(agent_ids[0], allocator);
-    defer context.agent_data[0].deinit();
-    context.agent_data[1] = try AgentData.init(agent_ids[1], allocator);
-    defer context.agent_data[1].deinit();
-
     var t = try std.Thread.spawn(.{}, (struct {
         pub fn f(inner_context: *Context) !void {
             try inner_context.zice_context.?.run();
         }
     }).f, .{&context});
     defer t.join();
+
+    const agent_ids = try createAgents(&zice_context, &context);
+    context.agent_data[0] = try AgentData.init(agent_ids[0], allocator);
+    defer context.agent_data[0].deinit();
+    context.agent_data[1] = try AgentData.init(agent_ids[1], allocator);
+    defer context.agent_data[1].deinit();
 
     var gather_completion_1: zice.ContextCompletion = undefined;
     try zice_context.gatherCandidates(context.agent_data[0].id, &gather_completion_1, null, gatherCandidateCallback);
