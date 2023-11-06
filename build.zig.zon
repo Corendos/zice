@@ -11,5 +11,9 @@
             .url = "https://github.com/mitchellh/libxev/archive/5ecbc87.tar.gz",
             .hash = "1220416854e424601ecc9814afb461a5dc9cf95db5917d82f794594a58ffc723b82c",
         },
+        .websocket = .{
+            .url = "https://github.com/karlseguin/websocket.zig/archive/e576bff2e45546d0ec1935f85ab8267eebdf48e1.tar.gz",
+            .hash = "12204577a96a2e1853b96ea10c1c3787e3f4523e7b6aa89ef78041459261f97a6cc1",
+        },
     },
 }

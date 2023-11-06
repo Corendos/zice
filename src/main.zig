@@ -19,6 +19,9 @@ pub const platform = switch (builtin.os.tag) {
     .linux => @import("zice/linux.zig"),
     else => @compileError("\"" ++ @tagName(builtin.os.tag) ++ "\" platform not supported"),
 };
+pub const sdp = @import("sdp.zig");
+
+const utils = @import("utils.zig");
 
 pub const DoublyLinkedList = @import("doubly_linked_list.zig").DoublyLinkedList;
 pub const CircularBuffer = @import("circular_buffer.zig").CircularBuffer;
@@ -60,6 +63,19 @@ pub const CandidateType = enum(u2) {
             .peer_reflexive => "prflx",
             .relay => "relay",
         };
+    }
+
+    pub inline fn fromString(value: []const u8) ?CandidateType {
+        return if (std.mem.eql(u8, value, "host"))
+            .host
+        else if (std.mem.eql(u8, value, "srflx"))
+            .server_reflexive
+        else if (std.mem.eql(u8, value, "prflx"))
+            .peer_reflexive
+        else if (std.mem.eql(u8, value, "relay"))
+            .relay
+        else
+            null;
     }
 };
 
@@ -1059,7 +1075,11 @@ const Checklist = struct {
     /// Sets the state of the candidate pair to the given state.
     pub fn setPairState(self: *Checklist, candidate_pair: CandidatePair, state: CandidatePairState) void {
         const entry = self.getEntry(candidate_pair) orelse @panic("TODO: Unknown candidate pair");
-        entry.data.state = state;
+        const old_state = entry.data.state;
+        if (state != old_state) {
+            log.debug("Pair {}:{} state changed from \"{s}\" to \"{s}\"", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, @tagName(old_state), @tagName(state) });
+            entry.data.state = state;
+        }
     }
 
     /// Updates the checklist state from the state of each candidate pair.
@@ -1752,51 +1772,51 @@ pub const AgentContext = struct {
         });
 
         // Replace reflexive candidate with their base as per https://www.rfc-editor.org/rfc/rfc8445#section-6.1.2.4.
-        for (pair_list.items) |*candidate_pair| {
-            const local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
+        //for (pair_list.items) |*candidate_pair| {
+        //    const local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
 
-            if (local_candidate.type == .server_reflexive) {
-                const new_local_candidate_index = for (self.local_candidates.items, 0..) |*c, i| {
-                    if (c.type == .host and c.transport_address.eql(local_candidate.base_address)) break i;
-                } else unreachable;
-                candidate_pair.local_candidate_index = new_local_candidate_index;
-            }
-        }
+        //    if (local_candidate.type == .server_reflexive) {
+        //        const new_local_candidate_index = for (self.local_candidates.items, 0..) |*c, i| {
+        //            if (c.type == .host and c.transport_address.eql(local_candidate.base_address)) break i;
+        //        } else unreachable;
+        //        candidate_pair.local_candidate_index = new_local_candidate_index;
+        //    }
+        //}
 
         // Remove redundant pairs as per https://www.rfc-editor.org/rfc/rfc8445#section-6.1.2.4.
-        var current_index: usize = 0;
-        while (current_index < pair_list.items.len - 1) : (current_index += 1) {
-            const current_candidate_pair = pair_list.items[current_index];
-            const current_candidate_pair_priority = computePairPriority(self.local_candidates.items[current_candidate_pair.local_candidate_index].priority, self.remote_candidates.items[current_candidate_pair.remote_candidate_index].priority, self.role.?);
+        //var current_index: usize = 0;
+        //while (current_index < pair_list.items.len - 1) : (current_index += 1) {
+        //    const current_candidate_pair = pair_list.items[current_index];
+        //    const current_candidate_pair_priority = computePairPriority(self.local_candidates.items[current_candidate_pair.local_candidate_index].priority, self.remote_candidates.items[current_candidate_pair.remote_candidate_index].priority, self.role.?);
 
-            const current_local_candidate_index = current_candidate_pair.local_candidate_index;
-            const current_local_candidate = self.local_candidates.items[current_local_candidate_index];
-            const current_remote_candidate_index = current_candidate_pair.remote_candidate_index;
+        //    const current_local_candidate_index = current_candidate_pair.local_candidate_index;
+        //    const current_local_candidate = self.local_candidates.items[current_local_candidate_index];
+        //    const current_remote_candidate_index = current_candidate_pair.remote_candidate_index;
 
-            var other_index: usize = current_index + 1;
-            while (other_index < pair_list.items.len) {
-                const other_candidate_pair = pair_list.items[other_index];
-                const other_candidate_pair_priority = computePairPriority(self.local_candidates.items[other_candidate_pair.local_candidate_index].priority, self.remote_candidates.items[other_candidate_pair.remote_candidate_index].priority, self.role.?);
-                const other_local_candidate_index = other_candidate_pair.local_candidate_index;
-                const other_local_candidate = self.local_candidates.items[other_local_candidate_index];
-                const other_remote_candidate_index = other_candidate_pair.remote_candidate_index;
+        //    var other_index: usize = current_index + 1;
+        //    while (other_index < pair_list.items.len) {
+        //        const other_candidate_pair = pair_list.items[other_index];
+        //        const other_candidate_pair_priority = computePairPriority(self.local_candidates.items[other_candidate_pair.local_candidate_index].priority, self.remote_candidates.items[other_candidate_pair.remote_candidate_index].priority, self.role.?);
+        //        const other_local_candidate_index = other_candidate_pair.local_candidate_index;
+        //        const other_local_candidate = self.local_candidates.items[other_local_candidate_index];
+        //        const other_remote_candidate_index = other_candidate_pair.remote_candidate_index;
 
-                const have_same_local_candidate_base = std.net.Address.eql(current_local_candidate.base_address, other_local_candidate.base_address);
-                const have_same_remote_candidate = current_remote_candidate_index == other_remote_candidate_index;
+        //        const have_same_local_candidate_base = std.net.Address.eql(current_local_candidate.base_address, other_local_candidate.base_address);
+        //        const have_same_remote_candidate = current_remote_candidate_index == other_remote_candidate_index;
 
-                if (have_same_local_candidate_base and have_same_remote_candidate) {
-                    // The list should already be ordered. Otherwise, something is wrong.
-                    std.debug.assert(current_candidate_pair_priority >= other_candidate_pair_priority);
+        //        if (have_same_local_candidate_base and have_same_remote_candidate) {
+        //            // The list should already be ordered. Otherwise, something is wrong.
+        //            std.debug.assert(current_candidate_pair_priority >= other_candidate_pair_priority);
 
-                    // Remove lower priority redundant pairs but keep ordering.
-                    _ = pair_list.orderedRemove(other_index);
+        //            // Remove lower priority redundant pairs but keep ordering.
+        //            _ = pair_list.orderedRemove(other_index);
 
-                    continue;
-                }
+        //            continue;
+        //        }
 
-                other_index += 1;
-            }
-        }
+        //        other_index += 1;
+        //    }
+        //}
 
         if (pair_list.items.len > Configuration.candidate_pair_limit) {
             try pair_list.resize(Configuration.candidate_pair_limit);
@@ -1925,6 +1945,7 @@ pub const AgentContext = struct {
 
     pub fn handleNomination(self: *AgentContext, candidate_pair: CandidatePair, loop: *xev.Loop) void {
         const nominated_entry = self.checklist.getValidEntry(candidate_pair) orelse @panic("TODO: Nominated a candidate pair that is not in the valid list yet");
+        log.debug("Agent {} - Candidate pair {}:{} nominated", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
         nominated_entry.data.nominated = true;
 
         const valid_local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
@@ -1974,6 +1995,7 @@ pub const AgentContext = struct {
     pub inline fn setState(self: *AgentContext, new_state: AgentState) void {
         const old_state = self.state;
         if (new_state != old_state) {
+            log.debug("Agent {} - State changed from \"{s}\" to \"{s}\"", .{ self.id, @tagName(old_state), @tagName(new_state) });
             self.state = new_state;
             self.on_state_change_callback(self.userdata, self, new_state);
         }
@@ -2003,7 +2025,6 @@ pub const AgentContext = struct {
         if (!self.isGatheringDone()) return;
 
         self.gathering_state = .done;
-        self.on_candidate_callback(self.userdata, self, .{ .done = {} });
 
         self.computePriorities();
         self.removeRedundantCandidates();
@@ -2015,6 +2036,8 @@ pub const AgentContext = struct {
                 break;
             }
         }
+
+        self.on_candidate_callback(self.userdata, self, .{ .done = {} });
 
         if (self.has_remote_candidates) {
             self.startChecks();
@@ -2222,8 +2245,8 @@ pub const AgentContext = struct {
         }
 
         if (result == .request_read or result == .completed) {
-            self.printPairStates();
-            self.printValidList();
+            //self.printPairStates();
+            //self.printValidList();
         }
 
         // TODO(Corendos): handle multiple checklists.
@@ -2392,7 +2415,7 @@ pub const AgentContext = struct {
 
         // TODO(Corendos): Hide implementation details
         if (xev.backend == .epoll) {
-            self.check_response_queue_write_completion = true;
+            self.check_response_queue_write_completion.flags.dup = true;
         }
 
         self.loop.add(&self.check_response_queue_write_completion);
@@ -2625,6 +2648,10 @@ pub const AgentContext = struct {
     }
 
     inline fn areTransportAddressesSymmetric(request_source: std.net.Address, request_destination: std.net.Address, response_source: std.net.Address, response_destination: std.net.Address) bool {
+        std.log.debug("request_source: {}", .{request_source});
+        std.log.debug("request_destination: {}", .{request_destination});
+        std.log.debug("response_source: {}", .{response_source});
+        std.log.debug("response_destination: {}", .{response_destination});
         return response_source.eql(request_destination) and response_destination.eql(request_source);
     }
 
@@ -2655,7 +2682,7 @@ pub const AgentContext = struct {
         // TODO(Corendos): implement peer-reflexive candidates handling here.
 
         // Constructing a Valid Pair
-        const valid_candidate_pair = self.constructValidPair(candidate_pair, mapped_address, remote_candidate.transport_address);
+        const valid_candidate_pair = self.constructValidPair(mapped_address, remote_candidate.transport_address);
 
         // Add the valid pair to the valid list if needed.
         if (valid_candidate_pair.eql(candidate_pair) or self.checklist.containsPair(valid_candidate_pair)) {
@@ -3187,7 +3214,6 @@ pub const Context = struct {
         if (self.flags.stopped) return;
 
         self.flags.stopped = true;
-        self.netlink_context.stop(&self.loop);
         self.async_handle.notify() catch unreachable;
     }
 
