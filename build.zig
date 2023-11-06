@@ -79,12 +79,14 @@ pub fn build(b: *std.build.Builder) void {
     const options = b.addOptions();
     options.addOption(LinuxBackend, "linux_backend", linux_backend);
 
+    const options_module = options.createModule();
+
     _ = b.addModule("zice", std.Build.CreateModuleOptions{
         .source_file = .{ .path = thisDir() ++ "/src/main.zig" },
         .dependencies = &.{
             .{ .name = "ztun", .module = ztun_module },
             .{ .name = "xev", .module = xev_module },
-            .{ .name = "build_options", .module = options.createModule() },
+            .{ .name = "build_options", .module = options_module },
         },
     });
 
@@ -96,6 +98,7 @@ pub fn build(b: *std.build.Builder) void {
     });
     main_tests.addModule("ztun", ztun_module);
     main_tests.addModule("xev", xev_module);
+    main_tests.addModule("build_options", options_module);
 
     const install_tests = b.addInstallArtifact(main_tests, .{});
 
