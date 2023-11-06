@@ -10,22 +10,22 @@ pub usingnamespace switch (builtin.os.tag) {
 };
 
 pub inline fn isLinkLocalIpv6(address: std.net.Ip6Address) bool {
-    const addr = std.mem.readIntSliceBig(u128, &address.sa.addr);
+    const addr = std.mem.readInt(u128, &address.sa.addr, .big);
     return (addr & 0xFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000) == 0xfe80_0000_0000_0000_0000_0000_0000_0000;
 }
 
 pub inline fn isSiteLocalIpv6(address: std.net.Ip6Address) bool {
-    const addr = std.mem.readIntSliceBig(u128, &address.sa.addr);
+    const addr = std.mem.readInt(u128, &address.sa.addr, .big);
     return (addr & 0xFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000) == 0xfec0_0000_0000_0000_0000_0000_0000_0000;
 }
 
 pub inline fn isIpv4CompatibleIpv6(address: std.net.Ip6Address) bool {
-    const addr = std.mem.readIntSliceBig(u128, &address.sa.addr);
+    const addr = std.mem.readInt(u128, &address.sa.addr, .big);
     return (addr & 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_0000_0000) == 0x0;
 }
 
 pub inline fn isIpv4MappedIpv6(address: std.net.Ip6Address) bool {
-    const addr = std.mem.readIntSliceBig(u128, &address.sa.addr);
+    const addr = std.mem.readInt(u128, &address.sa.addr, .big);
     return (addr & 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_0000_0000) == 0x0000_0000_0000_0000_0000_ffff_0000_0000;
 }
 

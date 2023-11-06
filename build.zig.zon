@@ -4,8 +4,8 @@
     .paths = .{ "src" },
     .dependencies = .{
         .ztun = .{
-            .url = "https://github.com/Corendos/ztun/archive/cba495083df623e97f324c69182d2c16c147d577.tar.gz",
-            .hash = "122038c4c3fad5ef85c82d6a62af7595f2042b589395809daeb415c198ba51ae9795",
+            .url = "https://github.com/Corendos/ztun/archive/ae27d7060f5cdf906d741cb0f51ddb1f2ad8459c.tar.gz",
+            .hash = "1220319886ce078416255b17e06973a2948a756ab495c12875901d1085cc51e2fb40",
         },
         .libxev = .{
             .url = "https://github.com/mitchellh/libxev/archive/5ecbc87.tar.gz",
