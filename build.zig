@@ -39,7 +39,6 @@ pub fn buildSamples(
             .optimize = optimize,
         });
         executable.addModule("zice", b.modules.get("zice").?);
-        executable.addModule("websocket", b.dependency("websocket", .{ .target = target, .optimize = optimize }).module("websocket"));
         executable.addModule("utils", sample_utils_module);
         const install_executable = b.addInstallArtifact(executable, .{});
 

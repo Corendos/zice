@@ -1059,7 +1059,11 @@ const Checklist = struct {
     /// Sets the state of the candidate pair to the given state.
     pub fn setPairState(self: *Checklist, candidate_pair: CandidatePair, state: CandidatePairState) void {
         const entry = self.getEntry(candidate_pair) orelse @panic("TODO: Unknown candidate pair");
-        entry.data.state = state;
+        const old_state = entry.data.state;
+        if (state != old_state) {
+            log.debug("Pair {}:{} state changed from \"{s}\" to \"{s}\"", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, @tagName(old_state), @tagName(state) });
+            entry.data.state = state;
+        }
     }
 
     /// Updates the checklist state from the state of each candidate pair.
@@ -1925,6 +1929,7 @@ pub const AgentContext = struct {
 
     pub fn handleNomination(self: *AgentContext, candidate_pair: CandidatePair, loop: *xev.Loop) void {
         const nominated_entry = self.checklist.getValidEntry(candidate_pair) orelse @panic("TODO: Nominated a candidate pair that is not in the valid list yet");
+        log.debug("Agent {} - Candidate pair {}:{} nominated", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
         nominated_entry.data.nominated = true;
 
         const valid_local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
@@ -1974,6 +1979,7 @@ pub const AgentContext = struct {
     pub inline fn setState(self: *AgentContext, new_state: AgentState) void {
         const old_state = self.state;
         if (new_state != old_state) {
+            log.debug("Agent {} - State changed from \"{s}\" to \"{s}\"", .{ self.id, @tagName(old_state), @tagName(new_state) });
             self.state = new_state;
             self.on_state_change_callback(self.userdata, self, new_state);
         }
@@ -2003,7 +2009,6 @@ pub const AgentContext = struct {
         if (!self.isGatheringDone()) return;
 
         self.gathering_state = .done;
-        self.on_candidate_callback(self.userdata, self, .{ .done = {} });
 
         self.computePriorities();
         self.removeRedundantCandidates();
@@ -2015,6 +2020,8 @@ pub const AgentContext = struct {
                 break;
             }
         }
+
+        self.on_candidate_callback(self.userdata, self, .{ .done = {} });
 
         if (self.has_remote_candidates) {
             self.startChecks();
@@ -2392,7 +2399,7 @@ pub const AgentContext = struct {
 
         // TODO(Corendos): Hide implementation details
         if (xev.backend == .epoll) {
-            self.check_response_queue_write_completion = true;
+            self.check_response_queue_write_completion.flags.dup = true;
         }
 
         self.loop.add(&self.check_response_queue_write_completion);
@@ -2655,7 +2662,7 @@ pub const AgentContext = struct {
         // TODO(Corendos): implement peer-reflexive candidates handling here.
 
         // Constructing a Valid Pair
-        const valid_candidate_pair = self.constructValidPair(candidate_pair, mapped_address, remote_candidate.transport_address);
+        const valid_candidate_pair = self.constructValidPair(mapped_address, remote_candidate.transport_address);
 
         // Add the valid pair to the valid list if needed.
         if (valid_candidate_pair.eql(candidate_pair) or self.checklist.containsPair(valid_candidate_pair)) {
@@ -3187,7 +3194,6 @@ pub const Context = struct {
         if (self.flags.stopped) return;
 
         self.flags.stopped = true;
-        self.netlink_context.stop(&self.loop);
         self.async_handle.notify() catch unreachable;
     }
 
