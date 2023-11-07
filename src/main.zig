@@ -183,23 +183,25 @@ fn makeBasicBindingRequest(allocator: std.mem.Allocator, transaction_id: ?u96) !
 
 /// Make the username used in STUN transaction from local and remote fragments.
 fn makeUsername(
-    local_username_fragment: [8]u8,
-    remote_username_fragment: [8]u8,
-) [17]u8 {
-    var result: [17]u8 = undefined;
+    local_username_fragment: []const u8,
+    remote_username_fragment: []const u8,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    var result = try allocator.alloc(u8, local_username_fragment.len + remote_username_fragment.len + 1);
+    errdefer allocator.free(result);
 
-    @memcpy(result[0..8], &local_username_fragment);
-    result[8] = ':';
-    @memcpy(result[9..17], &remote_username_fragment);
+    @memcpy(result[0..local_username_fragment.len], local_username_fragment);
+    result[local_username_fragment.len] = ':';
+    @memcpy(result[local_username_fragment.len + 1 ..], remote_username_fragment);
 
     return result;
 }
 
 /// Convenience to build a STUN request used in connectivity checks.
 fn makeConnectivityCheckBindingRequest(
-    local_username_fragment: [8]u8,
-    remote_username_fragment: [8]u8,
-    password: [24]u8,
+    local_username_fragment: []const u8,
+    remote_username_fragment: []const u8,
+    password: []const u8,
     priority: u32,
     role: AgentRole,
     tiebreaker: u64,
@@ -209,15 +211,20 @@ fn makeConnectivityCheckBindingRequest(
     var message_builder = ztun.MessageBuilder.init(allocator);
     defer message_builder.deinit();
 
-    const authentication = ztun.auth.Authentication{ .short_term = ztun.auth.ShortTermAuthentication{ .password = &password } };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+
+    var arena = arena_state.allocator();
+
+    const authentication = ztun.auth.Authentication{ .short_term = ztun.auth.ShortTermAuthentication{ .password = password } };
 
     // Binding request with random transaction ID.
     message_builder.setClass(ztun.Class.request);
     message_builder.setMethod(ztun.Method.binding);
     message_builder.randomTransactionId();
 
-    const username = makeUsername(local_username_fragment, remote_username_fragment);
-    const username_attribute = try (ztun.attr.common.Username{ .value = &username }).toAttribute(allocator);
+    const username = try makeUsername(local_username_fragment, remote_username_fragment, arena);
+    const username_attribute = try (ztun.attr.common.Username{ .value = username }).toAttribute(allocator);
     try message_builder.addAttribute(username_attribute);
 
     const priority_attribute = try (ztun.attr.common.Priority{ .value = priority }).toAttribute(allocator);
@@ -245,7 +252,7 @@ fn makeConnectivityCheckBindingRequest(
 }
 
 /// Convenience to build a STUN response to a request.
-fn makeBindingResponse(transaction_id: u96, source: std.net.Address, password: [24]u8, allocator: std.mem.Allocator) !ztun.Message {
+fn makeBindingResponse(transaction_id: u96, source: std.net.Address, password: []const u8, allocator: std.mem.Allocator) !ztun.Message {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
 
@@ -260,7 +267,7 @@ fn makeBindingResponse(transaction_id: u96, source: std.net.Address, password: [
     const xor_mapped_address_attribute = try xor_mapped_address.toAttribute(arena_state.allocator());
     try message_builder.addAttribute(xor_mapped_address_attribute);
 
-    const authentication = ztun.auth.Authentication{ .short_term = .{ .password = &password } };
+    const authentication = ztun.auth.Authentication{ .short_term = .{ .password = password } };
     message_builder.addMessageIntegrity(authentication);
 
     message_builder.addFingerprint();
@@ -269,7 +276,7 @@ fn makeBindingResponse(transaction_id: u96, source: std.net.Address, password: [
 }
 
 /// Convenience to build a STUN error response caused by a role conflict.
-fn makeRoleConflictResponse(transaction_id: u96, password: [24]u8, allocator: std.mem.Allocator) !ztun.Message {
+fn makeRoleConflictResponse(transaction_id: u96, password: []const u8, allocator: std.mem.Allocator) !ztun.Message {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
 
@@ -282,7 +289,7 @@ fn makeRoleConflictResponse(transaction_id: u96, password: [24]u8, allocator: st
     const error_code_attribute = try (ztun.attr.common.ErrorCode{ .value = .role_conflict, .reason = "Role Conflict" }).toAttribute(arena_state.allocator());
     try message_builder.addAttribute(error_code_attribute);
 
-    const authentication = ztun.auth.Authentication{ .short_term = .{ .password = &password } };
+    const authentication = ztun.auth.Authentication{ .short_term = .{ .password = password } };
     message_builder.addMessageIntegrity(authentication);
 
     message_builder.addFingerprint();
@@ -1187,22 +1194,46 @@ const ResponseEntry = struct {
 /// Represents the parameters used to authenticate STUN transaction.
 pub const AuthParameters = struct {
     /// The fragment of the user attribute.
-    username_fragment: [8]u8,
+    username_fragment: []const u8,
     /// The password used for authentication.
-    password: [24]u8,
+    password: []const u8,
+
+    /// The buffer storing the username fragment and buffer.
+    storage: []const u8,
+
+    /// Inits an AuthParameters by copying the given username fragment and password.
+    pub fn initFrom(username_fragment: []const u8, password: []const u8, allocator: std.mem.Allocator) !AuthParameters {
+        var storage = try allocator.alloc(u8, username_fragment.len + password.len);
+        errdefer allocator.free(storage);
+
+        @memcpy(storage[0..username_fragment.len], username_fragment);
+        @memcpy(storage[username_fragment.len..], password);
+
+        return AuthParameters{
+            .username_fragment = storage[0..username_fragment.len],
+            .password = storage[username_fragment.len..],
+            .storage = storage,
+        };
+    }
 
     /// Generates random parameters using the given random object.
-    pub inline fn random(rand: std.rand.Random) AuthParameters {
+    pub inline fn random(rand: std.rand.Random, allocator: std.mem.Allocator) !AuthParameters {
         var buffer: [6 + 18]u8 = undefined;
         rand.bytes(&buffer);
 
-        var base64_buffer: [8 + 24]u8 = undefined;
-        const result = std.base64.standard.Encoder.encode(&base64_buffer, &buffer);
+        var base64_buffer = try allocator.alloc(u8, 8 + 24);
+        var result = std.base64.standard.Encoder.encode(base64_buffer, &buffer);
 
         return .{
-            .username_fragment = result[0..8].*,
-            .password = result[8..32].*,
+            .username_fragment = result[0..8],
+            .password = result[8..32],
+            .storage = base64_buffer,
         };
+    }
+
+    /// Deinit allocated auth parameters.
+    pub fn deinit(self: AuthParameters, allocator: std.mem.Allocator) void {
+        allocator.free(self.storage);
     }
 };
 
@@ -1316,7 +1347,8 @@ pub const AgentContext = struct {
 
     /// Initializes an agent.
     pub fn init(context: *Context, agent_id: AgentId, loop: *xev.Loop, options: CreateAgentOptions, allocator: std.mem.Allocator) !AgentContext {
-        const auth_parameters = AuthParameters.random(std.crypto.random);
+        const auth_parameters = try AuthParameters.random(std.crypto.random, allocator);
+        errdefer auth_parameters.deinit(allocator);
         const tiebreaker = std.crypto.random.int(u64);
 
         var gathering_main_timer = try xev.Timer.init();
@@ -1423,6 +1455,11 @@ pub const AgentContext = struct {
     pub fn deinit(self: *AgentContext) void {
         std.debug.assert(self.done());
 
+        self.local_auth.deinit(self.allocator);
+        if (self.remote_auth) |remote_auth| {
+            remote_auth.deinit(self.allocator);
+        }
+
         self.gathering_main_timer.deinit();
         self.buffer_pool.deinit();
         self.allocator.destroy(self.stun_context_entries);
@@ -1505,10 +1542,7 @@ pub const AgentContext = struct {
     /// This should only be called by the zice Context.
     fn processSetRemoteCandidates(self: *AgentContext, parameters: RemoteCandidateParameters) !void {
         try self.remote_candidates.appendSlice(self.allocator, parameters.candidates);
-        self.remote_auth = AuthParameters{
-            .username_fragment = parameters.username_fragment,
-            .password = parameters.password,
-        };
+        self.remote_auth = try AuthParameters.initFrom(parameters.username_fragment, parameters.password, self.allocator);
         self.has_remote_candidates = true;
 
         // If we don't have a role yet, we can assume that the other agent is the controlling one.
@@ -2540,7 +2574,7 @@ pub const AgentContext = struct {
         };
 
         // Check fingerprint/integrity.
-        try checkMessageIntegrity(request, &self.local_auth.password);
+        try checkMessageIntegrity(request, self.local_auth.password);
 
         // Detecting and repairing role conflicts.
         if (self.detectAndRepairRoleConflict(request)) {
@@ -3039,8 +3073,8 @@ pub const ContextOperationType = enum {
 pub const RemoteCandidateParameters = struct {
     agent_id: AgentId = undefined,
     candidates: []const Candidate,
-    username_fragment: [8]u8,
-    password: [24]u8,
+    username_fragment: []const u8,
+    password: []const u8,
 };
 
 pub const SendParameters = struct {
