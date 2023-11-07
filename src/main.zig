@@ -1811,16 +1811,15 @@ pub const AgentContext = struct {
         }
     }
 
-    /// Computes the candidate pairs.
-    fn computeCandidatePairs(self: *AgentContext) !void {
-        var pair_list = std.ArrayList(CandidatePair).init(self.allocator);
-        defer pair_list.deinit();
+    /// Form candidate pairs.
+    fn formPairs(local_candidates: []const Candidate, remote_candidates: []const Candidate, allocator: std.mem.Allocator) !std.ArrayList(CandidatePair) {
+        var pair_list = std.ArrayList(CandidatePair).init(allocator);
+        errdefer pair_list.deinit();
 
-        // Compute Pair Priority
-        for (self.local_candidates.items, 0..) |local_candidate, i| {
+        for (local_candidates, 0..) |local_candidate, i| {
             const local_component_id = local_candidate.component_id;
             const local_address_family = local_candidate.transport_address.any.family;
-            for (self.remote_candidates.items, 0..) |remote_candidate, j| {
+            for (remote_candidates, 0..) |remote_candidate, j| {
                 const remote_component_id = remote_candidate.component_id;
                 const remote_address_family = remote_candidate.transport_address.any.family;
                 if (local_component_id == remote_component_id and local_address_family == remote_address_family) {
@@ -1830,6 +1829,11 @@ pub const AgentContext = struct {
             }
         }
 
+        return pair_list;
+    }
+
+    /// Sort pairs based on the priority of the associated candidates.
+    fn sortPairs(pairs: []CandidatePair, local_candidates: []const Candidate, remote_candidates: []const Candidate, role: AgentRole) void {
         // Sort pairs in decreasing order of priority.
         const SortContext = struct {
             local_candidates: []const Candidate,
@@ -1852,19 +1856,22 @@ pub const AgentContext = struct {
             }
         };
 
-        std.sort.heapContext(0, pair_list.items.len, SortContext{
-            .local_candidates = self.local_candidates.items,
-            .remote_candidates = self.remote_candidates.items,
-            .agent_role = self.role.?,
-            .ordered_pairs = pair_list.items,
+        std.sort.heapContext(0, pairs.len, SortContext{
+            .local_candidates = local_candidates,
+            .remote_candidates = remote_candidates,
+            .agent_role = role,
+            .ordered_pairs = pairs,
         });
+    }
 
+    /// Prune pairs by removing redundant ones.
+    fn prunePairs(pair_list: *std.ArrayList(CandidatePair), local_candidates: []const Candidate, remote_candidates: []const Candidate, role: AgentRole) void {
         // Replace reflexive candidate with their base as per https://www.rfc-editor.org/rfc/rfc8445#section-6.1.2.4.
         for (pair_list.items) |*candidate_pair| {
-            const local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
+            const local_candidate = local_candidates[candidate_pair.local_candidate_index];
 
             if (local_candidate.type == .server_reflexive) {
-                const new_local_candidate_index = for (self.local_candidates.items, 0..) |*c, i| {
+                const new_local_candidate_index = for (local_candidates, 0..) |*c, i| {
                     if (c.type == .host and c.transport_address.eql(local_candidate.base_address)) break i;
                 } else unreachable;
                 candidate_pair.local_candidate_index = new_local_candidate_index;
@@ -1875,18 +1882,18 @@ pub const AgentContext = struct {
         var current_index: usize = 0;
         while (current_index < pair_list.items.len - 1) : (current_index += 1) {
             const current_candidate_pair = pair_list.items[current_index];
-            const current_candidate_pair_priority = computePairPriority(self.local_candidates.items[current_candidate_pair.local_candidate_index].priority, self.remote_candidates.items[current_candidate_pair.remote_candidate_index].priority, self.role.?);
+            const current_candidate_pair_priority = computePairPriority(local_candidates[current_candidate_pair.local_candidate_index].priority, remote_candidates[current_candidate_pair.remote_candidate_index].priority, role);
 
             const current_local_candidate_index = current_candidate_pair.local_candidate_index;
-            const current_local_candidate = self.local_candidates.items[current_local_candidate_index];
+            const current_local_candidate = local_candidates[current_local_candidate_index];
             const current_remote_candidate_index = current_candidate_pair.remote_candidate_index;
 
             var other_index: usize = current_index + 1;
             while (other_index < pair_list.items.len) {
                 const other_candidate_pair = pair_list.items[other_index];
-                const other_candidate_pair_priority = computePairPriority(self.local_candidates.items[other_candidate_pair.local_candidate_index].priority, self.remote_candidates.items[other_candidate_pair.remote_candidate_index].priority, self.role.?);
+                const other_candidate_pair_priority = computePairPriority(local_candidates[other_candidate_pair.local_candidate_index].priority, remote_candidates[other_candidate_pair.remote_candidate_index].priority, role);
                 const other_local_candidate_index = other_candidate_pair.local_candidate_index;
-                const other_local_candidate = self.local_candidates.items[other_local_candidate_index];
+                const other_local_candidate = local_candidates[other_local_candidate_index];
                 const other_remote_candidate_index = other_candidate_pair.remote_candidate_index;
 
                 const have_same_local_candidate_base = std.net.Address.eql(current_local_candidate.base_address, other_local_candidate.base_address);
@@ -1905,6 +1912,16 @@ pub const AgentContext = struct {
                 other_index += 1;
             }
         }
+    }
+
+    /// Computes the candidate pairs.
+    fn computeCandidatePairs(self: *AgentContext) !void {
+        var pair_list = try formPairs(self.local_candidates.items, self.remote_candidates.items, self.allocator);
+        defer pair_list.deinit();
+
+        sortPairs(pair_list.items, self.local_candidates.items, self.remote_candidates.items, self.role.?);
+
+        prunePairs(&pair_list, self.local_candidates.items, self.remote_candidates.items, self.role.?);
 
         if (pair_list.items.len > Configuration.candidate_pair_limit) {
             try pair_list.resize(Configuration.candidate_pair_limit);
