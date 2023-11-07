@@ -817,6 +817,8 @@ pub const Transaction = struct {
     }
 };
 
+// TODO(Corendos,@Idea): To help with address symmetry checks, we should probably store the mapped address associated with a socket.
+
 /// Contains the additional data associated with an open socket.
 pub const SocketContext = struct {
     /// Our index in the Agent Context.
