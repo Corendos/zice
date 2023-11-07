@@ -34,6 +34,7 @@ const log = std.log.scoped(.zice);
 // TODO(Corendos,@Global):
 // * Handle peer-reflexive
 // * Implement https://www.rfc-editor.org/rfc/rfc8421#section-4 for local preference computation
+// * Support multiple data streams
 
 /// Represents an ICE candidate type. See https://www.rfc-editor.org/rfc/rfc8445#section-4 for definitions.
 pub const CandidateType = enum(u2) {
@@ -119,8 +120,6 @@ pub const Candidate = struct {
     component_id: u8 = 1,
     /// Is this candidate the default candidate.
     default: bool = false,
-
-    // TODO(Corendos): multiple component ID support
 };
 
 /// Compute the priority using the type preference, local preference and component ID according to https://www.rfc-editor.org/rfc/rfc8445#section-5.1.2.1.
@@ -839,14 +838,76 @@ pub const SocketContext = struct {
     /// The completion to cancel reads.
     read_cancel_completion: xev.Completion = .{},
 
-    /// Initialize the socket context from its index, fd, address and buffer for read data.
-    pub fn init(index: usize, socket: std.os.fd_t, address: std.net.Address, read_buffer: []u8) SocketContext {
+    pub fn init(index: usize, address: std.net.Address, read_buffer: []u8) !SocketContext {
+        const socket = try std.os.socket(address.any.family, std.os.SOCK.DGRAM, std.os.IPPROTO.UDP);
+        errdefer std.os.close(socket);
+
+        try std.os.bind(socket, &address.any, address.getOsSockLen());
+        const bound_address = try net.getSocketAddress(socket);
+
         return SocketContext{
             .index = index,
             .socket = socket,
-            .address = address,
+            .address = bound_address,
             .read_buffer = read_buffer,
         };
+    }
+
+    pub fn start(
+        self: *SocketContext,
+        loop: *xev.Loop,
+        userdata: ?*anyopaque,
+        callback: *const fn (
+            ?*anyopaque,
+            *xev.Loop,
+            *xev.Completion,
+            xev.Result,
+        ) xev.CallbackAction,
+    ) void {
+        // Start to listen for activity on the socket.
+        var read_data = &self.read_data;
+        read_data.iovec = .{ .iov_len = self.read_buffer.len, .iov_base = self.read_buffer.ptr };
+        read_data.message_header = .{
+            .name = &read_data.address.any,
+            .namelen = read_data.address.any.data.len,
+            .control = null,
+            .controllen = 0,
+            .iov = @ptrCast(&read_data.iovec),
+            .iovlen = 1,
+            .flags = 0,
+        };
+
+        self.read_completion = xev.Completion{
+            .op = .{
+                .recvmsg = .{
+                    .fd = self.socket,
+                    .msghdr = &read_data.message_header,
+                },
+            },
+            .userdata = userdata,
+            .callback = callback,
+        };
+
+        // TODO(Corendos): Hide implementation details
+        if (xev.backend == .epoll) {
+            self.read_completion.flags.dup = true;
+        }
+
+        loop.add(&self.read_completion);
+    }
+
+    pub fn cancel(self: *SocketContext, loop: *xev.Loop) void {
+        if (self.read_completion.state() == .dead) return;
+
+        self.read_cancel_completion = .{
+            .op = .{ .cancel = .{ .c = &self.read_completion } },
+        };
+
+        loop.add(&self.read_cancel_completion);
+    }
+
+    pub inline fn done(self: *const SocketContext) bool {
+        return self.read_completion.state() == .dead and self.read_cancel_completion.state() == .dead;
     }
 
     pub fn deinit(self: *SocketContext) void {
@@ -1307,7 +1368,6 @@ pub const AgentContext = struct {
 
     // Connectivity checks related fields.
 
-    // TODO(Corendos): handle multiple data-stream.
     /// The checklists used to check candidate pairs.
     checklist: Checklist,
 
@@ -1400,14 +1460,7 @@ pub const AgentContext = struct {
         self.flags.stopped = true;
 
         for (self.socket_contexts) |*ctx| {
-            if (ctx.read_completion.state() == .dead) continue;
-            ctx.read_cancel_completion = .{
-                .op = .{ .cancel = .{ .c = &ctx.read_completion } },
-                .userdata = self,
-                .callback = readCancelCallback,
-            };
-
-            self.loop.add(&ctx.read_cancel_completion);
+            ctx.cancel(self.loop);
         }
 
         for (self.stun_context_entries) |*entry| {
@@ -1477,6 +1530,28 @@ pub const AgentContext = struct {
         self.allocator.destroy(self.check_response_queue);
     }
 
+    /// Creates all the socket contexts associated with the given addresses.
+    fn createSocketContexts(addresses: []const std.net.Address, allocator: std.mem.Allocator, buffer_pool: *std.heap.MemoryPool([4096]u8)) ![]SocketContext {
+        var socket_context_list = try std.ArrayList(SocketContext).initCapacity(allocator, addresses.len);
+        defer socket_context_list.deinit();
+
+        errdefer for (socket_context_list.items) |*socket_context| {
+            socket_context.deinit();
+            buffer_pool.destroy(@alignCast(socket_context.read_buffer[0..4096]));
+        };
+
+        for (addresses, 0..) |address, index| {
+            const read_buffer = try buffer_pool.create();
+            errdefer buffer_pool.destroy(read_buffer);
+
+            const socket_context = try SocketContext.init(index, address, read_buffer);
+
+            socket_context_list.appendAssumeCapacity(socket_context);
+        }
+
+        return socket_context_list.toOwnedSlice() catch unreachable;
+    }
+
     /// Starts any required operation to gather candidates.
     /// This should only be called by the zice Context.
     pub fn processGatherCandidates(self: *AgentContext) !void {
@@ -1488,23 +1563,18 @@ pub const AgentContext = struct {
         const address_list = try self.context.getValidCandidateAddresses(self.allocator);
         defer self.allocator.free(address_list);
 
-        var socket_context_list = try std.ArrayList(SocketContext).initCapacity(self.allocator, address_list.len);
-        defer socket_context_list.deinit();
-        errdefer for (socket_context_list.items) |*socket_context| {
-            std.os.close(socket_context.socket);
+        self.socket_contexts = try createSocketContexts(address_list, self.allocator, &self.buffer_pool);
+        errdefer for (self.socket_contexts) |*socket_context| {
+            socket_context.deinit();
             self.buffer_pool.destroy(@alignCast(socket_context.read_buffer[0..4096]));
         };
 
-        for (address_list, 0..) |address, index| {
-            const socket = try std.os.socket(address.any.family, std.os.SOCK.DGRAM, std.os.IPPROTO.UDP);
-
-            try std.os.bind(socket, &address.any, address.getOsSockLen());
-            const bound_address = try net.getSocketAddress(socket);
-
-            const read_buffer = try self.buffer_pool.create();
-            socket_context_list.appendAssumeCapacity(SocketContext.init(index, socket, bound_address, read_buffer));
+        for (self.socket_contexts) |*socket_context| {
+            socket_context.start(self.loop, self, readCallback);
         }
-        self.socket_contexts = socket_context_list.toOwnedSlice() catch unreachable;
+        errdefer for (self.socket_contexts) |*socket_context| {
+            socket_context.cancel(self.loop);
+        };
 
         self.gathering_state = .gathering;
 
@@ -2180,37 +2250,6 @@ pub const AgentContext = struct {
             },
         };
 
-        // Start to listen for activity on the socket.
-        var read_data = &socket_context.read_data;
-        read_data.iovec = .{ .iov_len = socket_context.read_buffer.len, .iov_base = socket_context.read_buffer.ptr };
-        read_data.message_header = .{
-            .name = &read_data.address.any,
-            .namelen = read_data.address.any.data.len,
-            .control = null,
-            .controllen = 0,
-            .iov = @ptrCast(&read_data.iovec),
-            .iovlen = 1,
-            .flags = 0,
-        };
-
-        socket_context.read_completion = xev.Completion{
-            .op = .{
-                .recvmsg = .{
-                    .fd = socket_context.socket,
-                    .msghdr = &read_data.message_header,
-                },
-            },
-            .userdata = self,
-            .callback = readCallback,
-        };
-
-        // TODO(Corendos): Hide implementation details
-        if (xev.backend == .epoll) {
-            socket_context.read_completion.flags.dup = true;
-        }
-
-        self.loop.add(&socket_context.read_completion);
-
         log.debug("Agent {} - Starting transaction for base address \"{}\"", .{ self.id, socket_context.address });
         stun_context_entry.stun_context.gathering.transaction.start(
             Configuration.computeRtoGatheringMs(self.socket_contexts.len),
@@ -2343,19 +2382,6 @@ pub const AgentContext = struct {
         }
 
         return if (self.flags.stopped) .disarm else .rearm;
-    }
-
-    fn readCancelCallback(
-        userdata: ?*anyopaque,
-        loop: *xev.Loop,
-        c: *xev.Completion,
-        result: xev.Result,
-    ) xev.CallbackAction {
-        _ = result;
-        _ = c;
-        _ = loop;
-        _ = userdata;
-        return .disarm;
     }
 
     fn gatheringTransactionCompleteCallback(userdata: ?*anyopaque, transaction: *Transaction, result: TransactionResult) void {
