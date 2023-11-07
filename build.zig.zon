@@ -8,8 +8,8 @@
             .hash = "1220319886ce078416255b17e06973a2948a756ab495c12875901d1085cc51e2fb40",
         },
         .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/5ecbc87.tar.gz",
-            .hash = "1220416854e424601ecc9814afb461a5dc9cf95db5917d82f794594a58ffc723b82c",
+            .url = "https://github.com/Corendos/libxev/archive/efcd521.tar.gz",
+            .hash = "122066c6617bd0c106280eaf6bf7a8169c197cec7b97d35c5add1d3439b65984cefa",
         },
     },
 }
