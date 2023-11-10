@@ -355,18 +355,6 @@ inline fn computePairPriority(local_candidate_priority: u32, remote_candidate_pr
     return (@min(g, d) << 32) + (@max(g, d) << 1) + discriminant;
 }
 
-/// Represents the status of each potential candidate when gathering them.
-pub const CandidateGatheringStatus = enum {
-    /// The candidate has just been created.
-    new,
-    /// The candidate is currently being checked.
-    checking,
-    /// The candidate check resulted in a failure.
-    failed,
-    /// The candidate has been checked succesfully.
-    done,
-};
-
 /// Stores data required to properly send a message through the socket.
 pub const WriteData = struct {
     /// The iovec used in sendmsg.
@@ -391,16 +379,6 @@ pub const WriteData = struct {
             .flags = 0,
         };
     }
-};
-
-/// Stores data required to properly receive a message from the socket.
-pub const ReadData = struct {
-    /// The iovec used in recvmsg.
-    iovec: std.os.iovec = undefined,
-    /// The message_header used in recvmsg.
-    message_header: std.os.msghdr = undefined,
-    /// The address used in recvmsg.
-    address: std.net.Address = undefined,
 };
 
 /// Represents the gathering state of the agent.
@@ -833,46 +811,51 @@ pub const Transaction = struct {
     }
 };
 
-// TODO(Corendos,@Idea): To help with address symmetry checks, we should probably store the mapped address associated with a socket.
-
 /// Contains the additional data associated with an open socket.
-pub const SocketContext = struct {
-    /// Our index in the Agent Context.
-    index: usize,
-
-    /// Our associated socket.
-    socket: std.os.fd_t,
-    /// Our bound address.
-    address: std.net.Address,
-
-    // NOTE(Corendos): The bound address corresponds to the base address of candidates.
-
+pub const SocketData = struct {
+    /// The index of the socket we are associated to.
+    socket_index: usize,
     /// The buffer used to read a message.
-    read_buffer: []u8 = &.{},
-    /// The data required to receive a message.
-    read_data: ReadData = undefined,
+    read_buffer: *[4096]u8 = undefined,
     /// The associated xev.Completion.
     read_completion: xev.Completion = .{},
     /// The completion to cancel reads.
     read_cancel_completion: xev.Completion = .{},
+    /// The iovec used in recvmsg.
+    iovec: std.os.iovec = undefined,
+    /// The message_header used in recvmsg.
+    message_header: std.os.msghdr = undefined,
+    /// The address used in recvmsg.
+    address: std.net.Address = undefined,
+};
 
-    pub fn init(index: usize, address: std.net.Address, read_buffer: []u8) !SocketContext {
-        const socket = try std.os.socket(address.any.family, std.os.SOCK.DGRAM, std.os.IPPROTO.UDP);
-        errdefer std.os.close(socket);
+pub const Socket = struct {
+    /// Our associated socket.
+    fd: std.os.fd_t,
+    /// Our bound address.
+    address: std.net.Address,
 
-        try std.os.bind(socket, &address.any, address.getOsSockLen());
-        const bound_address = try net.getSocketAddress(socket);
+    /// The associated socket data.
+    data: *SocketData,
 
-        return SocketContext{
-            .index = index,
-            .socket = socket,
+    // NOTE(Corendos): The bound address corresponds to the base address of candidates.
+
+    pub fn init(address: std.net.Address, data: *SocketData) !Socket {
+        const fd = try std.os.socket(address.any.family, std.os.SOCK.DGRAM, std.os.IPPROTO.UDP);
+        errdefer std.os.close(fd);
+
+        try std.os.bind(fd, &address.any, address.getOsSockLen());
+        const bound_address = try net.getSocketAddress(fd);
+
+        return Socket{
+            .fd = fd,
             .address = bound_address,
-            .read_buffer = read_buffer,
+            .data = data,
         };
     }
 
     pub fn start(
-        self: *SocketContext,
+        self: Socket,
         loop: *xev.Loop,
         userdata: ?*anyopaque,
         callback: *const fn (
@@ -883,23 +866,25 @@ pub const SocketContext = struct {
         ) xev.CallbackAction,
     ) void {
         // Start to listen for activity on the socket.
-        var read_data = &self.read_data;
-        read_data.iovec = .{ .iov_len = self.read_buffer.len, .iov_base = self.read_buffer.ptr };
-        read_data.message_header = .{
-            .name = &read_data.address.any,
-            .namelen = read_data.address.any.data.len,
+        self.data.iovec = .{
+            .iov_len = self.data.read_buffer.len,
+            .iov_base = self.data.read_buffer,
+        };
+        self.data.message_header = .{
+            .name = &self.data.address.any,
+            .namelen = self.data.address.any.data.len,
             .control = null,
             .controllen = 0,
-            .iov = @ptrCast(&read_data.iovec),
+            .iov = @ptrCast(&self.data.iovec),
             .iovlen = 1,
             .flags = 0,
         };
 
-        self.read_completion = xev.Completion{
+        self.data.read_completion = xev.Completion{
             .op = .{
                 .recvmsg = .{
-                    .fd = self.socket,
-                    .msghdr = &read_data.message_header,
+                    .fd = self.fd,
+                    .msghdr = &self.data.message_header,
                 },
             },
             .userdata = userdata,
@@ -908,28 +893,28 @@ pub const SocketContext = struct {
 
         // TODO(Corendos): Hide implementation details
         if (xev.backend == .epoll) {
-            self.read_completion.flags.dup = true;
+            self.data.read_completion.flags.dup = true;
         }
 
-        loop.add(&self.read_completion);
+        loop.add(&self.data.read_completion);
     }
 
-    pub fn cancel(self: *SocketContext, loop: *xev.Loop) void {
-        if (self.read_completion.state() == .dead) return;
+    pub fn cancel(self: Socket, loop: *xev.Loop) void {
+        if (self.data.read_completion.state() == .dead) return;
 
-        self.read_cancel_completion = .{
-            .op = .{ .cancel = .{ .c = &self.read_completion } },
+        self.data.read_cancel_completion = .{
+            .op = .{ .cancel = .{ .c = &self.data.read_completion } },
         };
 
-        loop.add(&self.read_cancel_completion);
+        loop.add(&self.data.read_cancel_completion);
     }
 
-    pub inline fn done(self: *const SocketContext) bool {
-        return self.read_completion.state() == .dead and self.read_cancel_completion.state() == .dead;
+    pub inline fn done(self: Socket) bool {
+        return self.data.read_completion.state() == .dead and self.data.read_cancel_completion.state() == .dead;
     }
 
-    pub fn deinit(self: *SocketContext) void {
-        std.os.close(self.socket);
+    pub fn deinit(self: Socket) void {
+        std.os.close(self.fd);
     }
 };
 
@@ -1263,6 +1248,12 @@ const StunContextType = enum {
 const StunContext = union(StunContextType) {
     gathering: GatheringContext,
     check: ConnectivityCheckContext,
+
+    pub fn cancel(self: *StunContext, loop: *xev.Loop) void {
+        switch (self.*) {
+            inline else => |*v| v.transaction.cancel(loop),
+        }
+    }
 };
 
 /// An entry associated with a response that must be sent when possible.
@@ -1327,7 +1318,7 @@ pub const AuthParameters = struct {
 };
 
 /// Represents an entry in an array of STUN contexts.
-/// The AgentContext stores a fixed array of entries that can be used to gather candidates or perform connectivity checks.
+/// The gentContext stores a fixed array of entries that can be used to gather candidates or perform connectivity checks.
 const StunContextEntry = struct {
     /// The transaction ID of the associated STUN transaction.
     transaction_id: u96,
@@ -1366,9 +1357,9 @@ pub const AgentContext = struct {
     tiebreaker: u64,
 
     /// The list of local candidates.
-    local_candidates: std.ArrayListUnmanaged(Candidate) = .{},
+    local_candidates: std.ArrayList(Candidate),
     /// The list of remote candidates.
-    remote_candidates: std.ArrayListUnmanaged(Candidate) = .{},
+    remote_candidates: std.ArrayList(Candidate),
     /// Have we received the remote candidates.
     has_remote_candidates: bool = false,
 
@@ -1378,8 +1369,10 @@ pub const AgentContext = struct {
     /// A fixed size array of STUN context entry that can be used to gather candidates or perform connectivity checks.
     stun_context_entries: *[64]StunContextEntry,
 
-    /// Contexts for each bound sockets.
-    socket_contexts: []SocketContext = &.{},
+    /// Contains bound sockets.
+    sockets: std.ArrayList(Socket),
+    /// A pool of socket data.
+    socket_data_pool: std.heap.MemoryPool(SocketData),
 
     // Gathering related fields.
 
@@ -1391,8 +1384,8 @@ pub const AgentContext = struct {
     gathering_main_timer_cancel_completion: xev.Completion = .{},
     /// The agent gathering state.
     gathering_state: GatheringState = .idle,
-    /// The gathering status of each server reflexive candidate.
-    gathering_candidate_statuses: []CandidateGatheringStatus = &.{},
+    /// The queue for host candidate requiring gathering.
+    gathering_queue: *CircularBuffer(usize, 16),
 
     // Connectivity checks related fields.
 
@@ -1440,6 +1433,12 @@ pub const AgentContext = struct {
 
         const tiebreaker = std.crypto.random.int(u64);
 
+        var local_candidates = std.ArrayList(Candidate).init(allocator);
+        errdefer local_candidates.deinit();
+
+        var remote_candidates = std.ArrayList(Candidate).init(allocator);
+        errdefer remote_candidates.deinit();
+
         var gathering_main_timer = try xev.Timer.init();
         errdefer gathering_main_timer.deinit();
         var connectivity_checks_timer = try xev.Timer.init();
@@ -1447,6 +1446,13 @@ pub const AgentContext = struct {
 
         var buffer_pool = std.heap.MemoryPool([4096]u8).init(allocator);
         errdefer buffer_pool.deinit();
+
+        var socket_data_pool = std.heap.MemoryPool(SocketData).init(allocator);
+        errdefer socket_data_pool.deinit();
+
+        var gathering_queue = try allocator.create(CircularBuffer(usize, 16));
+        gathering_queue.* = .{};
+        errdefer allocator.destroy(gathering_queue);
 
         var check_response_queue_write_buffer = try buffer_pool.create();
         errdefer buffer_pool.destroy(check_response_queue_write_buffer);
@@ -1468,11 +1474,16 @@ pub const AgentContext = struct {
             .gathering_main_timer = gathering_main_timer,
             .buffer_pool = buffer_pool,
             .stun_context_entries = stun_context_entries,
+            .sockets = std.ArrayList(Socket).init(allocator),
+            .socket_data_pool = socket_data_pool,
+            .gathering_queue = gathering_queue,
             .checklist = checklist,
             .connectivity_checks_timer = connectivity_checks_timer,
             .check_response_queue_write_buffer = check_response_queue_write_buffer,
             .local_auth = auth_parameters,
             .tiebreaker = tiebreaker,
+            .local_candidates = local_candidates,
+            .remote_candidates = remote_candidates,
             .check_response_queue = check_response_queue,
             .userdata = options.userdata,
             .on_candidate_callback = options.on_candidate_callback,
@@ -1488,17 +1499,11 @@ pub const AgentContext = struct {
         if (self.flags.stopped) return;
         self.flags.stopped = true;
 
-        for (self.socket_contexts) |*ctx| {
-            ctx.cancel(self.loop);
-        }
+        for (self.sockets.items) |s| s.cancel(self.loop);
 
-        for (self.stun_context_entries) |*entry| {
-            if (entry.flags.in_use) {
-                switch (entry.stun_context) {
-                    inline else => |*v| v.transaction.cancel(self.loop),
-                }
-            }
-        }
+        for (self.stun_context_entries) |*entry| if (entry.flags.in_use) {
+            entry.stun_context.cancel(self.loop);
+        };
 
         if (self.gathering_main_timer_completion.state() == .active) {
             self.gathering_main_timer.cancel(
@@ -1525,7 +1530,7 @@ pub const AgentContext = struct {
 
     /// Returns true if the agent is done with all potential ongoing operations.
     pub fn done(self: *const AgentContext) bool {
-        for (self.socket_contexts) |*ctx| if (ctx.read_completion.state() != .dead or ctx.read_cancel_completion.state() != .dead) return false;
+        for (self.sockets.items) |s| if (!s.done()) return false;
         for (self.stun_context_entries) |*entry| if (entry.flags.in_use) return false;
         if (self.gathering_main_timer_completion.state() != .dead or self.gathering_main_timer_cancel_completion.state() != .dead) return false;
         if (self.connectivity_checks_timer_completion.state() != .dead or self.connectivity_checks_timer_cancel_completion.state() != .dead) return false;
@@ -1537,95 +1542,30 @@ pub const AgentContext = struct {
     pub fn deinit(self: *AgentContext) void {
         std.debug.assert(self.done());
 
+        self.allocator.destroy(self.check_response_queue);
+        self.allocator.destroy(self.stun_context_entries);
+        self.allocator.destroy(self.gathering_queue);
+
+        self.socket_data_pool.deinit();
+        for (self.sockets.items) |s| s.deinit();
+        self.sockets.deinit();
+
+        self.buffer_pool.deinit();
+        self.connectivity_checks_timer.deinit();
+        self.gathering_main_timer.deinit();
+
+        self.remote_candidates.deinit();
+        self.local_candidates.deinit();
+
         self.local_auth.deinit(self.allocator);
         if (self.remote_auth) |remote_auth| {
             remote_auth.deinit(self.allocator);
         }
-
-        self.gathering_main_timer.deinit();
-        self.buffer_pool.deinit();
-        self.allocator.destroy(self.stun_context_entries);
-
-        self.connectivity_checks_timer.deinit();
-
-        for (self.socket_contexts) |*ctx| ctx.deinit();
-        self.allocator.free(self.socket_contexts);
-
-        self.allocator.free(self.gathering_candidate_statuses);
-
-        self.local_candidates.deinit(self.allocator);
-        self.remote_candidates.deinit(self.allocator);
-
-        self.allocator.destroy(self.check_response_queue);
     }
 
-    /// Creates all the socket contexts associated with the given addresses.
-    fn createSocketContexts(addresses: []const std.net.Address, allocator: std.mem.Allocator, buffer_pool: *std.heap.MemoryPool([4096]u8)) ![]SocketContext {
-        var socket_context_list = try std.ArrayList(SocketContext).initCapacity(allocator, addresses.len);
-        defer socket_context_list.deinit();
-
-        errdefer for (socket_context_list.items) |*socket_context| {
-            socket_context.deinit();
-            buffer_pool.destroy(@alignCast(socket_context.read_buffer[0..4096]));
-        };
-
-        for (addresses, 0..) |address, index| {
-            const read_buffer = try buffer_pool.create();
-            errdefer buffer_pool.destroy(read_buffer);
-
-            const socket_context = try SocketContext.init(index, address, read_buffer);
-
-            socket_context_list.appendAssumeCapacity(socket_context);
-        }
-
-        return socket_context_list.toOwnedSlice() catch unreachable;
-    }
-
-    /// Starts any required operation to gather candidates.
-    /// This should only be called by the zice Context.
-    pub fn processGatherCandidates(self: *AgentContext) !void {
-        // By default, assume that we are in the controlling role if we are explicitly asked to gather candidates.
-        if (self.role == null) {
-            self.role = .controlling;
-        }
-
-        const address_list = try self.context.getValidCandidateAddresses(self.allocator);
-        defer self.allocator.free(address_list);
-
-        self.socket_contexts = try createSocketContexts(address_list, self.allocator, &self.buffer_pool);
-        errdefer for (self.socket_contexts) |*socket_context| {
-            socket_context.deinit();
-            self.buffer_pool.destroy(@alignCast(socket_context.read_buffer[0..4096]));
-        };
-
-        for (self.socket_contexts) |*socket_context| {
-            socket_context.start(self.loop, self, readCallback);
-        }
-        errdefer for (self.socket_contexts) |*socket_context| {
-            socket_context.cancel(self.loop);
-        };
-
-        self.gathering_state = .gathering;
-
-        for (self.socket_contexts, 0..) |ctx, index| {
-            const candidate = Candidate{
-                .type = .host,
-                .base_address = ctx.address,
-                .transport_address = ctx.address,
-                .foundation = Foundation{
-                    .type = .host,
-                    // TODO(Corentin): When supported, get that from the socket.
-                    .protocol = .udp,
-                    .address_index = @intCast(index),
-                },
-            };
-            self.local_candidates.append(self.allocator, candidate) catch unreachable;
-            self.on_candidate_callback(self.userdata, self, .{ .candidate = candidate });
-        }
-
-        self.gathering_candidate_statuses = try self.allocator.alloc(CandidateGatheringStatus, self.socket_contexts.len);
-        errdefer self.allocator.free(self.gathering_candidate_statuses);
-        @memset(self.gathering_candidate_statuses, .new);
+    fn restartGathering(self: *AgentContext) void {
+        if (self.flags.stopped) return;
+        if (self.gathering_main_timer_completion.state() == .active) return;
 
         self.gathering_main_timer.run(
             self.loop,
@@ -1637,10 +1577,74 @@ pub const AgentContext = struct {
         );
     }
 
+    fn addLocalCandidate(self: *AgentContext, candidate: Candidate) !void {
+        const candidate_index = self.local_candidates.items.len;
+        try self.local_candidates.append(candidate);
+
+        if (candidate.type == .host) {
+            if (self.gathering_queue.push(candidate_index)) {
+                self.restartGathering();
+            } else |_| {
+                log.warn("Failed to enqueue gathering operation", .{});
+            }
+        }
+
+        self.on_candidate_callback(self.userdata, self, .{ .candidate = candidate });
+    }
+
+    /// Starts any required operation to gather candidates.
+    /// This should only be called by the zice Context.
+    pub fn processGatherCandidates(self: *AgentContext) !void {
+        // By default, assume that we are in the controlling role if we are explicitly asked to gather candidates.
+        if (self.role == null) {
+            self.role = .controlling;
+        }
+
+        self.gathering_state = .gathering;
+
+        const addresses = try self.context.getValidCandidateAddresses(self.allocator);
+        defer self.allocator.free(addresses);
+
+        for (addresses) |address| {
+            const read_buffer = try self.buffer_pool.create();
+            errdefer self.buffer_pool.destroy(read_buffer);
+
+            const socket_data = try self.socket_data_pool.create();
+            socket_data.* = .{
+                .socket_index = self.sockets.items.len,
+                .read_buffer = read_buffer,
+            };
+            errdefer self.socket_data_pool.destroy(socket_data);
+
+            const socket = try Socket.init(address, socket_data);
+            errdefer socket.deinit();
+
+            socket.start(self.loop, self, readCallback);
+            errdefer socket.cancel(self.loop);
+
+            try self.sockets.append(socket);
+        }
+
+        for (self.sockets.items, 0..) |s, index| {
+            const candidate = Candidate{
+                .type = .host,
+                .base_address = s.address,
+                .transport_address = s.address,
+                .foundation = Foundation{
+                    .type = .host,
+                    // TODO(Corentin): When supported, get that from the socket.
+                    .protocol = .udp,
+                    .address_index = @intCast(index),
+                },
+            };
+            try self.addLocalCandidate(candidate);
+        }
+    }
+
     /// Sets the remote candidates and starts any required operations.
     /// This should only be called by the zice Context.
     fn processSetRemoteCandidates(self: *AgentContext, parameters: RemoteCandidateParameters) !void {
-        try self.remote_candidates.appendSlice(self.allocator, parameters.candidates);
+        try self.remote_candidates.appendSlice(parameters.candidates);
         self.remote_auth = try AuthParameters.initFrom(parameters.username_fragment, parameters.password, self.allocator);
         self.has_remote_candidates = true;
 
@@ -1668,7 +1672,7 @@ pub const AgentContext = struct {
             const local_candidate = self.local_candidates.items[selected_pair.local_candidate_index];
             const remote_candidate = self.remote_candidates.items[selected_pair.remote_candidate_index];
 
-            const socket_context = self.socket_contexts[self.getSocketContextIndexFromAddress(local_candidate.base_address).?];
+            const socket = self.sockets.items[self.getSocketIndexFromAddress(local_candidate.base_address).?];
 
             const parameters = &completion.op.send;
 
@@ -1676,7 +1680,7 @@ pub const AgentContext = struct {
             parameters.write_completion = xev.Completion{
                 .op = .{
                     .sendmsg = .{
-                        .fd = socket_context.socket,
+                        .fd = socket.fd,
                         .msghdr = &parameters.write_data.message_header,
                         .buffer = null,
                     },
@@ -1722,9 +1726,9 @@ pub const AgentContext = struct {
         self.handleConnectivityCheckMainTimer({}) catch unreachable;
     }
 
-    inline fn getSocketContextIndexFromAddress(self: *AgentContext, address: std.net.Address) ?usize {
-        return for (self.socket_contexts, 0..) |ctx, i| {
-            if (ctx.address.eql(address)) break i;
+    inline fn getSocketIndexFromAddress(self: *AgentContext, address: std.net.Address) ?usize {
+        return for (self.sockets.items, 0..) |socket, i| {
+            if (socket.address.eql(address)) break i;
         } else null;
     }
 
@@ -1737,20 +1741,6 @@ pub const AgentContext = struct {
     inline fn getRemoteCandidateIndexFromTransportAddress(self: *const AgentContext, address: std.net.Address) ?usize {
         return for (self.remote_candidates.items, 0..) |c, i| {
             if (c.transport_address.eql(address)) break i;
-        } else null;
-    }
-
-    /// Returns true if the gathering is done and we can call the callback with a valid result.
-    fn isGatheringDone(self: *const AgentContext) bool {
-        return self.gathering_main_timer_completion.state() == .dead and for (self.gathering_candidate_statuses) |status| {
-            if (status != .done and status != .failed) break false;
-        } else true;
-    }
-
-    /// Return the index of a candidate that has not been checked yet or null.
-    inline fn getUncheckedCandidateIndex(self: *const AgentContext) ?usize {
-        return for (self.gathering_candidate_statuses, 0..) |s, i| {
-            if (s == .new) break i;
         } else null;
     }
 
@@ -2135,6 +2125,33 @@ pub const AgentContext = struct {
         }
     }
 
+    pub fn setGatheringState(self: *AgentContext, new_state: GatheringState) void {
+        const old_state = self.gathering_state;
+        if (new_state == old_state) return;
+        self.gathering_state = new_state;
+
+        log.debug("Agent {} - Gathering State changed from \"{s}\" to \"{s}\"", .{ self.id, @tagName(old_state), @tagName(new_state) });
+
+        if (new_state == .done) {
+            self.computePriorities();
+            self.removeRedundantCandidates();
+
+            // Select the first server reflexive candidate to be the default candidate.
+            for (self.local_candidates.items) |*candidate| {
+                if (candidate.type == .server_reflexive) {
+                    candidate.default = true;
+                    break;
+                }
+            }
+
+            self.on_candidate_callback(self.userdata, self, .{ .done = {} });
+
+            if (self.has_remote_candidates) {
+                self.startChecks();
+            }
+        }
+    }
+
     /// Single entrypoint for all gathering related events (STUN message received, transaction completed or main timer fired).
     /// The rationale to have a single function instead of multiple callback is that it makes it easier to know exactly when the gathering is done.
     fn handleGatheringEvent(
@@ -2155,27 +2172,6 @@ pub const AgentContext = struct {
             },
             .main_timer => |r| self.handleGatheringMainTimer(r),
         }
-
-        if (!self.isGatheringDone()) return;
-
-        self.gathering_state = .done;
-
-        self.computePriorities();
-        self.removeRedundantCandidates();
-
-        // Select the first server reflexive candidate to be the default candidate.
-        for (self.local_candidates.items) |*candidate| {
-            if (candidate.type == .server_reflexive) {
-                candidate.default = true;
-                break;
-            }
-        }
-
-        self.on_candidate_callback(self.userdata, self, .{ .done = {} });
-
-        if (self.has_remote_candidates) {
-            self.startChecks();
-        }
     }
 
     fn handleGatheringResponseRead(
@@ -2183,8 +2179,6 @@ pub const AgentContext = struct {
         gathering_context: *GatheringContext,
         raw_message: []const u8,
     ) !void {
-        if (self.gathering_candidate_statuses[gathering_context.candidate_index] != .checking) return;
-
         const candidate = self.local_candidates.items[gathering_context.candidate_index];
         log.debug("Agent {} - Received STUN response for base address \"{}\"", .{ self.id, candidate.base_address });
 
@@ -2199,7 +2193,6 @@ pub const AgentContext = struct {
         const host_candidate = self.local_candidates.items[gathering_context.candidate_index];
 
         const payload = result catch |err| {
-            self.gathering_candidate_statuses[gathering_context.candidate_index] = .failed;
             log.debug("Agent {} - Gathering failed with {} for base address \"{}\"", .{ self.id, err, host_candidate.base_address });
             return;
         };
@@ -2224,11 +2217,9 @@ pub const AgentContext = struct {
                     .address_index = @intCast(gathering_context.candidate_index),
                 },
             };
-            self.local_candidates.append(self.allocator, candidate) catch unreachable;
-            self.on_candidate_callback(self.userdata, self, .{ .candidate = candidate });
+            self.addLocalCandidate(candidate) catch unreachable;
         }
 
-        self.gathering_candidate_statuses[gathering_context.candidate_index] = .done;
         log.debug("Agent {} - Gathering done for base address \"{}\"", .{ self.id, host_candidate.base_address });
     }
 
@@ -2253,15 +2244,18 @@ pub const AgentContext = struct {
             @panic("TODO");
         };
 
-        // Get a candidate still in the .new state or disarm the timer.
-        const candidate_index = self.getUncheckedCandidateIndex() orelse return;
-        const socket_context = &self.socket_contexts[candidate_index];
+        const candidate_index = self.gathering_queue.pop() orelse {
+            self.setGatheringState(.done);
+            return;
+        };
+        const socket = self.sockets.items[candidate_index];
 
-        const address = switch (socket_context.address.any.family) {
+        const address = switch (socket.address.any.family) {
             std.os.AF.INET => Configuration.stun_address_ipv4,
             std.os.AF.INET6 => Configuration.stun_address_ipv6,
             else => unreachable,
         };
+
         var buffer: [4096]u8 = undefined;
         const request = r: {
             var allocator = std.heap.FixedBufferAllocator.init(&buffer);
@@ -2277,7 +2271,7 @@ pub const AgentContext = struct {
         errdefer self.buffer_pool.destroy(read_buffer);
 
         const transaction = Transaction.init(
-            socket_context.socket,
+            socket.fd,
             address,
             request,
             write_buffer,
@@ -2296,17 +2290,12 @@ pub const AgentContext = struct {
             },
         };
 
-        log.debug("Agent {} - Starting transaction for base address \"{}\"", .{ self.id, socket_context.address });
+        log.debug("Agent {} - Starting transaction for base address \"{}\"", .{ self.id, socket.address });
         stun_context_entry.stun_context.gathering.transaction.start(
-            Configuration.computeRtoGatheringMs(self.socket_contexts.len),
+            Configuration.computeRtoGatheringMs(self.sockets.items.len),
             self.loop,
         );
 
-        // Set the candidate in the .checking state
-        self.gathering_candidate_statuses[candidate_index] = .checking;
-
-        // NOTE(Corendos): Small improvement could be done here. If we now that there won't be any new candidates the next time we go through this function,
-        //                 we could avoid one main timer delay.
         if (!self.flags.stopped) {
             self.gathering_main_timer.run(
                 self.loop,
@@ -2322,8 +2311,7 @@ pub const AgentContext = struct {
     fn handleConnectivityCheckEvent(self: *AgentContext, result: ConnectivityCheckEventResult) void {
         switch (result) {
             .request_read => |payload| {
-                const socket_context = &self.socket_contexts[payload.socket_context_index];
-                self.handleConnectivityCheckRequestRead(payload.raw_message, payload.address, socket_context) catch @panic("TODO: Request Read failed");
+                self.handleConnectivityCheckRequestRead(payload.raw_message, payload.address, payload.socket_index) catch @panic("TODO: Request Read failed");
             },
             .response_write => {
                 log.debug("Agent {} - Stun response sent !", .{self.id});
@@ -2385,17 +2373,17 @@ pub const AgentContext = struct {
         _ = loop;
 
         const self = @as(*AgentContext, @ptrCast(@alignCast(userdata.?)));
-        const socket_context = @fieldParentPtr(SocketContext, "read_completion", c);
-        const socket_context_index = socket_context.index;
+        const socket_data = @fieldParentPtr(SocketData, "read_completion", c);
+        const socket = self.sockets.items[socket_data.socket_index];
 
         const bytes_read = result.recvmsg catch |err| {
             if (err == error.Canceled and self.flags.stopped) return .disarm;
-            log.err("Agent {} - Got {} for base address \"{}\" while reading from socket", .{ self.id, err, socket_context.address });
+            log.err("Agent {} - Got {} for base address \"{}\" while reading from socket", .{ self.id, err, socket.address });
             return if (self.flags.stopped) .disarm else .rearm;
         };
 
-        const data = socket_context.read_buffer[0..bytes_read];
-        const source = socket_context.read_data.address;
+        const data = socket_data.read_buffer[0..bytes_read];
+        const source = socket_data.address;
 
         const stun_header_result = b: {
             var stream = std.io.fixedBufferStream(data);
@@ -2406,7 +2394,7 @@ pub const AgentContext = struct {
         if (stun_header_result) |stun_header| {
             switch (stun_header.type.class) {
                 .request => {
-                    self.handleConnectivityCheckEvent(.{ .request_read = .{ .socket_context_index = socket_context_index, .raw_message = data, .address = source } });
+                    self.handleConnectivityCheckEvent(.{ .request_read = .{ .socket_index = socket_data.socket_index, .raw_message = data, .address = source } });
                 },
                 .indication => @panic("An indication, really ?"),
                 else => {
@@ -2498,11 +2486,11 @@ pub const AgentContext = struct {
 
         self.check_response_queue_write_data.from(response_entry.source, data);
 
-        const socket_context = &self.socket_contexts[response_entry.socket_index];
+        const socket = self.sockets.items[response_entry.socket_index];
         self.check_response_queue_write_completion = xev.Completion{
             .op = .{
                 .sendmsg = .{
-                    .fd = socket_context.socket,
+                    .fd = socket.fd,
                     .msghdr = &self.check_response_queue_write_data.message_header,
                     .buffer = null,
                 },
@@ -2558,12 +2546,11 @@ pub const AgentContext = struct {
         _ = loop;
 
         const self = @as(*AgentContext, @ptrCast(@alignCast(userdata.?)));
-        const socket_context = for (self.socket_contexts) |*ctx| {
-            if (ctx.socket == c.op.sendmsg.fd) break ctx;
+        const socket_index = for (self.sockets.items, 0..) |socket, i| {
+            if (socket.fd == c.op.sendmsg.fd) break i;
         } else unreachable;
-        const socket_context_index = socket_context.index;
 
-        self.handleConnectivityCheckEvent(.{ .response_write = .{ .socket_context_index = socket_context_index, .result = result.sendmsg } });
+        self.handleConnectivityCheckEvent(.{ .response_write = .{ .socket_index = socket_index, .result = result.sendmsg } });
 
         return .disarm;
     }
@@ -2640,7 +2627,7 @@ pub const AgentContext = struct {
         self: *AgentContext,
         raw_message: []const u8,
         source: std.net.Address,
-        socket_context: *SocketContext,
+        socket_index: usize,
     ) !void {
         defer self.checklist.updateState();
 
@@ -2661,7 +2648,7 @@ pub const AgentContext = struct {
         if (self.detectAndRepairRoleConflict(request)) {
             // Enqueue a 487 STUN response.
             self.check_response_queue.push(ResponseEntry{
-                .socket_index = socket_context.index,
+                .socket_index = socket_index,
                 .transaction_id = request.transaction_id,
                 .source = source,
                 .flags = .{ .role_conflict = true },
@@ -2673,7 +2660,7 @@ pub const AgentContext = struct {
 
         // Enqueue response.
         self.check_response_queue.push(ResponseEntry{
-            .socket_index = socket_context.index,
+            .socket_index = socket_index,
             .transaction_id = request.transaction_id,
             .source = source,
             .flags = .{ .role_conflict = false },
@@ -2683,8 +2670,10 @@ pub const AgentContext = struct {
             if (a.type == ztun.attr.Type.use_candidate) break true;
         } else false;
 
+        const socket = self.sockets.items[socket_index];
+
         // Find local candidate whose transport address matches the address on which the request was received.
-        const local_candidate_index = self.getLocalCandidateIndexFromTransportAddress(socket_context.address) orelse unreachable;
+        const local_candidate_index = self.getLocalCandidateIndexFromTransportAddress(socket.address) orelse unreachable;
         const remote_candidate_index = self.getRemoteCandidateIndexFromTransportAddress(source) orelse {
             log.debug("Agent {} - No remote candidate matching the source address (peer reflexive candidate maybe?)", .{self.id});
             return;
@@ -2931,8 +2920,8 @@ pub const AgentContext = struct {
         const local_candidate = self.local_candidates.items[candidate_pair.local_candidate_index];
         const remote_candidate = self.remote_candidates.items[candidate_pair.remote_candidate_index];
 
-        const socket_context_index = self.getSocketContextIndexFromAddress(local_candidate.base_address).?;
-        const socket_context = &self.socket_contexts[socket_context_index];
+        const socket_index = self.getSocketIndexFromAddress(local_candidate.base_address).?;
+        const socket = self.sockets.items[socket_index];
 
         var buffer: [4096]u8 = undefined;
         const request = r: {
@@ -2959,7 +2948,7 @@ pub const AgentContext = struct {
         errdefer self.buffer_pool.destroy(read_buffer);
 
         var transaction = Transaction.init(
-            socket_context.socket,
+            socket.fd,
             remote_candidate.transport_address,
             request,
             write_buffer,
@@ -2972,7 +2961,7 @@ pub const AgentContext = struct {
         stun_context_entry.transaction_id = request.transaction_id;
         stun_context_entry.stun_context = .{
             .check = ConnectivityCheckContext{
-                .socket_index = socket_context_index,
+                .socket_index = socket_index,
                 .candidate_pair = candidate_pair,
                 .transaction = transaction,
                 .flags = .{
@@ -3140,10 +3129,10 @@ const GatheringEventResult = union(enum) {
 };
 
 const ConnectivityCheckEventResult = union(enum) {
-    request_read: struct { socket_context_index: usize, raw_message: []const u8, address: std.net.Address },
+    request_read: struct { socket_index: usize, raw_message: []const u8, address: std.net.Address },
     response_read: struct { stun_context: *StunContext, raw_message: []const u8, address: std.net.Address },
     completed: struct { stun_context: *StunContext, result: TransactionResult },
-    response_write: struct { socket_context_index: usize, result: xev.WriteError!usize },
+    response_write: struct { socket_index: usize, result: xev.WriteError!usize },
     main_timer: xev.Timer.RunError!void,
 };
 
@@ -3629,8 +3618,8 @@ pub const Context = struct {
 
 test "Basic structs size" {
     try std.testing.expectEqual(@as(usize, 1512), @sizeOf(StunContext));
-    try std.testing.expectEqual(@as(usize, 632), @sizeOf(SocketContext));
-    try std.testing.expectEqual(@as(usize, 2720), @sizeOf(AgentContext));
+    try std.testing.expectEqual(@as(usize, 504), @sizeOf(SocketData));
+    try std.testing.expectEqual(@as(usize, 2840), @sizeOf(AgentContext));
 }
 
 test {
