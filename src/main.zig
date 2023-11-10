@@ -1249,6 +1249,12 @@ const StunContext = union(StunContextType) {
     gathering: GatheringContext,
     check: ConnectivityCheckContext,
 
+    pub inline fn transactionId(self: StunContext) u96 {
+        return switch (self) {
+            inline else => |v| v.transaction.transaction_id,
+        };
+    }
+
     pub fn cancel(self: *StunContext, loop: *xev.Loop) void {
         switch (self.*) {
             inline else => |*v| v.transaction.cancel(loop),
@@ -1317,21 +1323,6 @@ pub const AuthParameters = struct {
     }
 };
 
-/// Represents an entry in an array of STUN contexts.
-/// The gentContext stores a fixed array of entries that can be used to gather candidates or perform connectivity checks.
-const StunContextEntry = struct {
-    /// The transaction ID of the associated STUN transaction.
-    transaction_id: u96,
-    /// The context of the STUN transaction.
-    stun_context: StunContext,
-
-    /// Various flags.
-    flags: packed struct {
-        /// Is this entry currently in use.
-        in_use: bool = false,
-    } = .{},
-};
-
 /// Represents the context associated with an ICE agent.
 /// This stores all the required data to handle all the lifecycle of an ICE agent.
 pub const AgentContext = struct {
@@ -1367,7 +1358,7 @@ pub const AgentContext = struct {
     buffer_pool: std.heap.MemoryPool([4096]u8),
 
     /// A fixed size array of STUN context entry that can be used to gather candidates or perform connectivity checks.
-    stun_context_entries: *[64]StunContextEntry,
+    stun_context_entries: *[64]?StunContext,
 
     /// Contains bound sockets.
     sockets: std.ArrayList(Socket),
@@ -1457,9 +1448,9 @@ pub const AgentContext = struct {
         var check_response_queue_write_buffer = try buffer_pool.create();
         errdefer buffer_pool.destroy(check_response_queue_write_buffer);
 
-        const stun_context_entries = try allocator.create([64]StunContextEntry);
+        const stun_context_entries = try allocator.create([64]?StunContext);
         errdefer allocator.destroy(stun_context_entries);
-        @memset(stun_context_entries[0..], .{ .transaction_id = undefined, .stun_context = undefined });
+        @memset(stun_context_entries[0..], null);
 
         var checklist = Checklist.init();
 
@@ -1501,8 +1492,8 @@ pub const AgentContext = struct {
 
         for (self.sockets.items) |s| s.cancel(self.loop);
 
-        for (self.stun_context_entries) |*entry| if (entry.flags.in_use) {
-            entry.stun_context.cancel(self.loop);
+        for (self.stun_context_entries) |*maybe_stun_context| if (maybe_stun_context.*) |*stun_context| {
+            stun_context.cancel(self.loop);
         };
 
         if (self.gathering_main_timer_completion.state() == .active) {
@@ -1531,7 +1522,7 @@ pub const AgentContext = struct {
     /// Returns true if the agent is done with all potential ongoing operations.
     pub fn done(self: *const AgentContext) bool {
         for (self.sockets.items) |s| if (!s.done()) return false;
-        for (self.stun_context_entries) |*entry| if (entry.flags.in_use) return false;
+        for (self.stun_context_entries) |maybe_stun_context| if (maybe_stun_context) |_| return false;
         if (self.gathering_main_timer_completion.state() != .dead or self.gathering_main_timer_cancel_completion.state() != .dead) return false;
         if (self.connectivity_checks_timer_completion.state() != .dead or self.connectivity_checks_timer_cancel_completion.state() != .dead) return false;
 
@@ -2052,17 +2043,19 @@ pub const AgentContext = struct {
     }
 
     pub fn releaseStunContext(self: *AgentContext, stun_context: *StunContext) void {
-        for (self.stun_context_entries) |*entry| {
-            if (&entry.stun_context == stun_context) {
-                switch (entry.stun_context) {
-                    inline else => |*ctx| {
-                        self.buffer_pool.destroy(@alignCast(ctx.transaction.write_buffer[0..4096]));
-                        self.buffer_pool.destroy(@alignCast(ctx.transaction.read_buffer[0..4096]));
-                        ctx.transaction.deinit();
-                    },
+        for (self.stun_context_entries) |*maybe_stun_context| {
+            if (maybe_stun_context.*) |*current_stun_context| {
+                if (current_stun_context == stun_context) {
+                    switch (current_stun_context.*) {
+                        inline else => |*ctx| {
+                            self.buffer_pool.destroy(@alignCast(ctx.transaction.write_buffer[0..4096]));
+                            self.buffer_pool.destroy(@alignCast(ctx.transaction.read_buffer[0..4096]));
+                            ctx.transaction.deinit();
+                        },
+                    }
+                    maybe_stun_context.* = null;
+                    return;
                 }
-                entry.flags.in_use = false;
-                return;
             }
         }
     }
@@ -2096,13 +2089,14 @@ pub const AgentContext = struct {
 
                 if (!current_entry.pair.eql(candidate_pair) and current_local_candidate.component_id == valid_local_candidate.component_id) {
                     // Cancel in-progress transaction for the removed entry.
-                    for (self.stun_context_entries) |*entry| {
-                        if (!entry.flags.in_use) continue;
-                        if (entry.stun_context != .check) continue;
-                        const check_context = &entry.stun_context.check;
-                        if (check_context.candidate_pair.eql(current_entry.pair)) {
-                            check_context.transaction.stopRetransmits(loop);
-                            check_context.flags.is_canceled = true;
+                    for (self.stun_context_entries) |*maybe_stun_context| {
+                        if (maybe_stun_context.*) |*stun_context| {
+                            if (stun_context.* != .check) continue;
+                            const check_context = &stun_context.check;
+                            if (check_context.candidate_pair.eql(current_entry.pair)) {
+                                check_context.transaction.stopRetransmits(loop);
+                                check_context.flags.is_canceled = true;
+                            }
                         }
                     }
 
@@ -2223,17 +2217,21 @@ pub const AgentContext = struct {
         log.debug("Agent {} - Gathering done for base address \"{}\"", .{ self.id, host_candidate.base_address });
     }
 
-    fn getFreeStunContextEntry(self: *AgentContext) ?*StunContextEntry {
-        const entry = for (self.stun_context_entries) |*entry| {
-            if (!entry.flags.in_use) break entry;
+    fn getFreeStunContext(self: *AgentContext) ?*StunContext {
+        const stun_context = for (self.stun_context_entries) |*maybe_stun_context| {
+            if (maybe_stun_context.* == null) {
+                break maybe_stun_context;
+            }
         } else return null;
-        entry.flags.in_use = true;
-        return entry;
+        stun_context.* = undefined;
+        return &stun_context.*.?;
     }
 
-    fn getStunContextEntryFromTransactionId(self: *AgentContext, transaction_id: u96) ?*StunContextEntry {
-        return for (self.stun_context_entries) |*entry| {
-            if (entry.flags.in_use and entry.transaction_id == transaction_id) break entry;
+    fn getStunContextFromTransactionId(self: *AgentContext, transaction_id: u96) ?*StunContext {
+        return for (self.stun_context_entries) |*maybe_stun_context| {
+            if (maybe_stun_context.*) |*stun_context| {
+                if (stun_context.transactionId() == transaction_id) break stun_context;
+            }
         } else null;
     }
 
@@ -2262,7 +2260,8 @@ pub const AgentContext = struct {
             break :r makeBasicBindingRequest(allocator.allocator(), null) catch unreachable;
         };
 
-        const stun_context_entry = self.getFreeStunContextEntry() orelse unreachable;
+        const stun_context = self.getFreeStunContext() orelse unreachable;
+        errdefer self.releaseStunContext(stun_context);
 
         const write_buffer = self.buffer_pool.create() catch unreachable;
         errdefer self.buffer_pool.destroy(write_buffer);
@@ -2281,8 +2280,7 @@ pub const AgentContext = struct {
         );
         errdefer transaction.deinit();
 
-        stun_context_entry.transaction_id = request.transaction_id;
-        stun_context_entry.stun_context = .{
+        stun_context.* = .{
             .gathering = .{
                 .socket_index = candidate_index,
                 .candidate_index = candidate_index,
@@ -2291,7 +2289,7 @@ pub const AgentContext = struct {
         };
 
         log.debug("Agent {} - Starting transaction for base address \"{}\"", .{ self.id, socket.address });
-        stun_context_entry.stun_context.gathering.transaction.start(
+        stun_context.gathering.transaction.start(
             Configuration.computeRtoGatheringMs(self.sockets.items.len),
             self.loop,
         );
@@ -2398,12 +2396,12 @@ pub const AgentContext = struct {
                 },
                 .indication => @panic("An indication, really ?"),
                 else => {
-                    const stun_context_entry_opt = self.getStunContextEntryFromTransactionId(stun_header.transaction_id);
+                    const stun_context_opt = self.getStunContextFromTransactionId(stun_header.transaction_id);
 
-                    if (stun_context_entry_opt) |stun_context_entry| {
-                        switch (stun_context_entry.stun_context) {
-                            .gathering => self.handleGatheringEvent(.{ .read = .{ .stun_context = &stun_context_entry.stun_context, .raw_message = data } }),
-                            .check => self.handleConnectivityCheckEvent(.{ .response_read = .{ .stun_context = &stun_context_entry.stun_context, .raw_message = data, .address = source } }),
+                    if (stun_context_opt) |stun_context| {
+                        switch (stun_context.*) {
+                            .gathering => self.handleGatheringEvent(.{ .read = .{ .stun_context = stun_context, .raw_message = data } }),
+                            .check => self.handleConnectivityCheckEvent(.{ .response_read = .{ .stun_context = stun_context, .raw_message = data, .address = source } }),
                         }
                     } else {
                         log.debug("Agent {} - Received STUN response with unknown transaction ID", .{self.id});
@@ -2428,9 +2426,9 @@ pub const AgentContext = struct {
 
     fn gatheringTransactionCompleteCallback(userdata: ?*anyopaque, transaction: *Transaction, result: TransactionResult) void {
         const self = @as(*AgentContext, @ptrCast(@alignCast(userdata.?)));
-        const stun_context_entry = self.getStunContextEntryFromTransactionId(transaction.transaction_id) orelse unreachable;
+        const stun_context = self.getStunContextFromTransactionId(transaction.transaction_id) orelse unreachable;
 
-        self.handleGatheringEvent(.{ .completed = .{ .stun_context = &stun_context_entry.stun_context, .result = result } });
+        self.handleGatheringEvent(.{ .completed = .{ .stun_context = stun_context, .result = result } });
     }
 
     fn mainTimerCallback(
@@ -2561,9 +2559,9 @@ pub const AgentContext = struct {
         result: TransactionResult,
     ) void {
         const self = @as(*AgentContext, @ptrCast(@alignCast(userdata.?)));
-        const stun_context_entry = self.getStunContextEntryFromTransactionId(transaction.transaction_id) orelse unreachable;
+        const stun_context = self.getStunContextFromTransactionId(transaction.transaction_id) orelse unreachable;
 
-        self.handleConnectivityCheckEvent(.{ .completed = .{ .stun_context = &stun_context_entry.stun_context, .result = result } });
+        self.handleConnectivityCheckEvent(.{ .completed = .{ .stun_context = stun_context, .result = result } });
     }
 
     fn checkMessageIntegrity(request: ztun.Message, password: []const u8) !void {
@@ -2709,13 +2707,15 @@ pub const AgentContext = struct {
                 else => {
                     log.debug("Agent {} - Adding {}:{} to the triggered check queue", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
                     if (entry.data.state == .in_progress) {
-                        for (self.stun_context_entries) |*stun_entry| {
-                            if (!stun_entry.flags.in_use) continue;
-                            if (stun_entry.stun_context != .check) continue;
-                            const check_context: *ConnectivityCheckContext = &stun_entry.stun_context.check;
-                            if (check_context.candidate_pair.eql(candidate_pair) and !check_context.flags.is_canceled) {
-                                check_context.transaction.stopRetransmits(self.loop);
-                                check_context.flags.is_canceled = true;
+                        for (self.stun_context_entries) |*maybe_stun_context| {
+                            if (maybe_stun_context.*) |*stun_context| {
+                                if (stun_context.* != .check) continue;
+
+                                const check_context: *ConnectivityCheckContext = &stun_context.check;
+                                if (check_context.candidate_pair.eql(candidate_pair) and !check_context.flags.is_canceled) {
+                                    check_context.transaction.stopRetransmits(self.loop);
+                                    check_context.flags.is_canceled = true;
+                                }
                             }
                         }
                     }
@@ -2938,8 +2938,8 @@ pub const AgentContext = struct {
             ) catch unreachable;
         };
 
-        const stun_context_entry = self.getFreeStunContextEntry() orelse unreachable;
-        errdefer stun_context_entry.flags.in_use = false;
+        const stun_context = self.getFreeStunContext() orelse unreachable;
+        errdefer self.releaseStunContext(stun_context);
 
         const write_buffer = try self.buffer_pool.create();
         errdefer self.buffer_pool.destroy(write_buffer);
@@ -2958,8 +2958,7 @@ pub const AgentContext = struct {
         );
         errdefer transaction.deinit();
 
-        stun_context_entry.transaction_id = request.transaction_id;
-        stun_context_entry.stun_context = .{
+        stun_context.* = .{
             .check = ConnectivityCheckContext{
                 .socket_index = socket_index,
                 .candidate_pair = candidate_pair,
@@ -2982,7 +2981,7 @@ pub const AgentContext = struct {
         const check_count = self.checklist.pairs.slice().len;
         const waiting_count = self.checklist.getPairCount(.waiting);
         const in_progress_count = self.checklist.getPairCount(.in_progress);
-        stun_context_entry.stun_context.check.transaction.start(Configuration.computeRtoCheckMs(check_count, waiting_count, in_progress_count), self.loop);
+        stun_context.check.transaction.start(Configuration.computeRtoCheckMs(check_count, waiting_count, in_progress_count), self.loop);
 
         if (!is_nominated) {
             self.checklist.setPairState(candidate_pair, .in_progress);
