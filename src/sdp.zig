@@ -256,6 +256,12 @@ pub fn makeSdp(pwd: []const u8, username: []const u8, candidates: []const zice.C
             zice.fmt.addressFormatter(c.transport_address),
             c.type.toString(),
         });
+        if (c.type == .server_reflexive) {
+            try writer.print(" raddr {a} rport {p}", .{
+                zice.fmt.addressFormatter(c.base_address),
+                zice.fmt.addressFormatter(c.base_address),
+            });
+        }
     }
 
     const sdp_template_2 =
