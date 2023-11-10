@@ -11,13 +11,13 @@ const LinuxBackend = enum {
 pub fn buildSamples(
     b: *std.build.Builder,
     sample_utils_module: *std.Build.Module,
-    xev_module: *std.Build.Module,
     optimize: std.builtin.Mode,
     target: std.zig.CrossTarget,
 ) !void {
-    _ = xev_module;
     var arena_state = std.heap.ArenaAllocator.init(b.allocator);
     defer arena_state.deinit();
+
+    const websocket_module = b.dependency("websocket", .{ .target = target, .optimize = optimize }).module("websocket");
 
     const directory_path = try b.build_root.join(arena_state.allocator(), &[_][]const u8{"samples"});
 
@@ -39,6 +39,7 @@ pub fn buildSamples(
             .optimize = optimize,
         });
         executable.addModule("zice", b.modules.get("zice").?);
+        executable.addModule("websocket", websocket_module);
         executable.addModule("utils", sample_utils_module);
         const install_executable = b.addInstallArtifact(executable, .{});
 
@@ -113,7 +114,7 @@ pub fn build(b: *std.build.Builder) void {
             .{ .name = "zice", .module = b.modules.get("zice").? },
         },
     });
-    buildSamples(b, sample_utils_module, xev_module, optimize, target) catch unreachable;
+    buildSamples(b, sample_utils_module, optimize, target) catch unreachable;
 }
 
 inline fn thisDir() []const u8 {

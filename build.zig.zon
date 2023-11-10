@@ -11,5 +11,9 @@
             .url = "https://github.com/Corendos/libxev/archive/efcd521.tar.gz",
             .hash = "122066c6617bd0c106280eaf6bf7a8169c197cec7b97d35c5add1d3439b65984cefa",
         },
+        .websocket = .{
+            .url = "https://github.com/karlseguin/websocket.zig/archive/e576bff2e45546d0ec1935f85ab8267eebdf48e1.tar.gz",
+            .hash = "12204577a96a2e1853b96ea10c1c3787e3f4523e7b6aa89ef78041459261f97a6cc1",
+        },
     },
 }
