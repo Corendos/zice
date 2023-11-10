@@ -10,21 +10,26 @@ const zice = @import("zice");
 pub const std_options = struct {
     pub const log_scope_levels = &.{
         //std.log.ScopeLevel{ .scope = .default, .level = .info },
-        std.log.ScopeLevel{ .scope = .zice, .level = .debug },
+        //std.log.ScopeLevel{ .scope = .zice, .level = .debug },
     };
     pub const logFn = utils.logFn;
 };
 
-pub fn candidateCallback(userdata: ?*anyopaque, agent_index: u32, result: zice.CandidateResult) void {
+pub fn candidateCallback(userdata: ?*anyopaque, agent_context: *zice.AgentContext, result: zice.CandidateResult) void {
     _ = userdata;
     if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent_index, @tagName(result.candidate.type), result.candidate.foundation.as_number(), result.candidate.transport_address });
+        std.log.info("Agent {} new candidate: ({s}) {} {}", .{
+            agent_context.id,
+            @tagName(result.candidate.type),
+            result.candidate.foundation.asNumber(),
+            result.candidate.transport_address,
+        });
     }
 }
 
-pub fn stateChangeCallback(userdata: ?*anyopaque, agent_index: u32, state: zice.GatheringState) void {
+pub fn stateChangeCallback(userdata: ?*anyopaque, agent_context: *zice.AgentContext, state: zice.AgentState) void {
     _ = userdata;
-    std.log.info("Agent {} new gathering state: {any}", .{ agent_index, state });
+    std.log.info("Agent {} new state: {any}", .{ agent_context.id, state });
 }
 
 const Context = struct {
@@ -73,7 +78,11 @@ pub fn main() !void {
     }).f, .{&context});
     defer t.join();
 
-    const agent = try zice_context.createAgent(.{});
+    const agent = try zice_context.createAgent(.{
+        .userdata = &context,
+        .on_candidate_callback = candidateCallback,
+        .on_state_change_callback = stateChangeCallback,
+    });
     context.agent = agent;
 
     var gather_completion: zice.ContextCompletion = undefined;
