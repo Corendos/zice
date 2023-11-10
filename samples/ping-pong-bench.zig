@@ -15,7 +15,8 @@ pub const std_options = struct {
     pub const logFn = utils.logFn;
 };
 
-pub const message = [_]u8{1} ** 4096;
+const message_size = 2048;
+pub const message = [_]u8{1} ** message_size;
 
 pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, result: zice.CandidateResult) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
@@ -72,6 +73,8 @@ pub fn controlledStateChangeCallback(userdata: ?*anyopaque, agent: *zice.AgentCo
 pub fn controllingDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
     _ = component_id;
 
+    std.debug.assert(data.len == message_size);
+
     std.log.debug("Agent {} - Received message \"{s}\"", .{ agent.id, data });
 
     const context: *Context = @alignCast(@ptrCast(userdata.?));
@@ -85,6 +88,8 @@ pub fn controllingDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext,
 
 pub fn controlledDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
     _ = component_id;
+
+    std.debug.assert(data.len == message_size);
 
     std.log.debug("Agent {} - Received message \"{s}\"", .{ agent.id, data });
 
@@ -105,6 +110,7 @@ fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.ContextResult) vo
 const AgentData = struct {
     id: zice.AgentId,
     candidates: std.ArrayList(zice.Candidate),
+    completed: bool = false,
 
     pub fn init(id: zice.AgentId, allocator: std.mem.Allocator) !AgentData {
         var candidates = std.ArrayList(zice.Candidate).init(allocator);
@@ -342,7 +348,12 @@ fn asyncCallback(userdata: ?*Context, loop: *xev.Loop, c: *xev.Completion, resul
                 setRemoteCandidates(context, source_agent_data, destination_agent_data) catch unreachable;
             },
             .ice_completed => |agent_type| {
-                if (agent_type == .controlling) {
+                switch (agent_type) {
+                    .controlling => context.controlling_agent_data.?.completed = true,
+                    .controlled => context.controlled_agent_data.?.completed = true,
+                }
+
+                if (context.controlling_agent_data.?.completed and context.controlled_agent_data.?.completed) {
                     context.benchmark_state.start_timestamp = std.time.nanoTimestamp();
                     _ = send(context, &context.controlling_agent_data.?, 1, 1, &message) catch unreachable;
                     context.benchmark_state.message_sent += 1;
