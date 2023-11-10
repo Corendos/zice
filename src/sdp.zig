@@ -226,29 +226,26 @@ pub const Parser = struct {
     }
 };
 
-pub fn makeSdp(pwd: []const u8, username: []const u8, candidates: []const zice.Candidate, allocator: std.mem.Allocator) ![]const u8 {
+pub fn makeSdp(pwd: []const u8, username: []const u8, candidates: []const zice.Candidate, is_controlling: bool, allocator: std.mem.Allocator) ![]const u8 {
     var buffer = std.ArrayList(u8).init(allocator);
     defer buffer.deinit();
 
     var writer = buffer.writer();
 
-    const sdp_template =
+    const sdp_template_1 =
         \\v=0
-        \\o=jdoe 2890844526 2890842807 IN IP4 203.0.113.141
-        \\s=
-        \\c=IN IP4 192.0.2.3
+        \\o=jdoe 2890844526 2890842807 IN IP4 0.0.0.0
+        \\s=-
         \\t=0 0
+        \\a=sendrecv
+        \\a=fingerprint:sha-256 49:66:12:17:0D:1C:91:AE:57:4C:C6:36:DD:D5:97:D2:7D:62:C9:9A:7F:B9:A3:F4:70:03:E7:43:91:73:23:5E
+        \\a=group:BUNDLE 0
         \\a=ice-options:ice2
-        \\a=ice-pacing:50
-        \\a=ice-pwd:{s}
-        \\a=ice-ufrag:{s}
-        \\m=audio 45664 RTP/AVP 0
-        \\b=RS:0
-        \\b=RR:0
-        \\a=rtpmap:0 PCMU/8000
+        \\a=msid-semantic:WMS *
+        \\m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+        \\c=IN IP4 0.0.0.0
     ;
-
-    try writer.print(sdp_template, .{ pwd, username });
+    try writer.writeAll(sdp_template_1);
 
     for (candidates) |*c| {
         try writer.print("\na=candidate:{} {} UDP {} {a} {p} typ {s}", .{
@@ -261,26 +258,42 @@ pub fn makeSdp(pwd: []const u8, username: []const u8, candidates: []const zice.C
         });
     }
 
+    const sdp_template_2 =
+        \\
+        \\a=sendrecv
+        \\a=ice-pwd:{s}
+        \\a=ice-ufrag:{s}
+        \\a=mid:0{s}
+        \\a=sctp-port:5000
+        \\a=max-message-size:1073741823
+    ;
+
+    try writer.print(sdp_template_2, .{ pwd, username, if (is_controlling) "\na=setup:actpass" else "" });
+
     return buffer.toOwnedSlice();
 }
 
 test "smoke test" {
     const sdp =
         \\v=0
-        \\o=jdoe 2890844526 2890842807 IN IP4 203.0.113.141
-        \\s=
-        \\c=IN IP4 192.0.2.3
+        \\o=jdoe 2890844526 2890842807 IN IP4 0.0.0.0
+        \\s=-
         \\t=0 0
+        \\a=sendrecv
+        \\a=fingerprint:sha-256 49:66:12:17:0D:1C:91:AE:57:4C:C6:36:DD:D5:97:D2:7D:62:C9:9A:7F:B9:A3:F4:70:03:E7:43:91:73:23:5E
+        \\a=group:BUNDLE 0
         \\a=ice-options:ice2
-        \\a=ice-pacing:50
-        \\a=ice-pwd:asd88fgpdd777uzjYhagZg
-        \\a=ice-ufrag:8hhY
-        \\m=audio 45664 RTP/AVP 0
-        \\b=RS:0
-        \\b=RR:0
-        \\a=rtpmap:0 PCMU/8000
+        \\a=msid-semantic:WMS *
+        \\m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+        \\c=IN IP4 0.0.0.0
         \\a=candidate:1 1 UDP 2130706431 203.0.113.141 8998 typ host
         \\a=candidate:2 1 UDP 1694498815 192.0.2.3 45664 typ srflx raddr 203.0.113.141 rport 8998
+        \\a=sendrecv
+        \\a=ice-pwd:asd88fgpdd777uzjYhagZg
+        \\a=ice-ufrag:8hhY
+        \\a=mid:0
+        \\a=sctp-port:5000
+        \\a=max-message-size:1073741823
     ;
     var parser = Parser.init(sdp);
 

@@ -17,6 +17,9 @@ pub const std_options = struct {
     pub const logFn = utils.logFn;
 };
 
+const tracker_host = "localhost";
+const tracker_url = std.fmt.comptimePrint("http://{s}:5000", .{tracker_host});
+
 fn stopHandlerCallback(userdata: ?*anyopaque, loop: *xev.Loop, result: utils.StopHandler.Result) void {
     _ = result catch unreachable;
     _ = loop;
@@ -86,7 +89,7 @@ pub fn candidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, resul
     if (result == .candidate) {
         std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent.id, @tagName(result.candidate.type), result.candidate.foundation.asNumber(), result.candidate.transport_address });
     } else if (result == .done) {
-        context.sdp = zice.sdp.makeSdp(&agent.local_auth.password, &agent.local_auth.username_fragment, agent.local_candidates.items, context.allocator) catch unreachable;
+        context.sdp = zice.sdp.makeSdp(agent.local_auth.password, agent.local_auth.username_fragment, agent.local_candidates.items, context.agent_type.? == .controlling, context.allocator) catch unreachable;
         context.event_fifo_mutex.lock();
         defer context.event_fifo_mutex.unlock();
 
@@ -109,7 +112,11 @@ fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.ContextResult) vo
 
 fn remoteDescriptionCallback(userdata: ?*anyopaque, result: zice.ContextResult) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
-    context.allocator.free(context.remote_description.?.candidates);
+    if (context.remote_description) |d| {
+        context.allocator.free(d.candidates);
+        context.allocator.free(d.username_fragment);
+        context.allocator.free(d.password);
+    }
     _ = result;
 }
 
@@ -217,8 +224,9 @@ fn candidateFromAttribute(attribute: zice.sdp.CandidateAttribute) !zice.Candidat
 }
 
 fn parseRemoteDescription(sdp: []const u8, allocator: std.mem.Allocator) !?RemoteDescription {
-    var password: ?[]const u8 = null;
-    var username_fragment: ?[]const u8 = null;
+    var maybe_password: ?[]const u8 = null;
+    var maybe_username_fragment: ?[]const u8 = null;
+
     var candidate_list = std.ArrayList(zice.Candidate).init(allocator);
     defer candidate_list.deinit();
 
@@ -226,10 +234,10 @@ fn parseRemoteDescription(sdp: []const u8, allocator: std.mem.Allocator) !?Remot
     while (parser.next()) |attribute| {
         switch (attribute) {
             .ice_pwd => |ice_pwd_attribute| {
-                password = ice_pwd_attribute.value;
+                maybe_password = ice_pwd_attribute.value;
             },
             .ice_ufrag => |ice_ufrag_attribute| {
-                username_fragment = ice_ufrag_attribute.value;
+                maybe_username_fragment = ice_ufrag_attribute.value;
             },
             .candidate => |c| {
                 const candidate = candidateFromAttribute(c) catch |err| {
@@ -242,12 +250,16 @@ fn parseRemoteDescription(sdp: []const u8, allocator: std.mem.Allocator) !?Remot
         }
     }
 
-    if (password == null) return null;
-    if (username_fragment == null) return null;
+    if (maybe_password == null or maybe_username_fragment == null) {
+        return null;
+    }
+
+    const password = try allocator.dupe(u8, maybe_password.?);
+    const username_fragment = try allocator.dupe(u8, maybe_username_fragment.?);
 
     return RemoteDescription{
-        .password = password.?,
-        .username_fragment = username_fragment.?,
+        .password = password,
+        .username_fragment = username_fragment,
         .candidates = try candidate_list.toOwnedSlice(),
     };
 }
@@ -257,8 +269,12 @@ fn initTracker(client: *std.http.Client, allocator: std.mem.Allocator) !u64 {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
+    const url = std.fmt.allocPrint(arena, "{s}/init", .{tracker_url}) catch unreachable;
 
-    var result = try client.fetch(arena, std.http.Client.FetchOptions{ .method = .POST, .location = .{ .url = "http://91.134.140.104:5000/init" } });
+    var result = try client.fetch(arena, std.http.Client.FetchOptions{
+        .method = .POST,
+        .location = .{ .url = url },
+    });
 
     if (result.status != .ok) return error.InvalidResponse;
 
@@ -274,10 +290,15 @@ fn byeTracker(client: *std.http.Client, peer_id: u64, allocator: std.mem.Allocat
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
+    const url = std.fmt.allocPrint(arena, "{s}/bye", .{tracker_url}) catch unreachable;
 
     const body = try std.json.stringifyAlloc(arena, .{ .peer_id = peer_id }, .{});
 
-    var result = try client.fetch(arena, std.http.Client.FetchOptions{ .method = .POST, .location = .{ .url = "http://91.134.140.104:5000/bye" }, .payload = .{ .string = body } });
+    var result = try client.fetch(arena, std.http.Client.FetchOptions{
+        .method = .POST,
+        .location = .{ .url = url },
+        .payload = .{ .string = body },
+    });
     _ = result;
 }
 
@@ -286,8 +307,12 @@ fn getSources(client: *std.http.Client, peer_id: u64, allocator: std.mem.Allocat
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
+    const url = std.fmt.allocPrint(arena, "{s}/sources", .{tracker_url}) catch unreachable;
 
-    var result = try client.fetch(arena, std.http.Client.FetchOptions{ .method = .GET, .location = .{ .url = "http://91.134.140.104:5000/sources" } });
+    var result = try client.fetch(arena, std.http.Client.FetchOptions{
+        .method = .GET,
+        .location = .{ .url = url },
+    });
 
     if (result.status != .ok) return error.InvalidResponse;
 
@@ -313,11 +338,12 @@ fn initSignaling(allocator: std.mem.Allocator, peer_id: u64) !websocket.Client {
 
     const arena = arena_state.allocator();
 
-    var ws_client = try websocket.connect(allocator, "91.134.140.104", 5001, .{});
+    var ws_client = try websocket.connect(allocator, "localhost", 5001, .{});
 
     const peer_id_header = try std.fmt.allocPrint(arena, "Peer-ID: {}", .{peer_id});
 
-    try ws_client.handshake("/", .{ .headers = peer_id_header });
+    const path = std.fmt.allocPrint(arena, "/{}", .{peer_id}) catch unreachable;
+    try ws_client.handshake(path, .{ .headers = peer_id_header });
 
     return ws_client;
 }
@@ -353,8 +379,8 @@ const Handler = struct {
             context.agent.?,
             &context.remote_description_completion,
             zice.RemoteCandidateParameters{
-                .username_fragment = context.remote_description.?.username_fragment[0..8].*,
-                .password = context.remote_description.?.password[0..24].*,
+                .username_fragment = context.remote_description.?.username_fragment,
+                .password = context.remote_description.?.password,
                 .candidates = context.remote_description.?.candidates,
             },
             context,
