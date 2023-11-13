@@ -9,21 +9,27 @@ const zice = @import("zice");
 
 pub const std_options = struct {
     pub const log_scope_levels = &.{
-        //std.log.ScopeLevel{ .scope = .default, .level = .info },
+        std.log.ScopeLevel{ .scope = .default, .level = .info },
         //std.log.ScopeLevel{ .scope = .zice, .level = .debug },
     };
     pub const logFn = utils.logFn;
 };
 
-pub fn candidateCallback(userdata: ?*anyopaque, agent_context: *zice.AgentContext, result: zice.CandidateResult) void {
+pub fn candidateCallback(userdata: ?*anyopaque, agent_context: *zice.AgentContext, event: zice.CandidateEvent) void {
     _ = userdata;
-    if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{
-            agent_context.id,
-            @tagName(result.candidate.type),
-            result.candidate.foundation.asNumber(),
-            result.candidate.transport_address,
-        });
+    switch (event) {
+        .candidate => |candidate_event| {
+            std.log.info("Agent {} new candidate for media stream {}: ({s}) {} {}", .{
+                agent_context.id,
+                candidate_event.media_stream_id,
+                @tagName(candidate_event.candidate.type),
+                candidate_event.candidate.foundation.asNumber(),
+                candidate_event.candidate.transport_address,
+            });
+        },
+        else => {
+            std.log.info("Agent {} all candidates gathered", .{agent_context.id});
+        },
     }
 }
 
@@ -51,6 +57,20 @@ fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.ContextResult) vo
     _ = result;
     _ = userdata;
     std.log.debug("Started candidate gathering", .{});
+}
+
+fn addMediaStream(context: *zice.Context, agent_id: zice.AgentId, media_stream_id: usize) !void {
+    var future = zice.Future(zice.AddMediaStreamError!void){};
+    var c: zice.ContextCompletion = undefined;
+
+    context.addMediaStream(agent_id, &c, media_stream_id, &future, (struct {
+        fn callback(userdata: ?*anyopaque, result: zice.ContextResult) void {
+            var inner_future: *@TypeOf(future) = @ptrCast(@alignCast(userdata.?));
+            inner_future.set(result.add_media_stream);
+        }
+    }).callback) catch unreachable;
+
+    return future.get();
 }
 
 pub fn main() !void {
@@ -84,6 +104,8 @@ pub fn main() !void {
         .on_state_change_callback = stateChangeCallback,
     });
     context.agent = agent;
+
+    addMediaStream(context.zice_context.?, agent, 1) catch unreachable;
 
     var gather_completion: zice.ContextCompletion = undefined;
     try zice_context.gatherCandidates(agent, &gather_completion, null, gatherCandidateCallback);

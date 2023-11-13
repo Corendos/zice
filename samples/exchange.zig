@@ -15,17 +15,26 @@ pub const std_options = struct {
     pub const logFn = utils.logFn;
 };
 
-pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, result: zice.CandidateResult) void {
+pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, event: zice.CandidateEvent) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
-    if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent.id, @tagName(result.candidate.type), result.candidate.foundation.asNumber(), result.candidate.transport_address });
-        context.controlling_agent_data.?.candidates.append(result.candidate) catch unreachable;
-    } else if (result == .done) {
-        context.event_fifo_mutex.lock();
-        defer context.event_fifo_mutex.unlock();
+    switch (event) {
+        .candidate => |candidate_event| {
+            std.log.info("Agent {} new candidate for media stream {}: ({s}) {} {}", .{
+                agent.id,
+                candidate_event.media_stream_id,
+                @tagName(candidate_event.candidate.type),
+                candidate_event.candidate.foundation.asNumber(),
+                candidate_event.candidate.transport_address,
+            });
+            context.controlling_agent_data.?.addCandidate(candidate_event.media_stream_id, candidate_event.candidate) catch unreachable;
+        },
+        .done => {
+            context.event_fifo_mutex.lock();
+            defer context.event_fifo_mutex.unlock();
 
-        context.event_fifo.push(ContextEvent{ .gathering_done = .controlling }) catch unreachable;
-        context.async_handle.notify() catch unreachable;
+            context.event_fifo.push(ContextEvent{ .gathering_done = .controlling }) catch unreachable;
+            context.async_handle.notify() catch unreachable;
+        },
     }
 }
 
@@ -41,17 +50,26 @@ pub fn controllingStateChangeCallback(userdata: ?*anyopaque, agent: *zice.AgentC
     }
 }
 
-pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, result: zice.CandidateResult) void {
+pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, event: zice.CandidateEvent) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
-    if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent.id, @tagName(result.candidate.type), result.candidate.foundation.asNumber(), result.candidate.transport_address });
-        context.controlled_agent_data.?.candidates.append(result.candidate) catch unreachable;
-    } else if (result == .done) {
-        context.event_fifo_mutex.lock();
-        defer context.event_fifo_mutex.unlock();
+    switch (event) {
+        .candidate => |candidate_event| {
+            std.log.info("Agent {} new candidate for media stream {}: ({s}) {} {}", .{
+                agent.id,
+                candidate_event.media_stream_id,
+                @tagName(candidate_event.candidate.type),
+                candidate_event.candidate.foundation.asNumber(),
+                candidate_event.candidate.transport_address,
+            });
+            context.controlled_agent_data.?.addCandidate(candidate_event.media_stream_id, candidate_event.candidate) catch unreachable;
+        },
+        .done => {
+            context.event_fifo_mutex.lock();
+            defer context.event_fifo_mutex.unlock();
 
-        context.event_fifo.push(ContextEvent{ .gathering_done = .controlled }) catch unreachable;
-        context.async_handle.notify() catch unreachable;
+            context.event_fifo.push(ContextEvent{ .gathering_done = .controlled }) catch unreachable;
+            context.async_handle.notify() catch unreachable;
+        },
     }
 }
 
@@ -67,10 +85,8 @@ pub fn controlledStateChangeCallback(userdata: ?*anyopaque, agent: *zice.AgentCo
     }
 }
 
-pub fn controllingDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
-    _ = component_id;
-
-    std.log.info("Agent {} - Received message \"{s}\"", .{ agent.id, data });
+pub fn controllingDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, media_stream_id: usize, component_id: u8, data: []const u8) void {
+    std.log.info("Agent {} - Received message on component {} of Media Stream {}: \"{s}\"", .{ agent.id, component_id, media_stream_id, data });
 
     const context: *Context = @alignCast(@ptrCast(userdata.?));
 
@@ -81,10 +97,8 @@ pub fn controllingDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext,
     context.async_handle.notify() catch unreachable;
 }
 
-pub fn controlledDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
-    _ = component_id;
-
-    std.log.info("Agent {} - Received message \"{s}\"", .{ agent.id, data });
+pub fn controlledDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, media_stream_id: usize, component_id: u8, data: []const u8) void {
+    std.log.info("Agent {} - Received message on component {} of Media Stream {}: \"{s}\"", .{ agent.id, component_id, media_stream_id, data });
 
     const context: *Context = @alignCast(@ptrCast(userdata.?));
 
@@ -102,20 +116,35 @@ fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.ContextResult) vo
 
 const AgentData = struct {
     id: zice.AgentId,
-    candidates: std.ArrayList(zice.Candidate),
+    allocator: std.mem.Allocator,
+    candidate_map: std.AutoArrayHashMap(usize, std.ArrayList(zice.Candidate)),
 
     pub fn init(id: zice.AgentId, allocator: std.mem.Allocator) !AgentData {
-        var candidates = std.ArrayList(zice.Candidate).init(allocator);
-        errdefer candidates.deinit();
+        var candidate_map = std.AutoArrayHashMap(usize, std.ArrayList(zice.Candidate)).init(allocator);
+        errdefer candidate_map.deinit();
 
         return AgentData{
             .id = id,
-            .candidates = candidates,
+            .allocator = allocator,
+            .candidate_map = candidate_map,
         };
     }
 
+    pub fn addCandidate(self: *AgentData, media_stream_id: usize, candidate: zice.Candidate) !void {
+        const gop = try self.candidate_map.getOrPut(media_stream_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = std.ArrayList(zice.Candidate).init(self.allocator);
+        }
+
+        try gop.value_ptr.append(candidate);
+    }
+
     pub fn deinit(self: *AgentData) void {
-        self.candidates.deinit();
+        var it = self.candidate_map.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.candidate_map.deinit();
     }
 };
 
@@ -130,12 +159,17 @@ const Context = struct {
     async_handle: xev.Async,
     async_completion: xev.Completion = .{},
 
+    allocator: std.mem.Allocator,
+
     flags: packed struct {
         stopped: bool = false,
     } = .{},
 
-    fn init() !Context {
-        return Context{ .async_handle = try xev.Async.init() };
+    fn init(allocator: std.mem.Allocator) !Context {
+        return Context{
+            .async_handle = try xev.Async.init(),
+            .allocator = allocator,
+        };
     }
 
     fn deinit(self: *Context) void {
@@ -190,10 +224,25 @@ fn setRemoteCandidates(context: *Context, source_agent_data: *AgentData, destina
 
     var source_agent_context = context.zice_context.?.getAgentContext(source_agent_data.id) catch unreachable;
 
+    var arena_state = std.heap.ArenaAllocator.init(context.allocator);
+    defer arena_state.deinit();
+
+    var arena = arena_state.allocator();
+
+    var media_stream_parameters = arena.alloc(zice.MediaStreamRemoteParameters, source_agent_data.candidate_map.count()) catch unreachable;
+    var it = source_agent_data.candidate_map.iterator();
+    var index: usize = 0;
+    while (it.next()) |entry| : (index += 1) {
+        media_stream_parameters[index] = .{
+            .media_stream_id = entry.key_ptr.*,
+            .candidates = arena.dupe(zice.Candidate, entry.value_ptr.items) catch unreachable,
+            .username_fragment = source_agent_context.local_auth.username_fragment,
+            .password = source_agent_context.local_auth.password,
+        };
+    }
+
     const parameters = zice.RemoteCandidateParameters{
-        .candidates = source_agent_data.candidates.items,
-        .username_fragment = source_agent_context.local_auth.username_fragment,
-        .password = source_agent_context.local_auth.password,
+        .media_stream_parameters = media_stream_parameters,
     };
 
     var completion: zice.ContextCompletion = undefined;
@@ -263,7 +312,7 @@ fn asyncCallback(userdata: ?*Context, loop: *xev.Loop, c: *xev.Completion, resul
             },
             .ice_completed => |agent_type| {
                 if (agent_type == .controlling) {
-                    _ = send(context, &context.controlling_agent_data.?, 1, 1, "Ping!") catch unreachable;
+                    _ = send(context, &context.controlling_agent_data.?, 2, 1, "Ping!") catch unreachable;
                 }
             },
             .message_received => |agent_type| {
@@ -274,6 +323,20 @@ fn asyncCallback(userdata: ?*Context, loop: *xev.Loop, c: *xev.Completion, resul
         }
     }
     return .rearm;
+}
+
+fn addMediaStream(context: *zice.Context, agent_id: zice.AgentId, media_stream_id: usize) !void {
+    var future = zice.Future(zice.AddMediaStreamError!void){};
+    var c: zice.ContextCompletion = undefined;
+
+    context.addMediaStream(agent_id, &c, media_stream_id, &future, (struct {
+        fn callback(userdata: ?*anyopaque, result: zice.ContextResult) void {
+            var inner_future: *@TypeOf(future) = @ptrCast(@alignCast(userdata.?));
+            inner_future.set(result.add_media_stream);
+        }
+    }).callback) catch unreachable;
+
+    return future.get();
 }
 
 pub fn main() !void {
@@ -288,7 +351,7 @@ pub fn main() !void {
     var stop_handler = try utils.StopHandler.init();
     defer stop_handler.deinit();
 
-    var context = try Context.init();
+    var context = try Context.init(allocator);
     defer context.deinit();
 
     stop_handler.register(&loop, &context, stopHandlerCallback);
@@ -321,6 +384,11 @@ pub fn main() !void {
 
     context.controlling_agent_data = try AgentData.init(controlling_agent, allocator);
     context.controlled_agent_data = try AgentData.init(controlled_agent, allocator);
+
+    for (0..2) |i| {
+        addMediaStream(context.zice_context.?, controlling_agent, i + 1) catch unreachable;
+        addMediaStream(context.zice_context.?, controlled_agent, i + 1) catch unreachable;
+    }
 
     var gather_completion: zice.ContextCompletion = undefined;
     try zice_context.gatherCandidates(controlling_agent, &gather_completion, null, gatherCandidateCallback);

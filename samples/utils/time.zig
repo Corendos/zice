@@ -122,3 +122,37 @@ pub fn localTime(time: std.os.linux.time_t) !tm {
 
     return result;
 }
+
+pub const Stopwatch = struct {
+    start_timestamp: ?u64 = null,
+    elapsed: u64 = 0,
+
+    pub fn initStart() Stopwatch {
+        var stopwatch = Stopwatch{};
+        stopwatch.start();
+        return stopwatch;
+    }
+
+    pub fn start(self: *Stopwatch) void {
+        self.start_timestamp = @as(u64, @intCast(std.time.nanoTimestamp()));
+    }
+
+    pub fn stop(self: *Stopwatch) void {
+        if (self.start_timestamp) |start_timestamp| {
+            const now: u64 = @intCast(std.time.nanoTimestamp());
+            self.elapsed = now - start_timestamp;
+            self.start_timestamp = null;
+        }
+    }
+
+    pub fn isRunning(self: Stopwatch) bool {
+        return self.start_timestamp != null;
+    }
+
+    pub fn elapsedNs(self: Stopwatch) u64 {
+        return if (self.start_timestamp) |start_timestamp| b: {
+            const now: u64 = @intCast(std.time.nanoTimestamp());
+            break :b now - start_timestamp;
+        } else self.elapsed;
+    }
+};
