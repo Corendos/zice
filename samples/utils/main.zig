@@ -38,6 +38,10 @@ pub const LogColor = enum(u8) {
             .debug => .blue,
         };
     }
+
+    pub inline fn endString() [:0]const u8 {
+        return "\x1b[0m";
+    }
 };
 
 const Datetime = struct {
@@ -89,8 +93,8 @@ pub fn logFn(
 
     const datetime = Datetime.now();
 
-    nosuspend stderr.print(level_color_escape.escapeString() ++ "[{}] ", .{datetime}) catch return;
-    nosuspend stderr.print(level_txt ++ prefix2 ++ format ++ "\n" ++ "\x1b[0m", args) catch return;
+    nosuspend stderr.print("[{}] ", .{datetime}) catch return;
+    nosuspend stderr.print(level_color_escape.escapeString() ++ level_txt ++ prefix2 ++ LogColor.endString() ++ format ++ "\n", args) catch return;
 }
 
 pub const StopHandler = struct {
