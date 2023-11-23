@@ -163,6 +163,10 @@ inline fn computePriority(type_preference: u32, local_preference: u32, component
     return (type_preference << 24) + (local_preference << 8) + (256 - @as(u32, component_id));
 }
 
+inline fn extractLocalPreference(priority: u32) u16 {
+    return @intCast((priority >> 8) & 0xFFFF);
+}
+
 test "candidate priority" {
     const priority1 = computePriority(CandidateType.host.preference(), 0, 1);
     const priority2 = computePriority(CandidateType.server_reflexive.preference(), 0, 1);
@@ -879,8 +883,6 @@ pub const Socket = struct {
         try std.os.bind(fd, &address.any, address.getOsSockLen());
         const bound_address = try net.getSocketAddress(fd);
 
-        log.debug("Bound to port {}", .{bound_address.getPort()});
-
         return Socket{
             .fd = fd,
             .address = bound_address,
@@ -1103,12 +1105,13 @@ const Checklist = struct {
     component_count: usize = 0,
 
     /// Initializes a checklist.
-    pub fn init(components: []const u8) Checklist {
-        std.debug.assert(components.len <= 16);
+    pub fn init(component_count: u8) Checklist {
+        std.debug.assert(component_count <= 16);
 
         var component_data: [16]ChecklistComponentData = undefined;
 
-        for (components, 0..) |component_id, index| {
+        for (0..component_count) |index| {
+            const component_id: u8 = @intCast(index + 1);
             component_data[index] = .{ .component_id = component_id };
         }
 
@@ -1116,7 +1119,7 @@ const Checklist = struct {
             .pairs = OrderedPairArray.init(),
             .valid_pairs = OrderedPairArray.init(),
             .component_data = component_data,
-            .component_count = components.len,
+            .component_count = component_count,
         };
     }
 
@@ -1188,14 +1191,25 @@ const Checklist = struct {
     }
 
     /// Sets the state of the candidate pair to the given state.
-    pub fn setPairState(self: *Checklist, candidate_pair: CandidatePair, state: CandidatePairState) void {
-        const entry = self.getEntry(candidate_pair) orelse @panic("TODO: Unknown candidate pair");
+    pub fn setPairState(self: *Checklist, candidate_pair: CandidatePair, state: CandidatePairState) bool {
+        const entry = self.getEntry(candidate_pair) orelse {
+            log.warn("Unknown pair state: {}:{}", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
+            return false;
+        };
+
         const old_state = entry.data.state;
-        if (state != old_state) {
+        return if (state != old_state) b: {
             log.debug("Pair {}:{} state changed from \"{s}\" to \"{s}\"", .{ candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, @tagName(old_state), @tagName(state) });
             entry.data.state = state;
-            self.updateState();
-        }
+            break :b true;
+        } else false;
+    }
+
+    /// Returns true if there is a valid pair for the given component id.
+    fn hasValidPairForComponent(self: Checklist, component_id: usize) bool {
+        return for (self.valid_pairs.slice()) |entry| {
+            if (entry.data.component_id == component_id) break true;
+        } else false;
     }
 
     /// Returns true if there is a nominated pair for the given component id.
@@ -1216,11 +1230,15 @@ const Checklist = struct {
                 break :b .completed;
             }
 
+            const has_valid_pair_for_each_component = for (self.component_data[0..self.component_count]) |component_data| {
+                if (!self.hasValidPairForComponent(component_data.component_id)) break false;
+            } else true;
+
             const are_pairs_done = for (self.pairs.slice()) |entry| {
                 if (entry.data.state != .succeeded and entry.data.state != .failed) break false;
             } else true;
 
-            break :b if (are_pairs_done)
+            break :b if (!has_valid_pair_for_each_component and are_pairs_done)
                 .failed
             else
                 .running;
@@ -1274,17 +1292,20 @@ const MediaStream = struct {
     gathering_queue: CircularBuffer(usize, 16) = .{},
     gathering_in_progress: usize = 0,
 
+    component_count: u8,
+
     /// The associated checklist.
     checklist: Checklist,
 
-    pub fn init(id: usize, local_auth: AuthParameters, allocator: std.mem.Allocator) !MediaStream {
+    pub fn init(id: usize, component_count: u8, local_auth: AuthParameters, allocator: std.mem.Allocator) !MediaStream {
         return MediaStream{
             .id = id,
             .local_auth = try AuthParameters.initFrom(local_auth.username_fragment, local_auth.password, allocator),
             .allocator = allocator,
             .local_candidates = std.ArrayList(Candidate).init(allocator),
             .remote_candidates = std.ArrayList(Candidate).init(allocator),
-            .checklist = Checklist.init(&.{1}),
+            .component_count = component_count,
+            .checklist = Checklist.init(component_count),
         };
     }
 
@@ -1314,7 +1335,7 @@ const MediaStream = struct {
             }
 
             // If we are here, we didn't find another pair with the same foundation in the waiting or in_progress state.
-            self.checklist.setPairState(entry.pair, .waiting);
+            self.setPairState(entry.pair, .waiting);
             return;
         }
     }
@@ -1508,6 +1529,12 @@ const MediaStream = struct {
         }
     }
 
+    fn setPairState(self: *MediaStream, candidate_pair: CandidatePair, state: CandidatePairState) void {
+        if (self.checklist.setPairState(candidate_pair, state)) {
+            self.checklist.updateState();
+        }
+    }
+
     fn printLocalCandidates(self: MediaStream) void {
         for (self.local_candidates.items, 0..) |c, i| {
             log.debug("{}: {}", .{ i, c });
@@ -1648,6 +1675,12 @@ pub const AuthParameters = struct {
 
 const GatheringQueue = CircularBuffer(struct { media_stream_id: usize, candidate_index: usize }, 16);
 
+/// Represents an address from a local interface as well as its associated preference.
+const AddressEntry = struct {
+    address: std.net.Address,
+    preference: u16,
+};
+
 /// Represents the context associated with an ICE agent.
 /// This stores all the required data to handle all the lifecycle of an ICE agent.
 pub const AgentContext = struct {
@@ -1721,6 +1754,7 @@ pub const AgentContext = struct {
     // NOTE(Corendos): ^ We could have one completion/buffer/data per socket.
 
     // Other fields.
+    address_entries: []AddressEntry = &.{},
 
     flags: packed struct {
         /// Has this agent been stopped.
@@ -1840,6 +1874,8 @@ pub const AgentContext = struct {
     pub fn deinit(self: *AgentContext) void {
         std.debug.assert(self.done());
 
+        self.allocator.free(self.address_entries);
+
         self.allocator.destroy(self.check_response_queue);
         self.allocator.destroy(self.stun_context_entries);
         for (self.media_streams.items) |*media_stream| media_stream.deinit();
@@ -1934,10 +1970,10 @@ pub const AgentContext = struct {
         return preferences;
     }
 
-    pub fn processAddMediaStream(self: *AgentContext, media_stream_id: usize) AddMediaStreamError!void {
+    pub fn processAddMediaStream(self: *AgentContext, media_stream_id: usize, component_count: u8) AddMediaStreamError!void {
         if (self.getMediaStreamIndexFromId(media_stream_id)) |_| return error.AlreadyExists;
 
-        var media_stream = MediaStream.init(media_stream_id, self.local_auth, self.allocator) catch return error.Unexpected;
+        var media_stream = MediaStream.init(media_stream_id, component_count, self.local_auth, self.allocator) catch return error.Unexpected;
         errdefer media_stream.deinit();
 
         self.media_streams.append(media_stream) catch return error.Unexpected;
@@ -1959,48 +1995,59 @@ pub const AgentContext = struct {
 
         self.gathering_state = .gathering;
 
-        const addresses = try self.context.getValidCandidateAddresses(self.allocator);
-        defer self.allocator.free(addresses);
+        self.address_entries = b: {
+            const addresses = try self.context.getValidCandidateAddresses(self.allocator);
+            defer self.allocator.free(addresses);
 
-        const address_preferences = try computeAddressPreferences(addresses, self.allocator);
-        defer self.allocator.free(address_preferences);
+            const address_preferences = try computeAddressPreferences(addresses, self.allocator);
+            defer self.allocator.free(address_preferences);
 
-        // TODO(Corendos): handle component ID for candidates.
+            const entries = try self.allocator.alloc(AddressEntry, addresses.len);
+            for (entries, addresses, address_preferences) |*entry, address, preference| {
+                entry.* = .{ .address = address, .preference = preference };
+            }
+
+            break :b entries;
+        };
+
         for (self.media_streams.items) |*media_stream| {
-            for (addresses, address_preferences, 0..) |address, preference, i| {
-                const socket_data = try self.socket_data_pool.create();
-                socket_data.* = .{
-                    .socket_index = self.sockets.items.len,
-                };
-                errdefer self.socket_data_pool.destroy(socket_data);
+            for (1..media_stream.component_count + 1) |component_id| {
+                for (self.address_entries, 0..) |entry, i| {
+                    const socket_data = try self.socket_data_pool.create();
+                    socket_data.* = .{
+                        .socket_index = self.sockets.items.len,
+                    };
+                    errdefer self.socket_data_pool.destroy(socket_data);
 
-                const socket = try Socket.init(address, socket_data);
-                errdefer socket.deinit();
+                    const socket = try Socket.init(entry.address, socket_data);
+                    errdefer socket.deinit();
 
-                socket.start(self.loop, self, readCallback);
-                errdefer socket.cancel(self.loop);
+                    socket.start(self.loop, self, readCallback);
+                    errdefer socket.cancel(self.loop);
 
-                try self.sockets.append(socket);
+                    try self.sockets.append(socket);
 
-                const candidate = Candidate{
-                    .type = .host,
-                    .base_address = socket.address,
-                    .transport_address = socket.address,
-                    .priority = computePriority(CandidateType.preference(.host), preference, 1),
-                    .foundation = Foundation{
+                    const candidate = Candidate{
                         .type = .host,
-                        // TODO(Corentin): When supported, get that from the socket.
-                        .protocol = .udp,
-                        .address_index = @intCast(i),
-                    },
-                };
-                try media_stream.addLocalCandidate(candidate);
-                self.on_candidate_callback(self.userdata, self, .{
-                    .candidate = .{
-                        .media_stream_id = media_stream.id,
-                        .candidate = candidate,
-                    },
-                });
+                        .base_address = socket.address,
+                        .transport_address = socket.address,
+                        .priority = computePriority(CandidateType.preference(.host), entry.preference, @intCast(component_id)),
+                        .foundation = Foundation{
+                            .type = .host,
+                            // TODO(Corentin): When supported, get that from the socket.
+                            .protocol = .udp,
+                            .address_index = @intCast(i),
+                        },
+                        .component_id = @intCast(component_id),
+                    };
+                    try media_stream.addLocalCandidate(candidate);
+                    self.on_candidate_callback(self.userdata, self, .{
+                        .candidate = .{
+                            .media_stream_id = media_stream.id,
+                            .candidate = candidate,
+                        },
+                    });
+                }
             }
         }
 
@@ -2148,9 +2195,9 @@ pub const AgentContext = struct {
 
         var it = foundation_map.iterator();
         while (it.next()) |entry| {
-            const checklist = &self.media_streams.items[entry.value_ptr.media_stream_index].checklist;
+            const media_stream = &self.media_streams.items[entry.value_ptr.media_stream_index];
             const candidate_pair = entry.value_ptr.candidate_pair;
-            checklist.setPairState(candidate_pair, .waiting);
+            media_stream.setPairState(candidate_pair, .waiting);
         }
     }
 
@@ -2374,13 +2421,18 @@ pub const AgentContext = struct {
                 .type = .server_reflexive,
                 .transport_address = transport_address,
                 .base_address = host_candidate.base_address,
-                .priority = computePriority(CandidateType.preference(.server_reflexive), 65535, 1),
+                .priority = computePriority(
+                    CandidateType.preference(.server_reflexive),
+                    extractLocalPreference(host_candidate.priority),
+                    host_candidate.component_id,
+                ),
                 .foundation = Foundation{
                     .type = .server_reflexive,
                     // TODO(Corentin): When supported, get that from the socket.
                     .protocol = .udp,
                     .address_index = @intCast(gathering_context.candidate_index),
                 },
+                .component_id = host_candidate.component_id,
             };
             media_stream.addLocalCandidate(candidate) catch unreachable;
             self.on_candidate_callback(self.userdata, self, .{
@@ -2585,7 +2637,6 @@ pub const AgentContext = struct {
 
         const data = socket_data.read_buffer[0..bytes_read];
         const source = socket_data.getAddress();
-        std.log.warn("Agent {} - Received data from: {}", .{ self.id, source });
 
         const stun_header_result = b: {
             var stream = std.io.fixedBufferStream(data);
@@ -2926,7 +2977,7 @@ pub const AgentContext = struct {
                             }
                         }
                     }
-                    media_stream.checklist.setPairState(candidate_pair, .waiting);
+                    media_stream.setPairState(candidate_pair, .waiting);
 
                     if (media_stream.checklist.addTriggeredCheck(candidate_pair, use_candidate)) {
                         self.restartConnectivityCheckTimer();
@@ -2977,7 +3028,7 @@ pub const AgentContext = struct {
         //if (!areTransportAddressesSymmetric(local_candidate.transport_address, remote_candidate.transport_address, source, mapped_address)) {
         //    log.debug("Agent {} - Check failed for candidate pair ({}:{}) because source and destination are not symmetric", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index });
 
-        //    self.checklist.setPairState(candidate_pair, .failed);
+        //    self.setPairState(candidate_pair, .failed);
         //    return;
         //}
 
@@ -2987,7 +3038,7 @@ pub const AgentContext = struct {
         // Constructing a Valid Pair
         const valid_local_candidate_index = media_stream.getLocalCandidateIndexFromTransportAddress(mapped_address) orelse {
             std.log.warn("Agent {} - Failed to find a local candidate matching the mapped address: {}", .{ self.id, mapped_address });
-            media_stream.checklist.setPairState(candidate_pair, .failed);
+            media_stream.setPairState(candidate_pair, .failed);
             return;
         };
         const valid_remote_candidate_index = media_stream.getRemoteCandidateIndexFromTransportAddress(remote_candidate.transport_address) orelse unreachable;
@@ -3042,7 +3093,7 @@ pub const AgentContext = struct {
         }
 
         // Updating Candidate Pair States.
-        media_stream.checklist.setPairState(candidate_pair, .succeeded);
+        media_stream.setPairState(candidate_pair, .succeeded);
 
         const entry = media_stream.checklist.getEntry(candidate_pair).?;
 
@@ -3053,7 +3104,7 @@ pub const AgentContext = struct {
         for (self.media_streams.items) |*other_media_stream| {
             for (other_media_stream.checklist.pairs.slice()) |current_entry| {
                 if (current_entry.data.state == .frozen and current_entry.data.foundation.eql(entry.data.foundation)) {
-                    other_media_stream.checklist.setPairState(current_entry.pair, .waiting);
+                    other_media_stream.setPairState(current_entry.pair, .waiting);
                 }
             }
         }
@@ -3069,7 +3120,7 @@ pub const AgentContext = struct {
         } else null;
 
         const error_code_attribute = error_code_attribute_opt orelse {
-            media_stream.checklist.setPairState(candidate_pair, .failed);
+            media_stream.setPairState(candidate_pair, .failed);
             return;
         };
 
@@ -3079,7 +3130,7 @@ pub const AgentContext = struct {
                     self.switchRole();
 
                     if (media_stream.checklist.addTriggeredCheck(candidate_pair, false)) {
-                        media_stream.checklist.setPairState(candidate_pair, .waiting);
+                        media_stream.setPairState(candidate_pair, .waiting);
                         self.restartConnectivityCheckTimer();
                     }
 
@@ -3087,7 +3138,7 @@ pub const AgentContext = struct {
                 }
             },
             else => {
-                media_stream.checklist.setPairState(candidate_pair, .failed);
+                media_stream.setPairState(candidate_pair, .failed);
             },
         }
     }
@@ -3105,7 +3156,7 @@ pub const AgentContext = struct {
             // Due to triggered check, we might never receive the answer but must not treat the lack of response as a failure.
             if (!check_context.flags.is_canceled) {
                 log.debug("Agent {} - Check failed for candidate pair ({}:{}) of media stream {} with {}", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, media_stream.id, err });
-                media_stream.checklist.setPairState(candidate_pair, .failed);
+                media_stream.setPairState(candidate_pair, .failed);
             }
             return;
         };
@@ -3137,7 +3188,6 @@ pub const AgentContext = struct {
     }
 
     fn startTransaction(self: *AgentContext, media_stream: *MediaStream, candidate_pair: CandidatePair, is_triggered_check: bool, is_nominated: bool) !void {
-        const checklist = &media_stream.checklist;
         const local_candidate = media_stream.local_candidates.items[candidate_pair.local_candidate_index];
         const remote_candidate = media_stream.remote_candidates.items[candidate_pair.remote_candidate_index];
 
@@ -3201,12 +3251,12 @@ pub const AgentContext = struct {
             media_stream.id,
         });
 
-        const check_count = checklist.pairs.slice().len;
-        const waiting_count = checklist.getPairCount(.waiting);
-        const in_progress_count = checklist.getPairCount(.in_progress);
+        const check_count = media_stream.checklist.pairs.slice().len;
+        const waiting_count = media_stream.checklist.getPairCount(.waiting);
+        const in_progress_count = media_stream.checklist.getPairCount(.in_progress);
         stun_context.check.transaction.start(Configuration.computeRtoCheckMs(check_count, waiting_count, in_progress_count), self.loop);
 
-        checklist.setPairState(candidate_pair, .in_progress);
+        media_stream.setPairState(candidate_pair, .in_progress);
     }
 
     fn handleConnectivityCheckMainTimer(self: *AgentContext, result: xev.Timer.RunError!void) !void {
@@ -3309,15 +3359,17 @@ pub const AgentContext = struct {
             try writer.print("Media Stream {}\n", .{self.ctx.id});
 
             for (self.ctx.local_candidates.items, 0..) |candidate, index| {
-                if (candidate.default) {
-                    try writer.print("    Local {} (d) - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
-                } else {
-                    try writer.print("    Local {} - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
-                }
+                try writer.print("    Local {} - {}\n", .{ index, candidate });
+                //if (candidate.default) {
+                //    try writer.print("    Local {} (d) - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
+                //} else {
+                //    try writer.print("    Local {} - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
+                //}
             }
 
             for (self.ctx.remote_candidates.items, 0..) |candidate, index| {
-                try writer.print("    Remote {} - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
+                try writer.print("    Remote {} - {}\n", .{ index, candidate });
+                //try writer.print("    Remote {} - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
             }
         }
     };
@@ -3390,6 +3442,7 @@ pub const RemoteCandidateParameters = struct {
 pub const MediaStreamParameters = struct {
     agent_id: AgentId,
     media_stream_id: usize,
+    component_count: u8,
 };
 
 pub const SendParameters = struct {
@@ -3680,12 +3733,13 @@ pub const Context = struct {
         return f.get();
     }
 
-    pub fn addMediaStream(self: *Context, agent_id: AgentId, c: *ContextCompletion, media_stream_id: usize, userdata: ?*anyopaque, callback: ContextCallback) !void {
+    pub fn addMediaStream(self: *Context, agent_id: AgentId, c: *ContextCompletion, media_stream_id: usize, component_count: u8, userdata: ?*anyopaque, callback: ContextCallback) !void {
         c.* = ContextCompletion{
             .op = .{
                 .add_media_stream = .{
                     .agent_id = agent_id,
                     .media_stream_id = media_stream_id,
+                    .component_count = component_count,
                 },
             },
             .userdata = userdata,
@@ -3847,7 +3901,7 @@ pub const Context = struct {
                 },
                 .add_media_stream => |parameters| {
                     const add_media_stream_result = if (self.getAgentContext(parameters.agent_id)) |agent_context| b: {
-                        agent_context.processAddMediaStream(parameters.media_stream_id) catch unreachable;
+                        agent_context.processAddMediaStream(parameters.media_stream_id, parameters.component_count) catch unreachable;
                         break :b {};
                     } else |err| err;
 

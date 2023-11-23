@@ -312,7 +312,7 @@ fn asyncCallback(userdata: ?*Context, loop: *xev.Loop, c: *xev.Completion, resul
             },
             .ice_completed => |agent_type| {
                 if (agent_type == .controlling) {
-                    _ = send(context, &context.controlling_agent_data.?, 2, 1, "Ping!") catch unreachable;
+                    _ = send(context, &context.controlling_agent_data.?, 1, 1, "Ping!") catch unreachable;
                 }
             },
             .message_received => |agent_type| {
@@ -325,11 +325,11 @@ fn asyncCallback(userdata: ?*Context, loop: *xev.Loop, c: *xev.Completion, resul
     return .rearm;
 }
 
-fn addMediaStream(context: *zice.Context, agent_id: zice.AgentId, media_stream_id: usize) !void {
+fn addMediaStream(context: *zice.Context, agent_id: zice.AgentId, media_stream_id: usize, component_count: u8) !void {
     var future = zice.Future(zice.AddMediaStreamError!void){};
     var c: zice.ContextCompletion = undefined;
 
-    context.addMediaStream(agent_id, &c, media_stream_id, &future, (struct {
+    context.addMediaStream(agent_id, &c, media_stream_id, component_count, &future, (struct {
         fn callback(userdata: ?*anyopaque, result: zice.ContextResult) void {
             var inner_future: *@TypeOf(future) = @ptrCast(@alignCast(userdata.?));
             inner_future.set(result.add_media_stream);
@@ -386,8 +386,8 @@ pub fn main() !void {
     context.controlled_agent_data = try AgentData.init(controlled_agent, allocator);
 
     for (0..2) |i| {
-        addMediaStream(context.zice_context.?, controlling_agent, i + 1) catch unreachable;
-        addMediaStream(context.zice_context.?, controlled_agent, i + 1) catch unreachable;
+        addMediaStream(context.zice_context.?, controlling_agent, i + 1, 5) catch unreachable;
+        addMediaStream(context.zice_context.?, controlled_agent, i + 1, 5) catch unreachable;
     }
 
     var gather_completion: zice.ContextCompletion = undefined;
