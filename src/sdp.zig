@@ -170,7 +170,7 @@ pub const Parser = struct {
         local_reader.skip(' ');
 
         const address = a: {
-            var address = local_reader.readUntil(' ') orelse return null;
+            const address = local_reader.readUntil(' ') orelse return null;
             local_reader.skip(' ');
             break :a std.mem.trim(u8, address, "[]");
         };

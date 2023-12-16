@@ -274,7 +274,7 @@ const WaitableResult = struct {
 fn setRemoteCandidates(context: *Context, source_agent_data: *AgentData, destination_agent_data: *AgentData) zice.InvalidError!void {
     var result: WaitableResult = .{};
 
-    var source_agent_context = context.zice_context.?.getAgentContext(source_agent_data.id) catch unreachable;
+    const source_agent_context = context.zice_context.?.getAgentContext(source_agent_data.id) catch unreachable;
 
     const parameters = zice.RemoteCandidateParameters{
         .candidates = source_agent_data.candidates.items,
@@ -379,7 +379,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
     defer _ = gpa.deinit();
 
-    var allocator = gpa.allocator();
+    const allocator = gpa.allocator();
 
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
@@ -408,7 +408,7 @@ pub fn main() !void {
         .on_data_callback = controllingDataCallback,
     });
 
-    var controlled_agent = try zice_context.createAgent(.{
+    const controlled_agent = try zice_context.createAgent(.{
         .userdata = &context,
         .on_candidate_callback = controlledCandidateCallback,
         .on_state_change_callback = controlledStateChangeCallback,

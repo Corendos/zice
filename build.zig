@@ -21,7 +21,7 @@ pub fn buildSamples(
 
     const directory_path = try b.build_root.join(arena_state.allocator(), &[_][]const u8{"samples"});
 
-    var iterable_dir = try std.fs.openIterableDirAbsolute(directory_path, .{});
+    var iterable_dir = try std.fs.openDirAbsolute(directory_path, .{ .iterate = true });
     var iterator = iterable_dir.iterate();
     while (try iterator.next()) |entry| {
         if (entry.kind != .file) continue;

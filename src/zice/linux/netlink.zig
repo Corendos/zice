@@ -246,7 +246,7 @@ test "AttributeIterator" {
 }
 
 test "AttributeIterator empty" {
-    var buffer: []align(@alignOf(rtattr)) u8 = &.{};
+    const buffer: []align(@alignOf(rtattr)) u8 = &.{};
     var it = AttributeIterator.init(buffer);
     try std.testing.expect(it.next() == null);
 }
@@ -399,7 +399,7 @@ test "MessageIterator" {
 }
 
 test "MessageIterator empty" {
-    var buffer: []align(@alignOf(linux.nlmsghdr)) u8 = &.{};
+    const buffer: []align(@alignOf(linux.nlmsghdr)) u8 = &.{};
     var it = MessageIterator.init(buffer);
     try std.testing.expect(it.next() == null);
 }
@@ -493,7 +493,7 @@ pub const IflaAttribute = union(linux.IFLA) {
 };
 
 test "IflaAttribute: unspec" {
-    var raw_attribute = Attribute{
+    const raw_attribute = Attribute{
         .len = 7,
         .type = @intFromEnum(std.os.linux.IFLA.UNSPEC),
         .data = &.{ 0x01, 0x02, 0x03 },
@@ -518,7 +518,7 @@ test "IflaAttribute: address" {
 
 test "IflaAttribute: interface_name" {
     const interface_name: [:0]const u8 = "eth0";
-    var raw_attribute = Attribute{
+    const raw_attribute = Attribute{
         .len = rta_length(interface_name.len),
         .type = @intFromEnum(std.os.linux.IFLA.IFNAME),
         .data = interface_name,

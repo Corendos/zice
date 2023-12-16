@@ -147,7 +147,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
     defer _ = gpa.deinit();
 
-    var allocator = gpa.allocator();
+    const allocator = gpa.allocator();
 
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();

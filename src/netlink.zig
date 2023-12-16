@@ -48,9 +48,9 @@ pub const NetlinkContext = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !NetlinkContext {
-        var write_buffer = try allocator.alloc(u8, 8192);
+        const write_buffer = try allocator.alloc(u8, 8192);
         errdefer allocator.free(write_buffer);
-        var read_buffer = try allocator.alloc(u8, 8192);
+        const read_buffer = try allocator.alloc(u8, 8192);
         errdefer allocator.free(read_buffer);
 
         const socket = try std.os.socket(std.os.linux.AF.NETLINK, std.os.linux.SOCK.RAW, std.os.linux.NETLINK.ROUTE);
@@ -217,7 +217,7 @@ pub const NetlinkContext = struct {
         _ = result;
         _ = loop;
         _ = completion;
-        var self = @as(*NetlinkContext, @ptrCast(@alignCast(userdata.?)));
+        const self = @as(*NetlinkContext, @ptrCast(@alignCast(userdata.?)));
         _ = self;
 
         return .disarm;
@@ -262,7 +262,7 @@ pub const NetlinkContext = struct {
         _ = result;
         _ = loop;
         _ = completion;
-        var self = @as(*NetlinkContext, @ptrCast(@alignCast(userdata.?)));
+        const self = @as(*NetlinkContext, @ptrCast(@alignCast(userdata.?)));
         _ = self;
 
         return .disarm;

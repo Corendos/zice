@@ -61,7 +61,7 @@ fn asyncCallback(userdata: ?*Context, loop: *xev.Loop, c: *xev.Completion, resul
                 var arena_state = std.heap.ArenaAllocator.init(context.allocator);
                 defer arena_state.deinit();
 
-                var arena = arena_state.allocator();
+                const arena = arena_state.allocator();
 
                 const message = SignalingMessage{
                     .peer_id = context.other_peer_id.?,
@@ -271,7 +271,7 @@ fn initTracker(client: *std.http.Client, allocator: std.mem.Allocator) !u64 {
     const arena = arena_state.allocator();
     const url = std.fmt.allocPrint(arena, "{s}/init", .{tracker_url}) catch unreachable;
 
-    var result = try client.fetch(arena, std.http.Client.FetchOptions{
+    const result = try client.fetch(arena, std.http.Client.FetchOptions{
         .method = .POST,
         .location = .{ .url = url },
     });
@@ -294,7 +294,7 @@ fn byeTracker(client: *std.http.Client, peer_id: u64, allocator: std.mem.Allocat
 
     const body = try std.json.stringifyAlloc(arena, .{ .peer_id = peer_id }, .{});
 
-    var result = try client.fetch(arena, std.http.Client.FetchOptions{
+    const result = try client.fetch(arena, std.http.Client.FetchOptions{
         .method = .POST,
         .location = .{ .url = url },
         .payload = .{ .string = body },
@@ -309,7 +309,7 @@ fn getSources(client: *std.http.Client, peer_id: u64, allocator: std.mem.Allocat
     const arena = arena_state.allocator();
     const url = std.fmt.allocPrint(arena, "{s}/sources", .{tracker_url}) catch unreachable;
 
-    var result = try client.fetch(arena, std.http.Client.FetchOptions{
+    const result = try client.fetch(arena, std.http.Client.FetchOptions{
         .method = .GET,
         .location = .{ .url = url },
     });

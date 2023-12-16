@@ -253,9 +253,9 @@ fn makeConnectivityCheckBindingRequest(
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
 
-    var arena = arena_state.allocator();
+    const arena = arena_state.allocator();
 
-    const authentication = ztun.auth.Authentication{ .short_term = ztun.auth.ShortTermAuthentication{ .password = password } };
+    const authentication = ztun.auth.ShortTermAuthenticationParameters{ .password = password };
 
     // Binding request with random transaction ID.
     message_builder.setClass(ztun.Class.request);
@@ -280,7 +280,8 @@ fn makeConnectivityCheckBindingRequest(
         try message_builder.addAttribute(use_candidate_attribute);
     }
 
-    message_builder.addMessageIntegrity(authentication);
+    const key = try authentication.computeKeyAlloc(arena);
+    message_builder.addMessageIntegrity(key);
 
     // Add a fingerprint for validity check.
     message_builder.addFingerprint();
@@ -306,8 +307,9 @@ fn makeBindingResponse(transaction_id: u96, source: std.net.Address, password: [
     const xor_mapped_address_attribute = try xor_mapped_address.toAttribute(arena_state.allocator());
     try message_builder.addAttribute(xor_mapped_address_attribute);
 
-    const authentication = ztun.auth.Authentication{ .short_term = .{ .password = password } };
-    message_builder.addMessageIntegrity(authentication);
+    const authentication = ztun.auth.ShortTermAuthenticationParameters{ .password = password };
+    const key = try authentication.computeKeyAlloc(arena_state.allocator());
+    message_builder.addMessageIntegrity(key);
 
     message_builder.addFingerprint();
 
@@ -328,8 +330,9 @@ fn makeRoleConflictResponse(transaction_id: u96, password: []const u8, allocator
     const error_code_attribute = try (ztun.attr.common.ErrorCode{ .value = .role_conflict, .reason = "Role Conflict" }).toAttribute(arena_state.allocator());
     try message_builder.addAttribute(error_code_attribute);
 
-    const authentication = ztun.auth.Authentication{ .short_term = .{ .password = password } };
-    message_builder.addMessageIntegrity(authentication);
+    const authentication = ztun.auth.ShortTermAuthenticationParameters{ .password = password };
+    const key = try authentication.computeKeyAlloc(arena_state.allocator());
+    message_builder.addMessageIntegrity(key);
 
     message_builder.addFingerprint();
 
@@ -1459,7 +1462,7 @@ const MediaStream = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
 
-        var arena = arena_state.allocator();
+        const arena = arena_state.allocator();
 
         var pair_list = try formPairs(self.local_candidates.items, self.remote_candidates.items, role, arena);
         defer pair_list.deinit();
@@ -1657,7 +1660,7 @@ pub const AuthParameters = struct {
         var buffer: [6 + 18]u8 = undefined;
         rand.bytes(&buffer);
 
-        var base64_buffer = try allocator.alloc(u8, 8 + 24);
+        const base64_buffer = try allocator.alloc(u8, 8 + 24);
         var result = std.base64.standard.Encoder.encode(base64_buffer, &buffer);
 
         return .{
@@ -1791,7 +1794,7 @@ pub const AgentContext = struct {
         var socket_data_pool = std.heap.MemoryPool(SocketData).init(allocator);
         errdefer socket_data_pool.deinit();
 
-        var check_response_queue_write_buffer = try buffer_pool.create();
+        const check_response_queue_write_buffer = try buffer_pool.create();
         errdefer buffer_pool.destroy(check_response_queue_write_buffer);
 
         const stun_context_entries = try allocator.create([64]?StunContext);
@@ -1924,7 +1927,7 @@ pub const AgentContext = struct {
 
     /// Computes the local preference associated with the given addresses.
     fn computeAddressPreferences(addresses: []std.net.Address, allocator: std.mem.Allocator) ![]u16 {
-        var preferences = try allocator.alloc(u16, addresses.len);
+        const preferences = try allocator.alloc(u16, addresses.len);
         errdefer allocator.free(preferences);
 
         var ipv4_count: usize = 0;
@@ -2411,8 +2414,8 @@ pub const AgentContext = struct {
         const message = b: {
             var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
             var stream = std.io.fixedBufferStream(payload.raw_message);
-            var reader = stream.reader();
-            break :b ztun.Message.readAlloc(reader, arena_state.allocator()) catch unreachable;
+            const reader = stream.reader();
+            break :b ztun.Message.readAlloc(arena_state.allocator(), reader) catch unreachable;
         };
 
         // TODO(Corendos): Keep address preference somewhere to put the correct one here.
@@ -2640,7 +2643,7 @@ pub const AgentContext = struct {
 
         const stun_header_result = b: {
             var stream = std.io.fixedBufferStream(data);
-            var reader = stream.reader();
+            const reader = stream.reader();
             break :b ztun.Message.readHeader(reader);
         };
 
@@ -2824,10 +2827,10 @@ pub const AgentContext = struct {
             if (a.type == ztun.attr.Type.message_integrity) break i;
         } else return error.NoMessageIntegrity;
 
-        const authentication = ztun.auth.Authentication{ .short_term = ztun.auth.ShortTermAuthentication{ .password = password } };
+        const authentication = ztun.auth.ShortTermAuthenticationParameters{ .password = password };
         const key = try authentication.computeKeyAlloc(arena_state.allocator());
 
-        if (!try request.checkMessageIntegrity(.classic, attribute_index, key, arena_state.allocator())) return error.InvalidMessageIntegrity;
+        if (!try request.checkMessageIntegrity(arena_state.allocator(), .classic, attribute_index, key)) return error.InvalidMessageIntegrity;
     }
 
     fn getRoleAndTiebreakerFromRequest(message: ztun.Message) ?struct { role: AgentRole, tiebreaker: u64 } {
@@ -2887,7 +2890,7 @@ pub const AgentContext = struct {
         const request = r: {
             var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
             var stream = std.io.fixedBufferStream(raw_message);
-            break :r try ztun.Message.readAlloc(stream.reader(), arena_state.allocator());
+            break :r try ztun.Message.readAlloc(arena_state.allocator(), stream.reader());
         };
 
         // Check fingerprint/integrity.
@@ -3165,8 +3168,8 @@ pub const AgentContext = struct {
         const message = b: {
             var arena_state = std.heap.FixedBufferAllocator.init(&buffer);
             var stream = std.io.fixedBufferStream(payload.raw_message);
-            var reader = stream.reader();
-            break :b ztun.Message.readAlloc(reader, arena_state.allocator()) catch unreachable;
+            const reader = stream.reader();
+            break :b ztun.Message.readAlloc(arena_state.allocator(), reader) catch unreachable;
         };
 
         if (message.type.class == .success_response) {
@@ -3879,7 +3882,7 @@ pub const Context = struct {
         var local_queue = b: {
             self.async_queue_mutex.lock();
             defer self.async_queue_mutex.unlock();
-            var q = self.async_queue;
+            const q = self.async_queue;
             self.async_queue = .{};
             break :b q;
         };
