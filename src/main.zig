@@ -3427,8 +3427,6 @@ pub const SendParameters = struct {
 };
 
 pub const ContextOperation = union(ContextOperationType) {
-    create_agent: CreateAgentOptions,
-    delete_agent: AgentId,
     add_media_stream: MediaStreamParameters,
     remove_media_stream: MediaStreamParameters,
     gather_candidates: AgentId,
@@ -3442,17 +3440,11 @@ pub const InvalidError = error{
 
 pub const SendError = error{NotReady} || xev.WriteError || InvalidError;
 
-pub const CreateAgentError = error{ NoSlotAvailable, Canceled, Unexpected };
-
-pub const DeleteAgentError = InvalidError || error{ Canceled, Unexpected };
-
 pub const AddMediaStreamError = error{ AlreadyExists, Unexpected } || InvalidError;
 
 pub const RemoveMediaStreamError = error{} || InvalidError;
 
 pub const ContextResult = union(ContextOperationType) {
-    create_agent: CreateAgentError!AgentId,
-    delete_agent: DeleteAgentError!void,
     add_media_stream: AddMediaStreamError!void,
     remove_media_stream: RemoveMediaStreamError!void,
     gather_candidates: InvalidError!void,
@@ -3472,6 +3464,10 @@ pub const ContextCompletion = struct {
     next: ?*ContextCompletion = null,
 };
 
+pub const CreateAgentError = error{ NoSlotAvailable, Unexpected };
+
+pub const DeleteAgentError = InvalidError || error{Unexpected};
+
 const context_agent_slot_bit_count = 6;
 const context_agent_slot_count = 1 << context_agent_slot_bit_count;
 
@@ -3479,6 +3475,7 @@ pub const AgentId = GenerationId(u16, context_agent_slot_bit_count);
 
 const AgentContextEntry = struct {
     flags: packed struct {
+        stopped: bool = false,
         deleted: bool = false,
     } = .{},
     agent_id: AgentId = .{ .raw = 0 },
@@ -3494,6 +3491,7 @@ pub const Context = struct {
 
     string_storage: std.heap.ArenaAllocator,
 
+    agent_context_entries_mutex: std.Thread.Mutex = .{},
     agent_context_entries: [context_agent_slot_count]AgentContextEntry,
 
     netlink_context: NetlinkContext,
@@ -3666,42 +3664,30 @@ pub const Context = struct {
         return if (entry.agent_context) |*agent_context| agent_context else error.InvalidId;
     }
 
-    fn createAgentCallback(userdata: ?*anyopaque, result: ContextResult) void {
-        var f: *Future(CreateAgentError!AgentId) = @ptrCast(@alignCast(userdata.?));
-        f.set(result.create_agent);
-    }
-
     pub fn createAgent(self: *Context, options: CreateAgentOptions) CreateAgentError!AgentId {
-        var f = Future(CreateAgentError!AgentId){};
-        var c = ContextCompletion{
-            .op = .{ .create_agent = options },
-            .userdata = &f,
-            .callback = createAgentCallback,
-        };
+        log.debug("Creating agent...", .{});
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
 
-        self.addCompletion(&c);
-        self.submitCompletions() catch return error.Unexpected;
+        const unused_entry: *AgentContextEntry = for (&self.agent_context_entries) |*entry| {
+            if (entry.agent_context == null) break entry;
+        } else return error.NoSlotAvailable;
 
-        return f.get();
-    }
+        // TODO(Corendos): Improve returned error.
+        unused_entry.agent_context = AgentContext.init(self, unused_entry.agent_id, &self.loop, options, self.allocator) catch return error.Unexpected;
 
-    fn deleteAgentCallback(userdata: ?*anyopaque, result: ContextResult) void {
-        var f: *Future(DeleteAgentError!void) = @ptrCast(@alignCast(userdata.?));
-        f.set(result.delete_agent);
+        return unused_entry.agent_id;
     }
 
     pub fn deleteAgent(self: *Context, agent_id: AgentId) DeleteAgentError!void {
-        var f = Future(DeleteAgentError!void){};
-        var c = ContextCompletion{
-            .op = .{ .delete_agent = agent_id },
-            .userdata = &f,
-            .callback = deleteAgentCallback,
-        };
+        log.debug("Deleting agent with id={}...", .{agent_id.raw});
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
 
-        self.addCompletion(&c);
-        self.submitCompletions() catch return error.Unexpected;
-
-        return f.get();
+        const entry = try self.getAgentEntry(agent_id);
+        if (entry.agent_context == null or entry.flags.deleted) return error.InvalidId;
+        entry.flags.deleted = true;
+        self.async_handle.notify() catch {};
     }
 
     pub fn addMediaStream(self: *Context, agent_id: AgentId, c: *ContextCompletion, media_stream_id: usize, component_count: u8, userdata: ?*anyopaque, callback: ContextCallback) !void {
@@ -3810,22 +3796,22 @@ pub const Context = struct {
         return try address_list.toOwnedSlice();
     }
 
-    fn handleCreateAgent(self: *Context, options: CreateAgentOptions) CreateAgentError!AgentId {
-        const unused_entry: *AgentContextEntry = for (&self.agent_context_entries) |*entry| {
-            if (entry.agent_context == null) break entry;
-        } else return error.NoSlotAvailable;
+    fn handleDeletion(self: *Context) void {
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
 
-        // TODO(Corendos): Improve returned error.
-        unused_entry.agent_context = AgentContext.init(self, unused_entry.agent_id, &self.loop, options, self.allocator) catch return error.Unexpected;
-
-        return unused_entry.agent_id;
-    }
-
-    fn handleDeleteAgent(self: *Context, agent_id: AgentId) DeleteAgentError!void {
-        const entry = try self.getAgentEntry(agent_id);
-        if (entry.agent_context == null or entry.flags.deleted) return error.InvalidId;
-        entry.flags.deleted = true;
-        entry.agent_context.?.stop();
+        for (self.agent_context_entries[0..]) |*entry| {
+            if (entry.flags.deleted) {
+                if (!entry.flags.stopped) {
+                    entry.agent_context.?.stop();
+                } else if (entry.agent_context.?.done()) {
+                    entry.agent_context.?.deinit();
+                    entry.flags.deleted = false;
+                    entry.agent_id.bump();
+                    entry.agent_context = null;
+                }
+            }
+        }
     }
 
     fn asyncCallback(
@@ -3838,14 +3824,7 @@ pub const Context = struct {
         _ = loop;
         const self = userdata.?;
 
-        for (&self.agent_context_entries) |*entry| {
-            if (entry.flags.deleted and entry.agent_context.?.done()) {
-                entry.agent_context.?.deinit();
-                entry.flags.deleted = false;
-                entry.agent_id.bump();
-                entry.agent_context = null;
-            }
-        }
+        self.handleDeletion();
 
         var local_queue = b: {
             self.async_queue_mutex.lock();
@@ -3860,16 +3839,6 @@ pub const Context = struct {
         while (local_queue.pop()) |c| {
             log.debug("Processing {s}", .{@tagName(c.op)});
             switch (c.op) {
-                .create_agent => |options| {
-                    const create_agent_result = self.handleCreateAgent(options);
-
-                    c.callback(c.userdata, ContextResult{ .create_agent = create_agent_result });
-                },
-                .delete_agent => |agent_id| {
-                    const delete_agent_result = self.handleDeleteAgent(agent_id);
-
-                    c.callback(c.userdata, ContextResult{ .delete_agent = delete_agent_result });
-                },
                 .add_media_stream => |parameters| {
                     const add_media_stream_result = if (self.getAgentContext(parameters.agent_id)) |agent_context| b: {
                         agent_context.processAddMediaStream(parameters.media_stream_id, parameters.component_count) catch unreachable;
