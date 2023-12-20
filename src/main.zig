@@ -2204,37 +2204,6 @@ pub const AgentContext = struct {
         }
     }
 
-    pub fn releaseStunContextIndex(self: *AgentContext, index: usize) void {
-        if (self.stun_context_entries[index]) |*stun_context| {
-            switch (stun_context.*) {
-                inline else => |*ctx| {
-                    self.buffer_pool.destroy(@alignCast(ctx.transaction.write_buffer[0..4096]));
-                    self.buffer_pool.destroy(@alignCast(ctx.transaction.read_buffer[0..4096]));
-                    ctx.transaction.deinit();
-                },
-            }
-            self.stun_context_entries[index] = null;
-        }
-    }
-
-    pub fn releaseStunContext(self: *AgentContext, stun_context: *StunContext) void {
-        for (self.stun_context_entries) |*maybe_stun_context| {
-            if (maybe_stun_context.*) |*current_stun_context| {
-                if (current_stun_context == stun_context) {
-                    switch (current_stun_context.*) {
-                        inline else => |*ctx| {
-                            self.buffer_pool.destroy(@alignCast(ctx.transaction.write_buffer[0..4096]));
-                            self.buffer_pool.destroy(@alignCast(ctx.transaction.read_buffer[0..4096]));
-                            ctx.transaction.deinit();
-                        },
-                    }
-                    maybe_stun_context.* = null;
-                    return;
-                }
-            }
-        }
-    }
-
     pub fn handleNomination(self: *AgentContext, media_stream: *MediaStream, candidate_pair: CandidatePair, loop: *xev.Loop) void {
         log.debug("Agent {} - Candidate pair {}:{} nominated for media stream {}", .{ self.id, candidate_pair.local_candidate_index, candidate_pair.remote_candidate_index, media_stream.id });
         const nominated_entry = media_stream.checklist.getValidEntry(candidate_pair) orelse @panic("TODO: Nominated a candidate pair that is not in the valid list yet");
@@ -2355,13 +2324,13 @@ pub const AgentContext = struct {
     ) void {
         switch (result) {
             .read => |r| {
-                const gathering_context = &r.stun_context.gathering;
+                const gathering_context = &self.stun_context_entries[r.stun_context_index].?.gathering;
                 self.handleGatheringResponseRead(gathering_context, r.raw_message) catch @panic("TODO");
             },
             .completed => |r| {
-                const gathering_context = &r.stun_context.gathering;
+                const gathering_context = &self.stun_context_entries[r.stun_context_index].?.gathering;
                 self.handleGatheringTransactionCompleted(gathering_context, r.result);
-                self.releaseStunContext(r.stun_context);
+                self.releaseStunContextIndex(r.stun_context_index);
 
                 if (self.gathering_state == .gathering) {
                     const gathering_still_in_progress = for (self.media_streams.items) |media_stream| {
@@ -2418,7 +2387,6 @@ pub const AgentContext = struct {
             break :b ztun.Message.readAlloc(arena_state.allocator(), reader) catch unreachable;
         };
 
-        // TODO(Corendos): Keep address preference somewhere to put the correct one here.
         if (getMappedAddressFromStunMessage(message)) |transport_address| {
             const candidate = Candidate{
                 .type = .server_reflexive,
@@ -2457,20 +2425,23 @@ pub const AgentContext = struct {
         } else return null;
     }
 
-    fn getFreeStunContext(self: *AgentContext) ?*StunContext {
-        const stun_context = for (self.stun_context_entries) |*maybe_stun_context| {
-            if (maybe_stun_context.* == null) {
-                break maybe_stun_context;
+    fn releaseStunContextIndex(self: *AgentContext, index: usize) void {
+        if (self.stun_context_entries[index]) |*stun_context| {
+            switch (stun_context.*) {
+                inline else => |*ctx| {
+                    self.buffer_pool.destroy(@alignCast(ctx.transaction.write_buffer[0..4096]));
+                    self.buffer_pool.destroy(@alignCast(ctx.transaction.read_buffer[0..4096]));
+                    ctx.transaction.deinit();
+                },
             }
-        } else return null;
-        stun_context.* = undefined;
-        return &stun_context.*.?;
+            self.stun_context_entries[index] = null;
+        }
     }
 
-    fn getStunContextFromTransactionId(self: *AgentContext, transaction_id: u96) ?*StunContext {
-        return for (self.stun_context_entries) |*maybe_stun_context| {
+    fn getStunContextIndexFromTransactionId(self: *AgentContext, transaction_id: u96) ?usize {
+        return for (self.stun_context_entries, 0..) |*maybe_stun_context, i| {
             if (maybe_stun_context.*) |*stun_context| {
-                if (stun_context.transactionId() == transaction_id) break stun_context;
+                if (stun_context.transactionId() == transaction_id) break i;
             }
         } else null;
     }
@@ -2563,12 +2534,11 @@ pub const AgentContext = struct {
                 log.debug("Agent {} - Stun response sent !", .{self.id});
             },
             .response_read => |payload| {
-                self.handleConnectivityCheckResponseRead(payload.raw_message, payload.address, payload.stun_context) catch @panic("TODO: Response read failed");
+                self.handleConnectivityCheckResponseRead(payload.raw_message, payload.address, payload.stun_context_index) catch @panic("TODO: Response read failed");
             },
             .completed => |payload| {
-                self.handleConnectivityCheckTransactionCompleted(payload.stun_context, payload.result) catch @panic("TODO: Transaction completed failed");
-
-                self.releaseStunContext(payload.stun_context);
+                self.handleConnectivityCheckTransactionCompleted(payload.stun_context_index, payload.result) catch @panic("TODO: Transaction completed failed");
+                self.releaseStunContextIndex(payload.stun_context_index);
             },
             .main_timer => |payload| {
                 self.handleConnectivityCheckMainTimer(payload) catch @panic("TODO: Main timer failed");
@@ -2654,12 +2624,10 @@ pub const AgentContext = struct {
                 },
                 .indication => @panic("An indication, really ?"),
                 else => {
-                    const stun_context_opt = self.getStunContextFromTransactionId(stun_header.transaction_id);
-
-                    if (stun_context_opt) |stun_context| {
-                        switch (stun_context.*) {
-                            .gathering => self.handleGatheringEvent(.{ .read = .{ .stun_context = stun_context, .raw_message = data } }),
-                            .check => self.handleConnectivityCheckEvent(.{ .response_read = .{ .stun_context = stun_context, .raw_message = data, .address = source } }),
+                    if (self.getStunContextIndexFromTransactionId(stun_header.transaction_id)) |stun_context_index| {
+                        switch (self.stun_context_entries[stun_context_index].?) {
+                            .gathering => self.handleGatheringEvent(.{ .read = .{ .stun_context_index = stun_context_index, .raw_message = data } }),
+                            .check => self.handleConnectivityCheckEvent(.{ .response_read = .{ .stun_context_index = stun_context_index, .raw_message = data, .address = source } }),
                         }
                     } else {
                         log.debug("Agent {} - Received STUN response with unknown transaction ID", .{self.id});
@@ -2680,9 +2648,9 @@ pub const AgentContext = struct {
 
     fn gatheringTransactionCompleteCallback(userdata: ?*anyopaque, transaction: *Transaction, result: TransactionResult) void {
         const self = @as(*AgentContext, @ptrCast(@alignCast(userdata.?)));
-        const stun_context = self.getStunContextFromTransactionId(transaction.transaction_id) orelse unreachable;
+        const stun_context_index = self.getStunContextIndexFromTransactionId(transaction.transaction_id) orelse unreachable;
 
-        self.handleGatheringEvent(.{ .completed = .{ .stun_context = stun_context, .result = result } });
+        self.handleGatheringEvent(.{ .completed = .{ .stun_context_index = stun_context_index, .result = result } });
     }
 
     fn mainTimerCallback(
@@ -2813,9 +2781,9 @@ pub const AgentContext = struct {
         result: TransactionResult,
     ) void {
         const self = @as(*AgentContext, @ptrCast(@alignCast(userdata.?)));
-        const stun_context = self.getStunContextFromTransactionId(transaction.transaction_id) orelse unreachable;
+        const stun_context_index = self.getStunContextIndexFromTransactionId(transaction.transaction_id) orelse unreachable;
 
-        self.handleConnectivityCheckEvent(.{ .completed = .{ .stun_context = stun_context, .result = result } });
+        self.handleConnectivityCheckEvent(.{ .completed = .{ .stun_context_index = stun_context_index, .result = result } });
     }
 
     fn checkMessageIntegrity(request: ztun.Message, password: []const u8) !void {
@@ -3148,10 +3116,10 @@ pub const AgentContext = struct {
 
     fn handleConnectivityCheckTransactionCompleted(
         self: *AgentContext,
-        stun_context: *StunContext,
+        stun_context_index: usize,
         result: TransactionResult,
     ) !void {
-        const check_context = &stun_context.check;
+        const check_context = &self.stun_context_entries[stun_context_index].?.check;
         const media_stream = self.getMediaStreamFromId(check_context.media_stream_id) orelse unreachable;
         const candidate_pair = check_context.candidate_pair;
 
@@ -3183,9 +3151,9 @@ pub const AgentContext = struct {
         self: *AgentContext,
         raw_message: []const u8,
         source: std.net.Address,
-        stun_context: *StunContext,
+        stun_context_index: usize,
     ) !void {
-        const check_context = &stun_context.check;
+        const check_context = &self.stun_context_entries[stun_context_index].?.check;
 
         check_context.transaction.readCallback(self.loop, raw_message, source);
     }
@@ -3212,8 +3180,8 @@ pub const AgentContext = struct {
             ) catch unreachable;
         };
 
-        const stun_context = self.getFreeStunContext() orelse unreachable;
-        errdefer self.releaseStunContext(stun_context);
+        const stun_context_index = self.getFreeStunContextIndex() orelse unreachable;
+        errdefer self.releaseStunContextIndex(stun_context_index);
 
         const write_buffer = try self.buffer_pool.create();
         errdefer self.buffer_pool.destroy(write_buffer);
@@ -3232,7 +3200,7 @@ pub const AgentContext = struct {
         );
         errdefer transaction.deinit();
 
-        stun_context.* = .{
+        self.stun_context_entries[stun_context_index] = .{
             .check = ConnectivityCheckContext{
                 .socket_index = socket_index,
                 .media_stream_id = media_stream.id,
@@ -3253,6 +3221,8 @@ pub const AgentContext = struct {
             candidate_pair.remote_candidate_index,
             media_stream.id,
         });
+
+        const stun_context = &self.stun_context_entries[stun_context_index].?;
 
         const check_count = media_stream.checklist.pairs.slice().len;
         const waiting_count = media_stream.checklist.getPairCount(.waiting);
@@ -3405,24 +3375,22 @@ const InterfaceAddress = struct {
 /// Represents an event that can happen while gathering candidates.
 const GatheringEventResult = union(enum) {
     /// A STUN response was received and it's the payload.
-    read: struct { stun_context: *StunContext, raw_message: []const u8 },
+    read: struct { stun_context_index: usize, raw_message: []const u8 },
     /// A STUN transaction completed.
-    completed: struct { stun_context: *StunContext, result: TransactionResult },
+    completed: struct { stun_context_index: usize, result: TransactionResult },
     /// The main timer fired and the payload contains the result.
     main_timer: xev.Timer.RunError!void,
 };
 
 const ConnectivityCheckEventResult = union(enum) {
     request_read: struct { socket_index: usize, raw_message: []const u8, address: std.net.Address },
-    response_read: struct { stun_context: *StunContext, raw_message: []const u8, address: std.net.Address },
-    completed: struct { stun_context: *StunContext, result: TransactionResult },
+    response_read: struct { stun_context_index: usize, raw_message: []const u8, address: std.net.Address },
+    completed: struct { stun_context_index: usize, result: TransactionResult },
     response_write: struct { socket_index: usize, result: xev.WriteError!usize },
     main_timer: xev.Timer.RunError!void,
 };
 
 pub const ContextOperationType = enum {
-    create_agent,
-    delete_agent,
     add_media_stream,
     remove_media_stream,
     gather_candidates,
