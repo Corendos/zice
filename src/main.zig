@@ -43,6 +43,12 @@ const log = std.log.scoped(.zice);
 // * Think about what happens if we add/remove MediaStream while the ICE Session is running. What should happen ?
 // * Handle nomination failure to allow other nomination to take place.
 
+// TODO(Corendos,@Architecture):
+// * MediaStream should be able to be added/removed on the fly.
+// * Maybe these could be synchronous instead of async.
+// * Agent should have a xev.Async handle to allow it to be woken up when needed.
+// *
+
 /// Represents an ICE candidate type. See https://www.rfc-editor.org/rfc/rfc8445#section-4 for definitions.
 pub const CandidateType = enum(u2) {
     host,
@@ -1276,9 +1282,18 @@ const Checklist = struct {
     }
 };
 
+const CandidateData = struct {
+    /// The index of the host candidate.
+    candidate_index: usize,
+    /// The gathering state of this candidate.
+    gathering_state: GatheringState = .idle,
+};
+
 const MediaStream = struct {
     /// The id of the MediaStream.
     id: usize,
+    /// The number of component in this MediaStream.
+    component_count: u8,
     /// The local authentication parameters used for connectivity checks.
     local_auth: AuthParameters,
     /// The remote authentication parameters used for connectivity checks.
@@ -1289,13 +1304,10 @@ const MediaStream = struct {
 
     /// The local candidates associated with the MediaStream.
     local_candidates: std.ArrayList(Candidate),
+    /// The data associated with local host candidates.
+    local_candidate_data: std.ArrayList(CandidateData),
     /// The remote candidates associated with the MediaStream.
     remote_candidates: std.ArrayList(Candidate),
-
-    gathering_queue: CircularBuffer(usize, 16) = .{},
-    gathering_in_progress: usize = 0,
-
-    component_count: u8,
 
     /// The associated checklist.
     checklist: Checklist,
@@ -1306,16 +1318,18 @@ const MediaStream = struct {
             .local_auth = try AuthParameters.initFrom(local_auth.username_fragment, local_auth.password, allocator),
             .allocator = allocator,
             .local_candidates = std.ArrayList(Candidate).init(allocator),
+            .local_candidate_data = std.ArrayList(CandidateData).init(allocator),
             .remote_candidates = std.ArrayList(Candidate).init(allocator),
             .component_count = component_count,
             .checklist = Checklist.init(component_count),
         };
     }
 
-    pub fn deinit(self: *MediaStream) void {
+    pub fn deinit(self: MediaStream) void {
         self.local_auth.deinit(self.allocator);
         if (self.remote_auth) |remote_auth| remote_auth.deinit(self.allocator);
         self.local_candidates.deinit();
+        self.local_candidate_data.deinit();
         self.remote_candidates.deinit();
     }
 
@@ -1495,15 +1509,14 @@ const MediaStream = struct {
     }
 
     pub fn addLocalCandidate(self: *MediaStream, candidate: Candidate) !void {
-        const candidate_index = self.local_candidates.items.len;
+        const host_candidate_index = self.local_candidates.items.len;
         try self.local_candidates.append(candidate);
+        errdefer _ = self.local_candidates.pop();
 
         if (candidate.type == .host) {
-            self.gathering_queue.push(candidate_index) catch {
-                log.warn("Failed to add candidate to gathering queue", .{});
-                return;
-            };
-            self.gathering_in_progress += 1;
+            const candidate_data = CandidateData{ .candidate_index = host_candidate_index };
+            try self.local_candidate_data.append(candidate_data);
+            errdefer _ = self.local_candidate_data.pop();
         }
     }
 
@@ -1696,6 +1709,9 @@ pub const AgentContext = struct {
     /// A reference to the associated zice.Context.
     context: *Context,
 
+    /// The mutex protecting the Agent.
+    mutex: std.Thread.Mutex = .{},
+
     /// The agent state.
     state: AgentState = .running,
     /// The agent role.
@@ -1722,6 +1738,11 @@ pub const AgentContext = struct {
     /// A pool of socket data.
     socket_data_pool: std.heap.MemoryPool(SocketData),
 
+    /// The async handle used to wakeup the agent.
+    async_handle: xev.Async,
+    /// The associated completion.
+    async_completion: xev.Completion = .{},
+
     // Gathering related fields.
 
     /// The timer that fires when a new candidate can be checked.
@@ -1738,15 +1759,15 @@ pub const AgentContext = struct {
     /// The checklists used to check candidate pairs.
     media_streams: std.ArrayList(MediaStream),
 
+    /// Represents the current checklist to use for connectivity checks.
+    current_checklist_index: usize = 0,
+
     /// The timer that fires when a connectivity check needs to be done.
     connectivity_checks_timer: xev.Timer,
     /// The associated xev.Completion.
     connectivity_checks_timer_completion: xev.Completion = .{},
     /// The completion used to cancel the connectivity checks timer.
     connectivity_checks_timer_cancel_completion: xev.Completion = .{},
-
-    /// Represents the current checklist to use for connectivity checks.
-    current_checklist_index: usize = 0,
 
     /// Queue of response to send when ready.
     check_response_queue: *CircularBuffer(ResponseEntry, 64),
@@ -1762,6 +1783,8 @@ pub const AgentContext = struct {
     flags: packed struct {
         /// Has this agent been stopped.
         stopped: bool = false,
+        /// Have the connectivity checks started.
+        connectivity_checks_started: bool = false,
     } = .{},
 
     /// Userdata that is given back in callbacks.
@@ -1770,7 +1793,7 @@ pub const AgentContext = struct {
     on_candidate_callback: OnCandidateCallback,
     /// Callback to call when the gathering state changes.
     on_state_change_callback: OnStateChangeCallback,
-    /// Callbacks to call when data is available.
+    /// Callback to call when data is available.
     on_data_callback: OnDataCallback,
 
     /// The zice.Context event loop.
@@ -1805,6 +1828,9 @@ pub const AgentContext = struct {
         errdefer allocator.destroy(check_response_queue);
         check_response_queue.* = .{};
 
+        var async_handle = try xev.Async.init();
+        errdefer async_handle.deinit();
+
         return AgentContext{
             .id = agent_id,
             .allocator = allocator,
@@ -1814,6 +1840,7 @@ pub const AgentContext = struct {
             .stun_context_entries = stun_context_entries,
             .sockets = std.ArrayList(Socket).init(allocator),
             .socket_data_pool = socket_data_pool,
+            .async_handle = async_handle,
             .media_streams = std.ArrayList(MediaStream).init(allocator),
             .connectivity_checks_timer = connectivity_checks_timer,
             .check_response_queue_write_buffer = check_response_queue_write_buffer,
@@ -1826,6 +1853,10 @@ pub const AgentContext = struct {
             .on_data_callback = options.on_data_callback,
             .loop = loop,
         };
+    }
+
+    pub fn start(self: *AgentContext) void {
+        self.async_handle.wait(self.loop, &self.async_completion, AgentContext, self, asyncCallback);
     }
 
     /// Stops the agent
@@ -1861,12 +1892,17 @@ pub const AgentContext = struct {
                 connectivityCheckTimerCancelCallback,
             );
         }
+
+        if (self.async_completion.state() == .active) {
+            self.async_handle.notify() catch unreachable;
+        }
     }
 
     /// Returns true if the agent is done with all potential ongoing operations.
     pub fn done(self: *const AgentContext) bool {
         for (self.sockets.items) |s| if (!s.done()) return false;
         for (self.stun_context_entries) |maybe_stun_context| if (maybe_stun_context) |_| return false;
+        if (self.async_completion.state() != .dead) return false;
         if (self.gathering_main_timer_completion.state() != .dead or self.gathering_main_timer_cancel_completion.state() != .dead) return false;
         if (self.connectivity_checks_timer_completion.state() != .dead or self.connectivity_checks_timer_cancel_completion.state() != .dead) return false;
 
@@ -1973,7 +2009,9 @@ pub const AgentContext = struct {
         return preferences;
     }
 
-    pub fn processAddMediaStream(self: *AgentContext, media_stream_id: usize, component_count: u8) AddMediaStreamError!void {
+    pub fn addMediaStream(self: *AgentContext, media_stream_id: usize, component_count: u8) AddMediaStreamError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.getMediaStreamIndexFromId(media_stream_id)) |_| return error.AlreadyExists;
 
         var media_stream = MediaStream.init(media_stream_id, component_count, self.local_auth, self.allocator) catch return error.Unexpected;
@@ -1982,10 +2020,24 @@ pub const AgentContext = struct {
         self.media_streams.append(media_stream) catch return error.Unexpected;
     }
 
-    pub fn processRemoveMediaStream(self: *AgentContext, media_stream_id: usize) !void {
-        _ = media_stream_id;
-        _ = self;
-        @panic("TODO: Implement MediaStream removal");
+    pub fn removeMediaStream(self: *AgentContext, media_stream_id: usize) RemoveMediaStreamError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const media_stream_index = self.getMediaStreamIndexFromId(media_stream_id) orelse return error.NotFound;
+
+        const media_stream = self.media_streams.swapRemove(media_stream_index);
+        media_stream.deinit();
+    }
+
+    fn updateGatheringState(self: *AgentContext) void {
+        const new_state: GatheringState = if (self.media_streams.items.len == 0) .idle else for (self.media_streams.items) |media_stream| {
+            const is_gathering = for (media_stream.local_candidate_data.items) |local_candidate_data| {
+                if (local_candidate_data.gathering_state != .done) break true;
+            } else false;
+            if (is_gathering) break .gathering;
+        } else .done;
+
+        self.setGatheringState(new_state);
     }
 
     /// Starts any required operation to gather candidates.
@@ -1996,7 +2048,7 @@ pub const AgentContext = struct {
             self.role = .controlling;
         }
 
-        self.gathering_state = .gathering;
+        self.setGatheringState(.gathering);
 
         self.address_entries = b: {
             const addresses = try self.context.getValidCandidateAddresses(self.allocator);
@@ -2013,43 +2065,47 @@ pub const AgentContext = struct {
             break :b entries;
         };
 
-        for (self.media_streams.items) |*media_stream| {
-            for (1..media_stream.component_count + 1) |component_id| {
-                for (self.address_entries, 0..) |entry, i| {
-                    const socket_data = try self.socket_data_pool.create();
-                    socket_data.* = .{
-                        .socket_index = self.sockets.items.len,
-                    };
-                    errdefer self.socket_data_pool.destroy(socket_data);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.media_streams.items) |*media_stream| {
+                for (1..media_stream.component_count + 1) |component_id| {
+                    for (self.address_entries, 0..) |entry, i| {
+                        const socket_data = try self.socket_data_pool.create();
+                        socket_data.* = .{
+                            .socket_index = self.sockets.items.len,
+                        };
+                        errdefer self.socket_data_pool.destroy(socket_data);
 
-                    const socket = try Socket.init(entry.address, socket_data);
-                    errdefer socket.deinit();
+                        const socket = try Socket.init(entry.address, socket_data);
+                        errdefer socket.deinit();
 
-                    socket.start(self.loop, self, readCallback);
-                    errdefer socket.cancel(self.loop);
+                        socket.start(self.loop, self, readCallback);
+                        errdefer socket.cancel(self.loop);
 
-                    try self.sockets.append(socket);
+                        try self.sockets.append(socket);
 
-                    const candidate = Candidate{
-                        .type = .host,
-                        .base_address = socket.address,
-                        .transport_address = socket.address,
-                        .priority = computePriority(CandidateType.preference(.host), entry.preference, @intCast(component_id)),
-                        .foundation = Foundation{
+                        const candidate = Candidate{
                             .type = .host,
-                            // TODO(Corentin): When supported, get that from the socket.
-                            .protocol = .udp,
-                            .address_index = @intCast(i),
-                        },
-                        .component_id = @intCast(component_id),
-                    };
-                    try media_stream.addLocalCandidate(candidate);
-                    self.on_candidate_callback(self.userdata, self, .{
-                        .candidate = .{
-                            .media_stream_id = media_stream.id,
-                            .candidate = candidate,
-                        },
-                    });
+                            .base_address = socket.address,
+                            .transport_address = socket.address,
+                            .priority = computePriority(CandidateType.preference(.host), entry.preference, @intCast(component_id)),
+                            .foundation = Foundation{
+                                .type = .host,
+                                // TODO(Corentin): When supported, get that from the socket.
+                                .protocol = .udp,
+                                .address_index = @intCast(i),
+                            },
+                            .component_id = @intCast(component_id),
+                        };
+                        try media_stream.addLocalCandidate(candidate);
+                        self.on_candidate_callback(self.userdata, self, .{
+                            .candidate = .{
+                                .media_stream_id = media_stream.id,
+                                .candidate = candidate,
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -2075,15 +2131,11 @@ pub const AgentContext = struct {
         }
         self.has_remote_parameters = true;
 
-        switch (self.role.?) {
-            .controlling => {
-                if (self.gathering_state == .done) {
-                    self.startChecks();
-                }
-            },
-            .controlled => {
-                try self.processGatherCandidates();
-            },
+        if (self.gathering_state == .idle) {
+            try self.processGatherCandidates();
+        } else if (self.gathering_state == .done and self.has_remote_parameters and !self.flags.connectivity_checks_started) {
+            self.flags.connectivity_checks_started = true;
+            self.startChecks();
         }
     }
 
@@ -2142,9 +2194,18 @@ pub const AgentContext = struct {
     }
 
     /// Starts connectivity checks.
-    fn startChecks(
-        self: *AgentContext,
-    ) void {
+    fn startChecks(self: *AgentContext) void {
+        for (self.media_streams.items) |*media_stream| {
+            media_stream.removeRedundantCandidates();
+
+            // Select the first server reflexive candidate to be the default candidate.
+            for (media_stream.local_candidates.items) |*candidate| {
+                if (candidate.type == .server_reflexive) {
+                    candidate.default = true;
+                    break;
+                }
+            }
+        }
         self.printCandidates();
         for (self.media_streams.items) |*media_stream| {
             media_stream.recomputePairs(self.role.?) catch unreachable;
@@ -2296,32 +2357,16 @@ pub const AgentContext = struct {
         log.debug("Agent {} - Gathering State changed from \"{s}\" to \"{s}\"", .{ self.id, @tagName(old_state), @tagName(new_state) });
 
         if (new_state == .done) {
-            for (self.media_streams.items) |*media_stream| {
-                media_stream.removeRedundantCandidates();
-
-                // Select the first server reflexive candidate to be the default candidate.
-                for (media_stream.local_candidates.items) |*candidate| {
-                    if (candidate.type == .server_reflexive) {
-                        candidate.default = true;
-                        break;
-                    }
-                }
-            }
-
             self.on_candidate_callback(self.userdata, self, .{ .done = {} });
-
-            if (self.has_remote_parameters) {
-                self.startChecks();
-            }
         }
     }
 
     /// Single entrypoint for all gathering related events (STUN message received, transaction completed or main timer fired).
     /// The rationale to have a single function instead of multiple callback is that it makes it easier to know exactly when the gathering is done.
-    fn handleGatheringEvent(
-        self: *AgentContext,
-        result: GatheringEventResult,
-    ) void {
+    fn handleGatheringEvent(self: *AgentContext, result: GatheringEventResult) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         switch (result) {
             .read => |r| {
                 const gathering_context = &self.stun_context_entries[r.stun_context_index].?.gathering;
@@ -2332,17 +2377,14 @@ pub const AgentContext = struct {
                 self.handleGatheringTransactionCompleted(gathering_context, r.result);
                 self.releaseStunContextIndex(r.stun_context_index);
 
-                if (self.gathering_state == .gathering) {
-                    const gathering_still_in_progress = for (self.media_streams.items) |media_stream| {
-                        if (media_stream.gathering_in_progress != 0) break true;
-                    } else false;
-
-                    if (!gathering_still_in_progress) {
-                        self.setGatheringState(.done);
-                    }
-                }
+                self.updateGatheringState();
             },
             .main_timer => |r| self.handleGatheringMainTimer(r),
+        }
+
+        if (self.gathering_state == .done and self.has_remote_parameters and !self.flags.connectivity_checks_started) {
+            self.flags.connectivity_checks_started = true;
+            self.startChecks();
         }
     }
 
@@ -2372,7 +2414,7 @@ pub const AgentContext = struct {
         };
         const host_candidate = media_stream.local_candidates.items[gathering_context.candidate_index];
 
-        media_stream.gathering_in_progress -= 1;
+        media_stream.local_candidate_data.items[gathering_context.candidate_index].gathering_state = .done;
 
         const payload = result catch |err| {
             log.debug("Agent {} - Gathering failed with {} for base address \"{}\"", .{ self.id, err, host_candidate.base_address });
@@ -2453,13 +2495,18 @@ pub const AgentContext = struct {
             @panic("TODO");
         };
 
-        const media_stream, const candidate_index = for (self.media_streams.items) |*media_stream| {
-            if (media_stream.gathering_queue.pop()) |candidate_index| break .{ media_stream, candidate_index };
+        const media_stream, const local_candidate_data = b: for (self.media_streams.items) |*media_stream| {
+            for (media_stream.local_candidate_data.items) |*local_candidate_data| {
+                if (local_candidate_data.gathering_state == .idle) break :b .{ media_stream, local_candidate_data };
+            }
         } else {
             return;
         };
 
-        const candidate = media_stream.local_candidates.items[candidate_index];
+        local_candidate_data.gathering_state = .gathering;
+        errdefer local_candidate_data.gathering_state = .idle;
+
+        const candidate = media_stream.local_candidates.items[local_candidate_data.candidate_index];
 
         const socket_index = self.getSocketIndexFromAddress(candidate.base_address) orelse unreachable;
         const socket = self.sockets.items[socket_index];
@@ -2497,9 +2544,9 @@ pub const AgentContext = struct {
 
         self.stun_context_entries[stun_context_index] = .{
             .gathering = .{
-                .socket_index = candidate_index,
+                .socket_index = local_candidate_data.candidate_index,
                 .media_stream_id = media_stream.id,
-                .candidate_index = candidate_index,
+                .candidate_index = local_candidate_data.candidate_index,
                 .transaction = transaction,
             },
         };
@@ -2526,6 +2573,9 @@ pub const AgentContext = struct {
     }
 
     fn handleConnectivityCheckEvent(self: *AgentContext, result: ConnectivityCheckEventResult) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         switch (result) {
             .request_read => |payload| {
                 self.handleConnectivityCheckRequestRead(payload.raw_message, payload.address, payload.socket_index) catch @panic("TODO: Request Read failed");
@@ -2590,6 +2640,26 @@ pub const AgentContext = struct {
         );
     }
 
+    fn handleMessage(self: *AgentContext, source: std.net.Address, data: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.media_streams.items) |media_stream| {
+            const remote_candidate_index = media_stream.getRemoteCandidateIndexFromTransportAddress(source) orelse continue;
+            const remote_candidate = media_stream.remote_candidates.items[remote_candidate_index];
+            self.on_data_callback(self.userdata, self, media_stream.id, remote_candidate.component_id, data);
+        }
+    }
+
+    fn asyncCallback(userdata: ?*AgentContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
+        const self = userdata.?;
+        _ = loop; // autofix
+        _ = c; // autofix
+        _ = result catch unreachable; // autofix
+
+        return if (self.flags.stopped) .disarm else .rearm;
+    }
+
     fn readCallback(
         userdata: ?*anyopaque,
         loop: *xev.Loop,
@@ -2637,11 +2707,7 @@ pub const AgentContext = struct {
             return if (self.flags.stopped) .disarm else .rearm;
         } else |_| {}
 
-        for (self.media_streams.items) |media_stream| {
-            const remote_candidate_index = media_stream.getRemoteCandidateIndexFromTransportAddress(source) orelse continue;
-            const remote_candidate = media_stream.remote_candidates.items[remote_candidate_index];
-            self.on_data_callback(self.userdata, self, media_stream.id, remote_candidate.component_id, data);
-        }
+        self.handleMessage(source, data);
 
         return if (self.flags.stopped) .disarm else .rearm;
     }
@@ -2820,8 +2886,10 @@ pub const AgentContext = struct {
         const old_role = self.role.?;
         self.role = if (old_role == .controlling) .controlled else .controlling;
         log.debug("Agent {} - Switching role from {s} to {s}", .{ self.id, @tagName(old_role), @tagName(self.role.?) });
-        for (self.media_streams.items) |*media_stream| {
-            media_stream.recomputePairs(self.role.?) catch unreachable;
+        if (self.flags.connectivity_checks_started) {
+            for (self.media_streams.items) |*media_stream| {
+                media_stream.recomputePairs(self.role.?) catch unreachable;
+            }
         }
     }
 
@@ -3333,16 +3401,10 @@ pub const AgentContext = struct {
 
             for (self.ctx.local_candidates.items, 0..) |candidate, index| {
                 try writer.print("    Local {} - {}\n", .{ index, candidate });
-                //if (candidate.default) {
-                //    try writer.print("    Local {} (d) - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
-                //} else {
-                //    try writer.print("    Local {} - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
-                //}
             }
 
             for (self.ctx.remote_candidates.items, 0..) |candidate, index| {
                 try writer.print("    Remote {} - {}\n", .{ index, candidate });
-                //try writer.print("    Remote {} - {} - {}\n", .{ index, candidate.base_address, candidate.transport_address });
             }
         }
     };
@@ -3391,8 +3453,6 @@ const ConnectivityCheckEventResult = union(enum) {
 };
 
 pub const ContextOperationType = enum {
-    add_media_stream,
-    remove_media_stream,
     gather_candidates,
     set_remote_candidates,
     send,
@@ -3410,10 +3470,15 @@ pub const RemoteCandidateParameters = struct {
     media_stream_parameters: []MediaStreamRemoteParameters,
 };
 
-pub const MediaStreamParameters = struct {
+pub const AddMediaStreamParameters = struct {
     agent_id: AgentId,
     media_stream_id: usize,
     component_count: u8,
+};
+
+pub const RemoveMediaStreamParameters = struct {
+    agent_id: AgentId,
+    media_stream_id: usize,
 };
 
 pub const SendParameters = struct {
@@ -3427,8 +3492,6 @@ pub const SendParameters = struct {
 };
 
 pub const ContextOperation = union(ContextOperationType) {
-    add_media_stream: MediaStreamParameters,
-    remove_media_stream: MediaStreamParameters,
     gather_candidates: AgentId,
     set_remote_candidates: RemoteCandidateParameters,
     send: SendParameters,
@@ -3442,11 +3505,9 @@ pub const SendError = error{NotReady} || xev.WriteError || InvalidError;
 
 pub const AddMediaStreamError = error{ AlreadyExists, Unexpected } || InvalidError;
 
-pub const RemoveMediaStreamError = error{} || InvalidError;
+pub const RemoveMediaStreamError = error{NotFound} || InvalidError;
 
 pub const ContextResult = union(ContextOperationType) {
-    add_media_stream: AddMediaStreamError!void,
-    remove_media_stream: RemoveMediaStreamError!void,
     gather_candidates: InvalidError!void,
     set_remote_candidates: InvalidError!void,
     send: SendError!usize,
@@ -3475,6 +3536,7 @@ pub const AgentId = GenerationId(u16, context_agent_slot_bit_count);
 
 const AgentContextEntry = struct {
     flags: packed struct {
+        started: bool = false,
         stopped: bool = false,
         deleted: bool = false,
     } = .{},
@@ -3505,6 +3567,7 @@ pub const Context = struct {
     flags_mutex: std.Thread.Mutex = .{},
     flags: packed struct {
         stopped: bool = false,
+        agent_created: bool = false,
     } = .{},
 
     loop: xev.Loop,
@@ -3676,6 +3739,15 @@ pub const Context = struct {
         // TODO(Corendos): Improve returned error.
         unused_entry.agent_context = AgentContext.init(self, unused_entry.agent_id, &self.loop, options, self.allocator) catch return error.Unexpected;
 
+        {
+            self.flags_mutex.lock();
+            defer self.flags_mutex.unlock();
+
+            self.flags.agent_created = true;
+        }
+
+        self.async_handle.notify() catch unreachable;
+
         return unused_entry.agent_id;
     }
 
@@ -3690,37 +3762,24 @@ pub const Context = struct {
         self.async_handle.notify() catch {};
     }
 
-    pub fn addMediaStream(self: *Context, agent_id: AgentId, c: *ContextCompletion, media_stream_id: usize, component_count: u8, userdata: ?*anyopaque, callback: ContextCallback) !void {
-        c.* = ContextCompletion{
-            .op = .{
-                .add_media_stream = .{
-                    .agent_id = agent_id,
-                    .media_stream_id = media_stream_id,
-                    .component_count = component_count,
-                },
-            },
-            .userdata = userdata,
-            .callback = callback,
-        };
+    pub fn addMediaStream(self: *Context, agent_id: AgentId, media_stream_id: usize, component_count: u8) AddMediaStreamError!void {
+        log.debug("Adding MediaStream {} with {} components to agent {}", .{ media_stream_id, component_count, agent_id.raw });
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
 
-        self.addCompletion(c);
-        try self.submitCompletions();
+        const agent_context = try self.getAgentContext(agent_id);
+
+        return agent_context.addMediaStream(media_stream_id, component_count);
     }
 
-    pub fn removeMediaStream(self: *Context, agent_id: AgentId, c: *ContextCompletion, media_stream_id: usize, userdata: ?*anyopaque, callback: ContextCallback) !void {
-        c.* = ContextCompletion{
-            .op = .{
-                .remove_media_stream = .{
-                    .agent_id = agent_id,
-                    .media_stream_id = media_stream_id,
-                },
-            },
-            .userdata = userdata,
-            .callback = callback,
-        };
+    pub fn removeMediaStream(self: *Context, agent_id: AgentId, media_stream_id: usize) RemoveMediaStreamError!void {
+        log.debug("Removing MediaStream {} from agent {}", .{ media_stream_id, agent_id.raw });
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
 
-        self.addCompletion(c);
-        try self.submitCompletions();
+        const agent_context = try self.getAgentContext(agent_id);
+
+        return agent_context.removeMediaStream(media_stream_id);
     }
 
     fn addCompletion(self: *Context, c: *ContextCompletion) void {
@@ -3814,6 +3873,26 @@ pub const Context = struct {
         }
     }
 
+    fn handleNewAgents(self: *Context) void {
+        {
+            self.flags_mutex.lock();
+            defer self.flags_mutex.unlock();
+
+            if (!self.flags.agent_created) return;
+            self.flags.agent_created = false;
+        }
+
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
+
+        for (self.agent_context_entries[0..]) |*entry| {
+            if (entry.agent_context != null and !entry.flags.started) {
+                entry.flags.started = true;
+                entry.agent_context.?.start();
+            }
+        }
+    }
+
     fn asyncCallback(
         userdata: ?*Context,
         loop: *xev.Loop,
@@ -3824,6 +3903,7 @@ pub const Context = struct {
         _ = loop;
         const self = userdata.?;
 
+        self.handleNewAgents();
         self.handleDeletion();
 
         var local_queue = b: {
@@ -3839,22 +3919,6 @@ pub const Context = struct {
         while (local_queue.pop()) |c| {
             log.debug("Processing {s}", .{@tagName(c.op)});
             switch (c.op) {
-                .add_media_stream => |parameters| {
-                    const add_media_stream_result = if (self.getAgentContext(parameters.agent_id)) |agent_context| b: {
-                        agent_context.processAddMediaStream(parameters.media_stream_id, parameters.component_count) catch unreachable;
-                        break :b {};
-                    } else |err| err;
-
-                    c.callback(c.userdata, ContextResult{ .add_media_stream = add_media_stream_result });
-                },
-                .remove_media_stream => |parameters| {
-                    const remove_media_stream_result = if (self.getAgentContext(parameters.agent_id)) |agent_context| b: {
-                        agent_context.processRemoveMediaStream(parameters.media_stream_id) catch unreachable;
-                        break :b {};
-                    } else |err| err;
-
-                    c.callback(c.userdata, ContextResult{ .remove_media_stream = remove_media_stream_result });
-                },
                 .gather_candidates => |agent_id| {
                     if (!self.netlink_context_ready) {
                         to_reenqueue.push(c);
