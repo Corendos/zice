@@ -868,6 +868,17 @@ pub const SocketData = struct {
     /// The address used in recvmsg.
     address_storage: std.os.sockaddr.storage = undefined,
 
+    /// The queue of response to send on that socket.
+    response_queue: CircularBuffer(ResponseEntry, 8) = .{},
+    /// The buffer to use for response.
+    response_queue_write_buffer: [4096]u8 = undefined,
+    /// The WriteData to use for response.
+    response_queue_write_data: WriteData = .{},
+    /// The associated xev.Completion.
+    response_queue_write_completion: xev.Completion = .{},
+    /// The completion to cancel writes.
+    response_queue_write_cancel_completion: xev.Completion = .{},
+
     /// Returns a std.net.Address from the address_storage field.
     pub inline fn getAddress(self: SocketData) std.net.Address {
         return std.net.Address.initPosix(@ptrCast(@alignCast(&self.address_storage)));
@@ -944,7 +955,7 @@ pub const Socket = struct {
         loop.add(&self.data.read_completion);
     }
 
-    pub fn cancel(self: Socket, loop: *xev.Loop) void {
+    fn cancelRead(self: Socket, loop: *xev.Loop) void {
         if (self.data.read_completion.state() == .dead) return;
 
         self.data.read_cancel_completion = .{
@@ -954,8 +965,24 @@ pub const Socket = struct {
         loop.add(&self.data.read_cancel_completion);
     }
 
+    fn cancelWrite(self: Socket, loop: *xev.Loop) void {
+        if (self.data.response_queue_write_completion.state() == .dead) return;
+
+        self.data.response_queue_write_cancel_completion = .{
+            .op = .{ .cancel = .{ .c = &self.data.response_queue_write_completion } },
+        };
+
+        loop.add(&self.data.response_queue_write_completion);
+    }
+
+    pub fn cancel(self: Socket, loop: *xev.Loop) void {
+        self.cancelRead(loop);
+        self.cancelWrite(loop);
+    }
+
     pub inline fn done(self: Socket) bool {
-        return self.data.read_completion.state() == .dead and self.data.read_cancel_completion.state() == .dead;
+        return self.data.read_completion.state() == .dead and self.data.read_cancel_completion.state() == .dead and
+            self.data.response_queue_write_completion.state() == .dead and self.data.response_queue_write_cancel_completion.state() == .dead;
     }
 
     pub fn deinit(self: Socket) void {
@@ -1630,8 +1657,6 @@ const StunContext = union(StunContextType) {
 
 /// An entry associated with a response that must be sent when possible.
 const ResponseEntry = struct {
-    /// The index of the socket in which we want to send the response.
-    socket_index: usize,
     /// The transaction ID of the request associated with this response.
     transaction_id: u96,
     /// The source of the associated request.
@@ -1769,14 +1794,6 @@ pub const AgentContext = struct {
     /// The completion used to cancel the connectivity checks timer.
     connectivity_checks_timer_cancel_completion: xev.Completion = .{},
 
-    /// Queue of response to send when ready.
-    check_response_queue: *CircularBuffer(ResponseEntry, 64),
-    check_response_queue_write_buffer: []u8 = &.{},
-    check_response_queue_write_data: WriteData = .{},
-    check_response_queue_write_completion: xev.Completion = .{},
-
-    // NOTE(Corendos): ^ We could have one completion/buffer/data per socket.
-
     // Other fields.
     address_entries: []AddressEntry = &.{},
 
@@ -1817,16 +1834,9 @@ pub const AgentContext = struct {
         var socket_data_pool = std.heap.MemoryPool(SocketData).init(allocator);
         errdefer socket_data_pool.deinit();
 
-        const check_response_queue_write_buffer = try buffer_pool.create();
-        errdefer buffer_pool.destroy(check_response_queue_write_buffer);
-
         const stun_context_entries = try allocator.create([64]?StunContext);
         errdefer allocator.destroy(stun_context_entries);
         @memset(stun_context_entries[0..], null);
-
-        const check_response_queue = try allocator.create(CircularBuffer(ResponseEntry, 64));
-        errdefer allocator.destroy(check_response_queue);
-        check_response_queue.* = .{};
 
         var async_handle = try xev.Async.init();
         errdefer async_handle.deinit();
@@ -1843,10 +1853,8 @@ pub const AgentContext = struct {
             .async_handle = async_handle,
             .media_streams = std.ArrayList(MediaStream).init(allocator),
             .connectivity_checks_timer = connectivity_checks_timer,
-            .check_response_queue_write_buffer = check_response_queue_write_buffer,
             .local_auth = auth_parameters,
             .tiebreaker = tiebreaker,
-            .check_response_queue = check_response_queue,
             .userdata = options.userdata,
             .on_candidate_callback = options.on_candidate_callback,
             .on_state_change_callback = options.on_state_change_callback,
@@ -1915,7 +1923,6 @@ pub const AgentContext = struct {
 
         self.allocator.free(self.address_entries);
 
-        self.allocator.destroy(self.check_response_queue);
         self.allocator.destroy(self.stun_context_entries);
         for (self.media_streams.items) |*media_stream| media_stream.deinit();
         self.media_streams.deinit();
@@ -2579,9 +2586,15 @@ pub const AgentContext = struct {
         switch (result) {
             .request_read => |payload| {
                 self.handleConnectivityCheckRequestRead(payload.raw_message, payload.address, payload.socket_index) catch @panic("TODO: Request Read failed");
+
+                // Handle response sending if required.
+                self.handleQueuedResponse(payload.socket_index);
             },
-            .response_write => {
+            .response_write => |payload| {
                 log.debug("Agent {} - Stun response sent !", .{self.id});
+
+                // Handle response sending if required.
+                self.handleQueuedResponse(payload.socket_index);
             },
             .response_read => |payload| {
                 self.handleConnectivityCheckResponseRead(payload.raw_message, payload.address, payload.stun_context_index) catch @panic("TODO: Response read failed");
@@ -2593,11 +2606,6 @@ pub const AgentContext = struct {
             .main_timer => |payload| {
                 self.handleConnectivityCheckMainTimer(payload) catch @panic("TODO: Main timer failed");
             },
-        }
-
-        // Handle response sending if required.
-        if (self.check_response_queue_write_completion.state() != .active) {
-            self.handleQueuedResponse();
         }
 
         // TODO(Corendos): This might need to be put elsewhere.
@@ -2748,11 +2756,13 @@ pub const AgentContext = struct {
         return .disarm;
     }
 
-    fn handleQueuedResponse(self: *AgentContext) void {
-        // Ensure we are not already waiting for a completion.
-        std.debug.assert(self.check_response_queue_write_completion.state() == .dead);
+    fn handleQueuedResponse(self: *AgentContext, socket_index: usize) void {
+        const socket = self.sockets.items[socket_index];
 
-        const response_entry = self.check_response_queue.pop() orelse return;
+        // If we are already sending a response, abort.
+        if (socket.data.response_queue_write_completion.state() == .active) return;
+
+        const response_entry = socket.data.response_queue.pop() orelse return;
 
         var buffer: [4096]u8 = undefined;
         const response = r: {
@@ -2765,19 +2775,18 @@ pub const AgentContext = struct {
         };
 
         const data = d: {
-            var stream = std.io.fixedBufferStream(self.check_response_queue_write_buffer);
+            var stream = std.io.fixedBufferStream(socket.data.response_queue_write_buffer[0..]);
             response.write(stream.writer()) catch unreachable;
             break :d stream.getWritten();
         };
 
-        self.check_response_queue_write_data.from(response_entry.source, data);
+        socket.data.response_queue_write_data.from(response_entry.source, data);
 
-        const socket = self.sockets.items[response_entry.socket_index];
-        self.check_response_queue_write_completion = xev.Completion{
+        socket.data.response_queue_write_completion = xev.Completion{
             .op = .{
                 .sendmsg = .{
                     .fd = socket.fd,
-                    .msghdr = &self.check_response_queue_write_data.message_header,
+                    .msghdr = &socket.data.response_queue_write_data.message_header,
                     .buffer = null,
                 },
             },
@@ -2787,10 +2796,10 @@ pub const AgentContext = struct {
 
         // TODO(Corendos): Hide implementation details
         if (xev.backend == .epoll) {
-            self.check_response_queue_write_completion.flags.dup = true;
+            socket.data.response_queue_write_completion.flags.dup = true;
         }
 
-        self.loop.add(&self.check_response_queue_write_completion);
+        self.loop.add(&socket.data.response_queue_write_completion);
     }
 
     fn connectivityCheckTimerCallback(
@@ -2932,11 +2941,12 @@ pub const AgentContext = struct {
         // Check fingerprint/integrity.
         try checkMessageIntegrity(request, self.local_auth.password);
 
+        const socket = self.sockets.items[socket_index];
+
         // Detecting and repairing role conflicts.
         if (self.detectAndRepairRoleConflict(request)) {
             // Enqueue a 487 STUN response.
-            self.check_response_queue.push(ResponseEntry{
-                .socket_index = socket_index,
+            socket.data.response_queue.push(ResponseEntry{
                 .transaction_id = request.transaction_id,
                 .source = source,
                 .flags = .{ .role_conflict = true },
@@ -2947,8 +2957,7 @@ pub const AgentContext = struct {
         }
 
         // Enqueue response.
-        self.check_response_queue.push(ResponseEntry{
-            .socket_index = socket_index,
+        socket.data.response_queue.push(ResponseEntry{
             .transaction_id = request.transaction_id,
             .source = source,
             .flags = .{ .role_conflict = false },
@@ -2957,8 +2966,6 @@ pub const AgentContext = struct {
         const use_candidate = for (request.attributes) |a| {
             if (a.type == ztun.attr.Type.use_candidate) break true;
         } else false;
-
-        const socket = self.sockets.items[socket_index];
 
         // Find local candidate whose transport address matches the address on which the request was received.
         const match_result = for (self.media_streams.items, 0..) |*media_stream, index| {
