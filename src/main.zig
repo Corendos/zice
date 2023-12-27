@@ -1749,9 +1749,6 @@ pub const AgentContext = struct {
     /// Tiebreaker value.
     tiebreaker: u64,
 
-    // TODO(Corendos,@Temporary):
-    has_remote_parameters: bool = false,
-
     /// A pool of buffer that can be used for network IO.
     buffer_pool: std.heap.MemoryPool([4096]u8),
 
@@ -1802,6 +1799,8 @@ pub const AgentContext = struct {
         stopped: bool = false,
         /// Have the connectivity checks started.
         connectivity_checks_started: bool = false,
+        // TODO(Corendos,@Temporary):
+        has_remote_description: bool = false,
     } = .{},
 
     /// Userdata that is given back in callbacks.
@@ -2047,14 +2046,7 @@ pub const AgentContext = struct {
         self.setGatheringState(new_state);
     }
 
-    /// Starts any required operation to gather candidates.
-    /// This should only be called by the zice Context.
-    pub fn processGatherCandidates(self: *AgentContext) !void {
-        // By default, assume that we are in the controlling role if we are explicitly asked to gather candidates.
-        if (self.role == null) {
-            self.role = .controlling;
-        }
-
+    fn startCandidateGathering(self: *AgentContext) !void {
         self.setGatheringState(.gathering);
 
         self.address_entries = b: {
@@ -2072,47 +2064,43 @@ pub const AgentContext = struct {
             break :b entries;
         };
 
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            for (self.media_streams.items) |*media_stream| {
-                for (1..media_stream.component_count + 1) |component_id| {
-                    for (self.address_entries, 0..) |entry, i| {
-                        const socket_data = try self.socket_data_pool.create();
-                        socket_data.* = .{
-                            .socket_index = self.sockets.items.len,
-                        };
-                        errdefer self.socket_data_pool.destroy(socket_data);
+        for (self.media_streams.items) |*media_stream| {
+            for (1..media_stream.component_count + 1) |component_id| {
+                for (self.address_entries, 0..) |entry, i| {
+                    const socket_data = try self.socket_data_pool.create();
+                    socket_data.* = .{
+                        .socket_index = self.sockets.items.len,
+                    };
+                    errdefer self.socket_data_pool.destroy(socket_data);
 
-                        const socket = try Socket.init(entry.address, socket_data);
-                        errdefer socket.deinit();
+                    const socket = try Socket.init(entry.address, socket_data);
+                    errdefer socket.deinit();
 
-                        socket.start(self.loop, self, readCallback);
-                        errdefer socket.cancel(self.loop);
+                    socket.start(self.loop, self, readCallback);
+                    errdefer socket.cancel(self.loop);
 
-                        try self.sockets.append(socket);
+                    try self.sockets.append(socket);
 
-                        const candidate = Candidate{
+                    const candidate = Candidate{
+                        .type = .host,
+                        .base_address = socket.address,
+                        .transport_address = socket.address,
+                        .priority = computePriority(CandidateType.preference(.host), entry.preference, @intCast(component_id)),
+                        .foundation = Foundation{
                             .type = .host,
-                            .base_address = socket.address,
-                            .transport_address = socket.address,
-                            .priority = computePriority(CandidateType.preference(.host), entry.preference, @intCast(component_id)),
-                            .foundation = Foundation{
-                                .type = .host,
-                                // TODO(Corentin): When supported, get that from the socket.
-                                .protocol = .udp,
-                                .address_index = @intCast(i),
-                            },
-                            .component_id = @intCast(component_id),
-                        };
-                        try media_stream.addLocalCandidate(candidate);
-                        self.on_candidate_callback(self.userdata, self, .{
-                            .candidate = .{
-                                .media_stream_id = media_stream.id,
-                                .candidate = candidate,
-                            },
-                        });
-                    }
+                            // TODO(Corentin): When supported, get that from the socket.
+                            .protocol = .udp,
+                            .address_index = @intCast(i),
+                        },
+                        .component_id = @intCast(component_id),
+                    };
+                    try media_stream.addLocalCandidate(candidate);
+                    self.on_candidate_callback(self.userdata, self, .{
+                        .candidate = .{
+                            .media_stream_id = media_stream.id,
+                            .candidate = candidate,
+                        },
+                    });
                 }
             }
         }
@@ -2120,30 +2108,47 @@ pub const AgentContext = struct {
         self.restartGathering();
     }
 
-    /// Sets the remote candidates and starts any required operations.
+    /// Starts any required operation to gather candidates.
     /// This should only be called by the zice Context.
-    fn processSetRemoteCandidates(self: *AgentContext, parameters: RemoteCandidateParameters) !void {
-        // If we don't have a role yet, we can assume that the other agent is the controlling one.
+    pub fn processGatherCandidates(self: *AgentContext) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // By default, assume that we are in the controlling role if we are explicitly asked to gather candidates.
+        if (self.role == null) {
+            self.role = .controlling;
+        }
+
+        try self.startCandidateGathering();
+    }
+
+    /// Sets the remote description and notify agent to start any required operations.
+    fn setRemoteDescription(self: *AgentContext, description: Description) SetRemoteDescriptionError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.role == null) {
             self.role = .controlled;
         }
 
-        for (parameters.media_stream_parameters) |media_stream_parameters| {
-            const media_stream = self.getMediaStreamFromId(media_stream_parameters.media_stream_id) orelse {
-                log.warn("Agent {} - No MediaStream with id={} found", .{ self.id, media_stream_parameters.media_stream_id });
-                continue;
-            };
-            try media_stream.remote_candidates.appendSlice(media_stream_parameters.candidates);
-            try media_stream.setRemoteAuth(media_stream_parameters.username_fragment, media_stream_parameters.password);
-        }
-        self.has_remote_parameters = true;
+        for (description.media_stream_descriptions) |media_stream_description| {
+            const media_stream = self.getMediaStreamFromId(media_stream_description.id) orelse b: {
+                // TODO(Corendos): How to get the number of component for a remote MediaStream ?
+                var new_media_stream = MediaStream.init(media_stream_description.id, media_stream_description.component_count, self.local_auth, self.allocator) catch unreachable;
+                errdefer new_media_stream.deinit();
 
-        if (self.gathering_state == .idle) {
-            try self.processGatherCandidates();
-        } else if (self.gathering_state == .done and self.has_remote_parameters and !self.flags.connectivity_checks_started) {
-            self.flags.connectivity_checks_started = true;
-            self.startChecks();
+                const media_stream = self.media_streams.addOne() catch unreachable;
+                media_stream.* = new_media_stream;
+
+                break :b media_stream;
+            };
+
+            media_stream.remote_candidates.appendSlice(media_stream_description.candidates) catch unreachable;
+            media_stream.setRemoteAuth(media_stream_description.username_fragment, media_stream_description.password) catch unreachable;
         }
+        self.flags.has_remote_description = true;
+
+        self.async_handle.notify() catch unreachable;
     }
 
     /// Starts any required operation to send the given message to the other agents.
@@ -2202,6 +2207,9 @@ pub const AgentContext = struct {
 
     /// Starts connectivity checks.
     fn startChecks(self: *AgentContext) void {
+        if (self.flags.connectivity_checks_started) return;
+        self.flags.connectivity_checks_started = true;
+
         for (self.media_streams.items) |*media_stream| {
             media_stream.removeRedundantCandidates();
 
@@ -2389,8 +2397,7 @@ pub const AgentContext = struct {
             .main_timer => |r| self.handleGatheringMainTimer(r),
         }
 
-        if (self.gathering_state == .done and self.has_remote_parameters and !self.flags.connectivity_checks_started) {
-            self.flags.connectivity_checks_started = true;
+        if (self.gathering_state == .done and self.flags.has_remote_description and !self.flags.connectivity_checks_started) {
             self.startChecks();
         }
     }
@@ -2660,10 +2667,21 @@ pub const AgentContext = struct {
     }
 
     fn asyncCallback(userdata: ?*AgentContext, loop: *xev.Loop, c: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
-        const self = userdata.?;
         _ = loop; // autofix
         _ = c; // autofix
-        _ = result catch unreachable; // autofix
+        const self = userdata.?;
+
+        _ = result catch unreachable;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Handle gathering/connectivity checks
+        if (self.gathering_state == .idle) {
+            self.startCandidateGathering() catch unreachable;
+        } else if (self.gathering_state == .done and self.flags.has_remote_description) {
+            self.startChecks();
+        }
 
         return if (self.flags.stopped) .disarm else .rearm;
     }
@@ -3461,31 +3479,19 @@ const ConnectivityCheckEventResult = union(enum) {
 
 pub const ContextOperationType = enum {
     gather_candidates,
-    set_remote_candidates,
     send,
 };
 
-pub const MediaStreamRemoteParameters = struct {
-    media_stream_id: usize,
-    candidates: []const Candidate,
+pub const MediaStreamDescription = struct {
+    id: usize,
+    component_count: u8,
     username_fragment: []const u8,
     password: []const u8,
+    candidates: []const Candidate,
 };
 
-pub const RemoteCandidateParameters = struct {
-    agent_id: AgentId = undefined,
-    media_stream_parameters: []MediaStreamRemoteParameters,
-};
-
-pub const AddMediaStreamParameters = struct {
-    agent_id: AgentId,
-    media_stream_id: usize,
-    component_count: u8,
-};
-
-pub const RemoveMediaStreamParameters = struct {
-    agent_id: AgentId,
-    media_stream_id: usize,
+pub const Description = struct {
+    media_stream_descriptions: []const MediaStreamDescription,
 };
 
 pub const SendParameters = struct {
@@ -3500,7 +3506,6 @@ pub const SendParameters = struct {
 
 pub const ContextOperation = union(ContextOperationType) {
     gather_candidates: AgentId,
-    set_remote_candidates: RemoteCandidateParameters,
     send: SendParameters,
 };
 
@@ -3514,9 +3519,10 @@ pub const AddMediaStreamError = error{ AlreadyExists, Unexpected } || InvalidErr
 
 pub const RemoveMediaStreamError = error{NotFound} || InvalidError;
 
+pub const SetRemoteDescriptionError = InvalidError;
+
 pub const ContextResult = union(ContextOperationType) {
     gather_candidates: InvalidError!void,
-    set_remote_candidates: InvalidError!void,
     send: SendError!usize,
 };
 
@@ -3810,19 +3816,14 @@ pub const Context = struct {
         try self.submitCompletions();
     }
 
-    pub fn setRemoteCandidates(self: *Context, agent_id: AgentId, c: *ContextCompletion, parameters: RemoteCandidateParameters, userdata: ?*anyopaque, callback: ContextCallback) !void {
-        // TODO(Corendos): Improve that
-        var parameters_copy = parameters;
-        parameters_copy.agent_id = agent_id;
+    pub fn setRemoteDescription(self: *Context, agent_id: AgentId, description: Description) SetRemoteDescriptionError!void {
+        log.debug("Setting remote description for agent {}", .{agent_id.raw});
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
 
-        c.* = ContextCompletion{
-            .op = .{ .set_remote_candidates = parameters_copy },
-            .userdata = userdata,
-            .callback = callback,
-        };
+        const agent_context = try self.getAgentContext(agent_id);
 
-        self.addCompletion(c);
-        try self.submitCompletions();
+        return agent_context.setRemoteDescription(description);
     }
 
     pub fn send(self: *Context, agent_id: AgentId, c: *ContextCompletion, data_stream_id: u8, component_id: u8, data: []const u8, userdata: ?*anyopaque, callback: ContextCallback) !void {
@@ -3937,14 +3938,6 @@ pub const Context = struct {
                     } else |err| err;
 
                     c.callback(c.userdata, ContextResult{ .gather_candidates = gather_result });
-                },
-                .set_remote_candidates => |parameters| {
-                    const set_remote_candidates_result = if (self.getAgentContext(parameters.agent_id)) |agent_context| b: {
-                        agent_context.processSetRemoteCandidates(parameters) catch unreachable;
-                        break :b {};
-                    } else |err| err;
-
-                    c.callback(c.userdata, ContextResult{ .set_remote_candidates = set_remote_candidates_result });
                 },
                 .send => |parameters| {
                     if (self.getAgentContext(parameters.agent_id)) |agent_context| b: {
