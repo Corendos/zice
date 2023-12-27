@@ -26,6 +26,10 @@ pub fn GenerationId(comptime StorageType: type, comptime index_bit_count: u16) t
             _ = fmt;
             try writer.print("{}", .{self.raw});
         }
+
+        pub inline fn eql(a: @This(), b: @This()) bool {
+            return a.raw == b.raw;
+        }
     };
 }
 
