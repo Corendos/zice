@@ -15,64 +15,50 @@ pub const std_options = struct {
     pub const logFn = utils.logFn;
 };
 
-const message_size = 2048;
+const message_size = 4096;
 pub const message = [_]u8{1} ** message_size;
 
-pub fn controllingCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, result: zice.CandidateResult) void {
+pub fn candidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, event: zice.CandidateEvent) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
-    if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent.id, @tagName(result.candidate.type), result.candidate.foundation.asNumber(), result.candidate.transport_address });
-        context.controlling_agent_data.?.candidates.append(result.candidate) catch unreachable;
-    } else if (result == .done) {
-        context.event_fifo_mutex.lock();
-        defer context.event_fifo_mutex.unlock();
+    switch (event) {
+        .candidate => |candidate_event| {
+            std.log.info("Agent {} new candidate for media stream {}: ({s}) {} {}", .{
+                agent.id,
+                candidate_event.media_stream_id,
+                @tagName(candidate_event.candidate.type),
+                candidate_event.candidate.foundation.asNumber(),
+                candidate_event.candidate.transport_address,
+            });
+        },
+        .done => {
+            context.event_fifo_mutex.lock();
+            defer context.event_fifo_mutex.unlock();
 
-        context.event_fifo.push(ContextEvent{ .gathering_done = .controlling }) catch unreachable;
-        context.async_handle.notify() catch unreachable;
+            const agent_type: AgentType = if (agent.id.eql(context.controlling_agent_id.?)) .controlling else .controlled;
+
+            context.event_fifo.push(ContextEvent{ .gathering_done = agent_type }) catch unreachable;
+            context.async_handle.notify() catch unreachable;
+        },
     }
 }
 
-pub fn controllingStateChangeCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, state: zice.AgentState) void {
-    const context: *Context = @alignCast(@ptrCast(userdata.?));
-    std.log.info("Agent {} new state: {any}", .{ agent.id, state });
-    if (state == .completed) {
-        context.event_fifo_mutex.lock();
-        defer context.event_fifo_mutex.unlock();
-
-        context.event_fifo.push(ContextEvent{ .ice_completed = .controlling }) catch unreachable;
-        context.async_handle.notify() catch unreachable;
-    }
-}
-
-pub fn controlledCandidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, result: zice.CandidateResult) void {
-    const context: *Context = @alignCast(@ptrCast(userdata.?));
-    if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent.id, @tagName(result.candidate.type), result.candidate.foundation.asNumber(), result.candidate.transport_address });
-        context.controlled_agent_data.?.candidates.append(result.candidate) catch unreachable;
-    } else if (result == .done) {
-        context.event_fifo_mutex.lock();
-        defer context.event_fifo_mutex.unlock();
-
-        context.event_fifo.push(ContextEvent{ .gathering_done = .controlled }) catch unreachable;
-        context.async_handle.notify() catch unreachable;
-    }
-}
-
-pub fn controlledStateChangeCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, state: zice.AgentState) void {
+pub fn stateChangeCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, state: zice.AgentState) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
     std.log.info("Agent {} new state: {any}", .{ agent.id, state });
     if (state == .completed) {
         context.event_fifo_mutex.lock();
         defer context.event_fifo_mutex.unlock();
 
-        context.event_fifo.push(ContextEvent{ .ice_completed = .controlled }) catch unreachable;
+        const agent_type: AgentType = if (agent.id.eql(context.controlling_agent_id.?)) .controlling else .controlled;
+
+        context.event_fifo.push(ContextEvent{ .ice_completed = agent_type }) catch unreachable;
         context.async_handle.notify() catch unreachable;
     }
 }
 
-pub fn controllingDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
-    _ = component_id;
-
+pub fn dataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, media_stream_id: usize, component_id: u8, data: []const u8) void {
+    _ = media_stream_id; // autofix
+    _ = component_id; // autofix
     std.debug.assert(data.len == message_size);
 
     std.log.debug("Agent {} - Received message \"{s}\"", .{ agent.id, data });
@@ -82,50 +68,10 @@ pub fn controllingDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext,
     context.event_fifo_mutex.lock();
     defer context.event_fifo_mutex.unlock();
 
-    context.event_fifo.push(ContextEvent{ .message_received = .controlling }) catch unreachable;
+    const agent_type: AgentType = if (agent.id.eql(context.controlling_agent_id.?)) .controlling else .controlled;
+    context.event_fifo.push(ContextEvent{ .message_received = agent_type }) catch unreachable;
     context.async_handle.notify() catch unreachable;
 }
-
-pub fn controlledDataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
-    _ = component_id;
-
-    std.debug.assert(data.len == message_size);
-
-    std.log.debug("Agent {} - Received message \"{s}\"", .{ agent.id, data });
-
-    const context: *Context = @alignCast(@ptrCast(userdata.?));
-
-    context.event_fifo_mutex.lock();
-    defer context.event_fifo_mutex.unlock();
-
-    context.event_fifo.push(ContextEvent{ .message_received = .controlled }) catch unreachable;
-    context.async_handle.notify() catch unreachable;
-}
-
-fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.ContextResult) void {
-    _ = result;
-    _ = userdata;
-}
-
-const AgentData = struct {
-    id: zice.AgentId,
-    candidates: std.ArrayList(zice.Candidate),
-    completed: bool = false,
-
-    pub fn init(id: zice.AgentId, allocator: std.mem.Allocator) !AgentData {
-        var candidates = std.ArrayList(zice.Candidate).init(allocator);
-        errdefer candidates.deinit();
-
-        return AgentData{
-            .id = id,
-            .candidates = candidates,
-        };
-    }
-
-    pub fn deinit(self: *AgentData) void {
-        self.candidates.deinit();
-    }
-};
 
 const BenchmarkState = struct {
     start_timestamp: ?i128 = null,
@@ -136,8 +82,12 @@ const BenchmarkState = struct {
 
 const Context = struct {
     zice_context: ?*zice.Context = null,
-    controlling_agent_data: ?AgentData = null,
-    controlled_agent_data: ?AgentData = null,
+    controlling_agent_id: ?zice.AgentId = null,
+    controlling_agent_ready: bool = false,
+    controlled_agent_id: ?zice.AgentId = null,
+    controlled_agent_ready: bool = false,
+
+    allocator: std.mem.Allocator,
 
     stop_handler: utils.StopHandler,
 
@@ -157,7 +107,7 @@ const Context = struct {
         stopped: bool = false,
     } = .{},
 
-    fn init() !Context {
+    fn init(allocator: std.mem.Allocator) !Context {
         const stop_handler = try utils.StopHandler.init();
         errdefer stop_handler.deinit();
 
@@ -171,18 +121,11 @@ const Context = struct {
             .stop_handler = stop_handler,
             .async_handle = async_handle,
             .timer = timer,
+            .allocator = allocator,
         };
     }
 
     fn deinit(self: *Context) void {
-        if (self.controlling_agent_data) |*data| {
-            data.deinit();
-        }
-
-        if (self.controlled_agent_data) |*data| {
-            data.deinit();
-        }
-
         self.async_handle.deinit();
         self.timer.deinit();
         self.stop_handler.deinit();
@@ -194,8 +137,8 @@ const Context = struct {
 
         self.benchmark_state.end_timestamp = std.time.nanoTimestamp();
 
-        self.zice_context.?.deleteAgent(self.controlling_agent_data.?.id) catch {};
-        self.zice_context.?.deleteAgent(self.controlled_agent_data.?.id) catch {};
+        self.zice_context.?.deleteAgent(self.controlling_agent_id.?) catch {};
+        self.zice_context.?.deleteAgent(self.controlled_agent_id.?) catch {};
         self.zice_context.?.stop();
 
         self.async_handle.notify() catch unreachable;
@@ -271,43 +214,21 @@ const WaitableResult = struct {
     result: ?zice.ContextResult = null,
 };
 
-fn setRemoteCandidates(context: *Context, source_agent_data: *AgentData, destination_agent_data: *AgentData) zice.InvalidError!void {
-    var result: WaitableResult = .{};
+fn setRemoteCandidates(context: *Context, source_agent_id: zice.AgentId, destination_agent_id: zice.AgentId) zice.InvalidError!void {
+    var arena_state = std.heap.ArenaAllocator.init(context.allocator);
+    defer arena_state.deinit();
 
-    const source_agent_context = context.zice_context.?.getAgentContext(source_agent_data.id) catch unreachable;
+    const arena = arena_state.allocator();
+    const description = context.zice_context.?.getLocalDescription(arena, source_agent_id) catch unreachable;
 
-    const parameters = zice.RemoteCandidateParameters{
-        .candidates = source_agent_data.candidates.items,
-        .username_fragment = source_agent_context.local_auth.username_fragment,
-        .password = source_agent_context.local_auth.password,
-    };
-
-    var completion: zice.ContextCompletion = undefined;
-
-    context.zice_context.?.setRemoteCandidates(
-        destination_agent_data.id,
-        &completion,
-        parameters,
-        &result,
-        (struct {
-            fn callback(userdata: ?*anyopaque, completion_result: zice.ContextResult) void {
-                var inner_result: *WaitableResult = @ptrCast(@alignCast(userdata.?));
-                inner_result.result = completion_result;
-                inner_result.barrier.set();
-            }
-        }).callback,
-    ) catch unreachable;
-
-    result.barrier.wait();
-
-    return result.result.?.set_remote_candidates;
+    return context.zice_context.?.setRemoteDescription(destination_agent_id, description);
 }
 
-fn send(context: *Context, agent_data: *AgentData, data_stream_id: u8, component_id: u8, data: []const u8) zice.SendError!usize {
+fn send(context: *Context, agent_id: zice.AgentId, data_stream_id: u8, component_id: u8, data: []const u8) zice.SendError!usize {
     var result: WaitableResult = .{};
 
     var completion: zice.ContextCompletion = undefined;
-    context.zice_context.?.send(agent_data.id, &completion, data_stream_id, component_id, data, &result, (struct {
+    context.zice_context.?.send(agent_id, &completion, data_stream_id, component_id, data, &result, (struct {
         pub fn callback(userdata: ?*anyopaque, completion_result: zice.ContextResult) void {
             var inner_result: *WaitableResult = @ptrCast(@alignCast(userdata.?));
             inner_result.result = completion_result;
@@ -342,29 +263,29 @@ fn asyncCallback(userdata: ?*Context, loop: *xev.Loop, c: *xev.Completion, resul
     while (temp_fifo.pop()) |event| {
         switch (event) {
             .gathering_done => |agent_type| {
-                const source_agent_data = if (agent_type == .controlling) &context.controlling_agent_data.? else &context.controlled_agent_data.?;
-                const destination_agent_data = if (agent_type == .controlling) &context.controlled_agent_data.? else &context.controlling_agent_data.?;
+                const source_agent_id = if (agent_type == .controlling) context.controlling_agent_id.? else context.controlled_agent_id.?;
+                const destination_agent_id = if (agent_type == .controlling) context.controlled_agent_id.? else context.controlling_agent_id.?;
 
-                setRemoteCandidates(context, source_agent_data, destination_agent_data) catch unreachable;
+                setRemoteCandidates(context, source_agent_id, destination_agent_id) catch unreachable;
             },
             .ice_completed => |agent_type| {
                 switch (agent_type) {
-                    .controlling => context.controlling_agent_data.?.completed = true,
-                    .controlled => context.controlled_agent_data.?.completed = true,
+                    .controlling => context.controlling_agent_ready = true,
+                    .controlled => context.controlled_agent_ready = true,
                 }
 
-                if (context.controlling_agent_data.?.completed and context.controlled_agent_data.?.completed) {
+                if (context.controlling_agent_ready and context.controlled_agent_ready) {
                     context.benchmark_state.start_timestamp = std.time.nanoTimestamp();
-                    _ = send(context, &context.controlling_agent_data.?, 1, 1, &message) catch unreachable;
+                    _ = send(context, context.controlling_agent_id.?, 1, 1, &message) catch unreachable;
                     context.benchmark_state.message_sent += 1;
                 }
             },
             .message_received => |agent_type| {
                 if (agent_type == .controlled) {
-                    _ = send(context, &context.controlled_agent_data.?, 1, 1, &message) catch unreachable;
+                    _ = send(context, context.controlled_agent_id.?, 1, 1, &message) catch unreachable;
                     context.benchmark_state.message_sent += 1;
                 } else if (agent_type == .controlling) {
-                    _ = send(context, &context.controlling_agent_data.?, 1, 1, &message) catch unreachable;
+                    _ = send(context, context.controlling_agent_id.?, 1, 1, &message) catch unreachable;
                     context.benchmark_state.message_sent += 1;
                 }
             },
@@ -384,7 +305,7 @@ pub fn main() !void {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    var context = try Context.init();
+    var context = try Context.init(allocator);
     defer context.deinit();
 
     context.stop_handler.register(&loop, &context, stopHandlerCallback);
@@ -401,25 +322,29 @@ pub fn main() !void {
     }).f, .{&context});
     defer t.join();
 
+    // NOTE(Corendos,@Temporary): horrible hack until there is an initial interface/address discovery mechanism
+    std.time.sleep(10 * std.time.ns_per_ms);
+
     const controlling_agent = try zice_context.createAgent(.{
         .userdata = &context,
-        .on_candidate_callback = controllingCandidateCallback,
-        .on_state_change_callback = controllingStateChangeCallback,
-        .on_data_callback = controllingDataCallback,
+        .on_candidate_callback = candidateCallback,
+        .on_state_change_callback = stateChangeCallback,
+        .on_data_callback = dataCallback,
     });
 
     const controlled_agent = try zice_context.createAgent(.{
         .userdata = &context,
-        .on_candidate_callback = controlledCandidateCallback,
-        .on_state_change_callback = controlledStateChangeCallback,
-        .on_data_callback = controlledDataCallback,
+        .on_candidate_callback = candidateCallback,
+        .on_state_change_callback = stateChangeCallback,
+        .on_data_callback = dataCallback,
     });
 
-    context.controlling_agent_data = try AgentData.init(controlling_agent, allocator);
-    context.controlled_agent_data = try AgentData.init(controlled_agent, allocator);
+    context.controlling_agent_id = controlling_agent;
+    context.controlled_agent_id = controlled_agent;
 
-    var gather_completion: zice.ContextCompletion = undefined;
-    try zice_context.gatherCandidates(controlling_agent, &gather_completion, null, gatherCandidateCallback);
+    context.zice_context.?.addMediaStream(controlling_agent, 1, 1) catch unreachable;
+
+    try zice_context.gatherCandidates(controlling_agent);
 
     context.async_handle.wait(&loop, &context.async_completion, Context, &context, asyncCallback);
 

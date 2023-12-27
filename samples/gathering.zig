@@ -53,26 +53,6 @@ fn stopHandlerCallback(userdata: ?*anyopaque, loop: *xev.Loop, result: utils.Sto
     context.zice_context.?.stop();
 }
 
-fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.ContextResult) void {
-    _ = result;
-    _ = userdata;
-    std.log.debug("Started candidate gathering", .{});
-}
-
-fn addMediaStream(context: *zice.Context, agent_id: zice.AgentId, media_stream_id: usize) !void {
-    var future = zice.Future(zice.AddMediaStreamError!void){};
-    var c: zice.ContextCompletion = undefined;
-
-    context.addMediaStream(agent_id, &c, media_stream_id, &future, (struct {
-        fn callback(userdata: ?*anyopaque, result: zice.ContextResult) void {
-            var inner_future: *@TypeOf(future) = @ptrCast(@alignCast(userdata.?));
-            inner_future.set(result.add_media_stream);
-        }
-    }).callback) catch unreachable;
-
-    return future.get();
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
     defer _ = gpa.deinit();
@@ -98,6 +78,9 @@ pub fn main() !void {
     }).f, .{&context});
     defer t.join();
 
+    // NOTE(Corendos,@Temporary): horrible hack until there is an initial interface/address discovery mechanism
+    std.time.sleep(10 * std.time.ns_per_ms);
+
     const agent = try zice_context.createAgent(.{
         .userdata = &context,
         .on_candidate_callback = candidateCallback,
@@ -105,10 +88,9 @@ pub fn main() !void {
     });
     context.agent = agent;
 
-    addMediaStream(context.zice_context.?, agent, 1) catch unreachable;
+    zice_context.addMediaStream(agent, 1, 1) catch unreachable;
 
-    var gather_completion: zice.ContextCompletion = undefined;
-    try zice_context.gatherCandidates(agent, &gather_completion, null, gatherCandidateCallback);
+    try zice_context.gatherCandidates(agent);
 
     try loop.run(.until_done);
 }

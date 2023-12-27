@@ -15,77 +15,83 @@ pub const std_options = struct {
     pub const logFn = utils.logFn;
 };
 
-pub fn candidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, index: usize, result: zice.CandidateResult) void {
+pub fn candidateCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, index: usize, event: zice.CandidateEvent) void {
     const context: *Context = @alignCast(@ptrCast(userdata.?));
-    if (result == .candidate) {
-        std.log.info("Agent {} new candidate: ({s}) {} {}", .{ agent.id, @tagName(result.candidate.type), result.candidate.foundation.asNumber(), result.candidate.transport_address });
-        context.agent_data[index].candidates.append(result.candidate) catch unreachable;
-    } else if (result == .done) {
-        const parameters = zice.RemoteCandidateParameters{
-            .candidates = context.agent_data[index].candidates.items,
-            .username_fragment = agent.local_auth.username_fragment,
-            .password = agent.local_auth.password,
-        };
+    switch (event) {
+        .candidate => |candidate_event| {
+            std.log.info("Agent {} new candidate for media stream {}: ({s}) {} {}", .{
+                agent.id,
+                candidate_event.media_stream_id,
+                @tagName(candidate_event.candidate.type),
+                candidate_event.candidate.foundation.asNumber(),
+                candidate_event.candidate.transport_address,
+            });
+        },
+        .done => {
+            context.event_fifo_mutex.lock();
+            defer context.event_fifo_mutex.unlock();
 
-        context.zice_context.?.setRemoteCandidates(
-            context.agent_data[1 - index].id,
-            &context.agent_data[1 - index].set_remote_candidate_completion,
-            parameters,
-            null,
-            setRemoteCandidatesCallback,
-        ) catch unreachable;
+            context.event_fifo.push(ContextEvent{ .gathering_done = index }) catch unreachable;
+            context.async_handle.notify() catch unreachable;
+        },
     }
 }
 
 pub fn stateChangeCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, index: usize, state: zice.AgentState) void {
-    _ = index;
     const context: *Context = @alignCast(@ptrCast(userdata.?));
-    _ = context;
     std.log.info("Agent {} new state: {any}", .{ agent.id, state });
-}
+    if (state == .completed) {
+        context.event_fifo_mutex.lock();
+        defer context.event_fifo_mutex.unlock();
 
-pub fn dataCallback(userdata: ?*anyopaque, agent: *zice.AgentContext, index: usize, component_id: u8, data: []const u8) void {
-    _ = index;
-    _ = userdata;
-    std.log.info("Agent {} received data for component {}: {s}", .{ agent.id, component_id, data });
+        context.event_fifo.push(ContextEvent{ .ice_completed = index }) catch unreachable;
+        context.async_handle.notify() catch unreachable;
+    }
 }
 
 fn gatherCandidateCallback(userdata: ?*anyopaque, result: zice.ContextResult) void {
     _ = result;
     _ = userdata;
-    std.log.debug("Started candidate gathering", .{});
 }
-
-fn setRemoteCandidatesCallback(userdata: ?*anyopaque, result: zice.ContextResult) void {
-    _ = result;
-    _ = userdata;
-    std.log.debug("Set remote candidates", .{});
-}
-
-const AgentData = struct {
-    id: zice.AgentId,
-    candidates: std.ArrayList(zice.Candidate),
-    set_remote_candidate_completion: zice.ContextCompletion = undefined,
-    send_completion: zice.ContextCompletion = undefined,
-
-    pub fn init(id: zice.AgentId, allocator: std.mem.Allocator) !AgentData {
-        var candidates = std.ArrayList(zice.Candidate).init(allocator);
-        errdefer candidates.deinit();
-
-        return AgentData{
-            .id = id,
-            .candidates = candidates,
-        };
-    }
-
-    pub fn deinit(self: *AgentData) void {
-        self.candidates.deinit();
-    }
-};
 
 const Context = struct {
     zice_context: ?*zice.Context = null,
-    agent_data: [2]AgentData = undefined,
+    agent_ids: [2]zice.AgentId = .{ undefined, undefined },
+
+    event_fifo_mutex: std.Thread.Mutex = .{},
+    event_fifo: zice.BoundedFifo(ContextEvent, 16) = .{},
+
+    async_handle: xev.Async,
+    async_completion: xev.Completion = .{},
+
+    allocator: std.mem.Allocator,
+
+    flags: packed struct {
+        stopped: bool = false,
+    } = .{},
+
+    fn init(allocator: std.mem.Allocator) !Context {
+        return Context{
+            .async_handle = try xev.Async.init(),
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *Context) void {
+        self.async_handle.deinit();
+    }
+};
+
+const ContextEventType = enum {
+    gathering_done,
+    ice_completed,
+    message_received,
+};
+
+const ContextEvent = union(ContextEventType) {
+    gathering_done: usize,
+    ice_completed: usize,
+    message_received: usize,
 };
 
 fn stopHandlerCallback(userdata: ?*anyopaque, loop: *xev.Loop, result: utils.StopHandler.Result) void {
@@ -94,53 +100,57 @@ fn stopHandlerCallback(userdata: ?*anyopaque, loop: *xev.Loop, result: utils.Sto
     const context: *Context = @ptrCast(@alignCast(userdata.?));
     std.log.info("Received SIGINT", .{});
 
-    context.zice_context.?.deleteAgent(context.agent_data[0].id) catch {};
-    context.zice_context.?.deleteAgent(context.agent_data[1].id) catch {};
+    for (context.agent_ids[0..]) |id| {
+        context.zice_context.?.deleteAgent(id) catch {};
+    }
     context.zice_context.?.stop();
+
+    context.flags.stopped = true;
+    context.async_handle.notify() catch unreachable;
 }
 
-pub fn createAgents(zice_context: *zice.Context, context: *Context) ![2]zice.AgentId {
-    const agent_1 = try zice_context.createAgent(.{
-        .userdata = context,
-        .on_candidate_callback = (struct {
-            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, result: zice.CandidateResult) void {
-                return candidateCallback(userdata, agent, 0, result);
-            }
-        }).callback,
-        .on_state_change_callback = (struct {
-            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, state: zice.AgentState) void {
-                return stateChangeCallback(userdata, agent, 0, state);
-            }
-        }).callback,
-        .on_data_callback = (struct {
-            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
-                return dataCallback(userdata, agent, 0, component_id, data);
-            }
-        }).callback,
-    });
-    errdefer zice_context.deleteAgent(agent_1) catch unreachable;
+fn setRemoteCandidates(context: *Context, source_agent_id: zice.AgentId, destination_agent_id: zice.AgentId) zice.InvalidError!void {
+    var arena_state = std.heap.ArenaAllocator.init(context.allocator);
+    defer arena_state.deinit();
 
-    const agent_2 = try zice_context.createAgent(.{
-        .userdata = context,
-        .on_candidate_callback = (struct {
-            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, result: zice.CandidateResult) void {
-                return candidateCallback(userdata, agent, 1, result);
-            }
-        }).callback,
-        .on_state_change_callback = (struct {
-            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, state: zice.AgentState) void {
-                return stateChangeCallback(userdata, agent, 1, state);
-            }
-        }).callback,
-        .on_data_callback = (struct {
-            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, component_id: u8, data: []const u8) void {
-                return dataCallback(userdata, agent, 1, component_id, data);
-            }
-        }).callback,
-    });
-    errdefer zice_context.deleteAgent(agent_2) catch unreachable;
+    const arena = arena_state.allocator();
+    const description = context.zice_context.?.getLocalDescription(arena, source_agent_id) catch unreachable;
 
-    return [2]zice.AgentId{ agent_1, agent_2 };
+    return context.zice_context.?.setRemoteDescription(destination_agent_id, description);
+}
+
+fn asyncCallback(userdata: ?*Context, loop: *xev.Loop, c: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
+    const context = userdata.?;
+    _ = result catch unreachable;
+
+    if (context.flags.stopped) return .disarm;
+
+    _ = c;
+    _ = loop;
+
+    var temp_fifo: zice.BoundedFifo(ContextEvent, 16) = .{};
+
+    {
+        context.event_fifo_mutex.lock();
+        defer context.event_fifo_mutex.unlock();
+        while (context.event_fifo.pop()) |event| {
+            temp_fifo.push(event) catch unreachable;
+        }
+    }
+
+    while (temp_fifo.pop()) |event| {
+        switch (event) {
+            .gathering_done => |agent_index| {
+                const source_agent_id = context.agent_ids[agent_index];
+                const destination_agent_id = context.agent_ids[1 - agent_index];
+
+                setRemoteCandidates(context, source_agent_id, destination_agent_id) catch unreachable;
+            },
+            .ice_completed => |_| {},
+            .message_received => |_| {},
+        }
+    }
+    return .rearm;
 }
 
 pub fn main() !void {
@@ -155,7 +165,8 @@ pub fn main() !void {
     var stop_handler = try utils.StopHandler.init();
     defer stop_handler.deinit();
 
-    var context = Context{};
+    var context = try Context.init(allocator);
+    defer context.deinit();
 
     stop_handler.register(&loop, &context, stopHandlerCallback);
 
@@ -171,16 +182,46 @@ pub fn main() !void {
     }).f, .{&context});
     defer t.join();
 
-    const agent_ids = try createAgents(&zice_context, &context);
-    context.agent_data[0] = try AgentData.init(agent_ids[0], allocator);
-    defer context.agent_data[0].deinit();
-    context.agent_data[1] = try AgentData.init(agent_ids[1], allocator);
-    defer context.agent_data[1].deinit();
+    // NOTE(Corendos,@Temporary): horrible hack until there is an initial interface/address discovery mechanism
+    std.time.sleep(10 * std.time.ns_per_ms);
 
-    var gather_completion_1: zice.ContextCompletion = undefined;
-    try zice_context.gatherCandidates(context.agent_data[0].id, &gather_completion_1, null, gatherCandidateCallback);
-    var gather_completion_2: zice.ContextCompletion = undefined;
-    try zice_context.gatherCandidates(context.agent_data[1].id, &gather_completion_2, null, gatherCandidateCallback);
+    const agent_1 = try zice_context.createAgent(.{
+        .userdata = &context,
+        .on_candidate_callback = (struct {
+            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, result: zice.CandidateEvent) void {
+                return candidateCallback(userdata, agent, 0, result);
+            }
+        }).callback,
+        .on_state_change_callback = (struct {
+            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, state: zice.AgentState) void {
+                return stateChangeCallback(userdata, agent, 0, state);
+            }
+        }).callback,
+    });
+    context.agent_ids[0] = agent_1;
+
+    const agent_2 = try zice_context.createAgent(.{
+        .userdata = &context,
+        .on_candidate_callback = (struct {
+            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, result: zice.CandidateEvent) void {
+                return candidateCallback(userdata, agent, 1, result);
+            }
+        }).callback,
+        .on_state_change_callback = (struct {
+            pub fn callback(userdata: ?*anyopaque, agent: *zice.AgentContext, state: zice.AgentState) void {
+                return stateChangeCallback(userdata, agent, 1, state);
+            }
+        }).callback,
+    });
+    context.agent_ids[1] = agent_2;
+
+    zice_context.addMediaStream(context.agent_ids[0], 1, 1) catch unreachable;
+    zice_context.addMediaStream(context.agent_ids[1], 1, 1) catch unreachable;
+
+    try zice_context.gatherCandidates(context.agent_ids[0]);
+    try zice_context.gatherCandidates(context.agent_ids[1]);
+
+    context.async_handle.wait(&loop, &context.async_completion, Context, &context, asyncCallback);
 
     try loop.run(.until_done);
 }
