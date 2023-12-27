@@ -2125,6 +2125,46 @@ pub const AgentContext = struct {
         self.async_handle.notify() catch unreachable;
     }
 
+    /// Gets the local description from the agent.
+    fn getLocalDescription(self: *AgentContext, allocator: std.mem.Allocator) GetLocalDescriptionError!Description {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var media_stream_description_list = try std.ArrayList(MediaStreamDescription).initCapacity(allocator, self.media_streams.items.len);
+        defer media_stream_description_list.deinit();
+        errdefer for (media_stream_description_list.items) |media_stream_description| {
+            allocator.free(media_stream_description.username_fragment);
+            allocator.free(media_stream_description.password);
+            allocator.free(media_stream_description.candidates);
+        };
+
+        for (self.media_streams.items) |media_stream| {
+            // TODO(Corendos): Plug that back when each media stream has its authentication.
+            //const username_fragment = try allocator.dupe(u8, media_stream.username_fragment);
+            const username_fragment = try allocator.dupe(u8, self.local_auth.username_fragment);
+            errdefer allocator.free(username_fragment);
+
+            // TODO(Corendos): Plug that back when each media stream has its authentication.
+            //const password = try allocator.dupe(u8, media_stream.password);
+            const password = try allocator.dupe(u8, self.local_auth.password);
+            errdefer allocator.free(password);
+
+            const candidates = try allocator.dupe(Candidate, media_stream.local_candidates.items);
+            errdefer allocator.free(candidates);
+
+            const media_stream_description = MediaStreamDescription{
+                .id = media_stream.id,
+                .component_count = media_stream.component_count,
+                .username_fragment = username_fragment,
+                .password = password,
+                .candidates = candidates,
+            };
+            media_stream_description_list.appendAssumeCapacity(media_stream_description);
+        }
+
+        return Description{ .media_stream_descriptions = try media_stream_description_list.toOwnedSlice() };
+    }
+
     /// Sets the remote description and notify agent to start any required operations.
     fn setRemoteDescription(self: *AgentContext, description: Description) SetRemoteDescriptionError!void {
         self.mutex.lock();
@@ -3520,6 +3560,8 @@ pub const AddMediaStreamError = error{ AlreadyExists, Unexpected } || InvalidErr
 
 pub const RemoveMediaStreamError = error{NotFound} || InvalidError;
 
+pub const GetLocalDescriptionError = std.mem.Allocator.Error || InvalidError;
+
 pub const SetRemoteDescriptionError = InvalidError;
 
 pub const GatherCandidateError = InvalidError;
@@ -3815,6 +3857,16 @@ pub const Context = struct {
         const agent_context = try self.getAgentContext(agent_id);
 
         return agent_context.gatherCandidates();
+    }
+
+    pub fn getLocalDescription(self: *Context, allocator: std.mem.Allocator, agent_id: AgentId) GetLocalDescriptionError!Description {
+        log.debug("Getting local description for agent {}", .{agent_id.raw});
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
+
+        const agent_context = try self.getAgentContext(agent_id);
+
+        return agent_context.getLocalDescription(allocator);
     }
 
     pub fn setRemoteDescription(self: *Context, agent_id: AgentId, description: Description) SetRemoteDescriptionError!void {
