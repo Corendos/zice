@@ -1801,6 +1801,8 @@ pub const AgentContext = struct {
         connectivity_checks_started: bool = false,
         // TODO(Corendos,@Temporary):
         has_remote_description: bool = false,
+        /// Should the agent start gathering candidates.
+        should_gather_candidates: bool = false,
     } = .{},
 
     /// Userdata that is given back in callbacks.
@@ -2108,9 +2110,8 @@ pub const AgentContext = struct {
         self.restartGathering();
     }
 
-    /// Starts any required operation to gather candidates.
-    /// This should only be called by the zice Context.
-    pub fn processGatherCandidates(self: *AgentContext) !void {
+    /// Notify agent to start any required operation to gather candidates.
+    pub fn gatherCandidates(self: *AgentContext) GatherCandidateError!void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -2119,7 +2120,9 @@ pub const AgentContext = struct {
             self.role = .controlling;
         }
 
-        try self.startCandidateGathering();
+        self.flags.should_gather_candidates = true;
+
+        self.async_handle.notify() catch unreachable;
     }
 
     /// Sets the remote description and notify agent to start any required operations.
@@ -2677,7 +2680,7 @@ pub const AgentContext = struct {
         defer self.mutex.unlock();
 
         // Handle gathering/connectivity checks
-        if (self.gathering_state == .idle) {
+        if ((self.flags.should_gather_candidates or self.flags.has_remote_description) and self.gathering_state == .idle) {
             self.startCandidateGathering() catch unreachable;
         } else if (self.gathering_state == .done and self.flags.has_remote_description) {
             self.startChecks();
@@ -3478,7 +3481,6 @@ const ConnectivityCheckEventResult = union(enum) {
 };
 
 pub const ContextOperationType = enum {
-    gather_candidates,
     send,
 };
 
@@ -3505,7 +3507,6 @@ pub const SendParameters = struct {
 };
 
 pub const ContextOperation = union(ContextOperationType) {
-    gather_candidates: AgentId,
     send: SendParameters,
 };
 
@@ -3521,8 +3522,9 @@ pub const RemoveMediaStreamError = error{NotFound} || InvalidError;
 
 pub const SetRemoteDescriptionError = InvalidError;
 
+pub const GatherCandidateError = InvalidError;
+
 pub const ContextResult = union(ContextOperationType) {
-    gather_candidates: InvalidError!void,
     send: SendError!usize,
 };
 
@@ -3805,15 +3807,14 @@ pub const Context = struct {
         try self.async_handle.notify();
     }
 
-    pub fn gatherCandidates(self: *Context, agent_id: AgentId, c: *ContextCompletion, userdata: ?*anyopaque, callback: ContextCallback) !void {
-        c.* = ContextCompletion{
-            .op = .{ .gather_candidates = agent_id },
-            .userdata = userdata,
-            .callback = callback,
-        };
+    pub fn gatherCandidates(self: *Context, agent_id: AgentId) GatherCandidateError!void {
+        log.debug("Start gathering candidates for agent {}", .{agent_id.raw});
+        self.agent_context_entries_mutex.lock();
+        defer self.agent_context_entries_mutex.unlock();
 
-        self.addCompletion(c);
-        try self.submitCompletions();
+        const agent_context = try self.getAgentContext(agent_id);
+
+        return agent_context.gatherCandidates();
     }
 
     pub fn setRemoteDescription(self: *Context, agent_id: AgentId, description: Description) SetRemoteDescriptionError!void {
@@ -3927,18 +3928,6 @@ pub const Context = struct {
         while (local_queue.pop()) |c| {
             log.debug("Processing {s}", .{@tagName(c.op)});
             switch (c.op) {
-                .gather_candidates => |agent_id| {
-                    if (!self.netlink_context_ready) {
-                        to_reenqueue.push(c);
-                        continue;
-                    }
-                    const gather_result = if (self.getAgentContext(agent_id)) |agent_context| b: {
-                        agent_context.processGatherCandidates() catch unreachable;
-                        break :b {};
-                    } else |err| err;
-
-                    c.callback(c.userdata, ContextResult{ .gather_candidates = gather_result });
-                },
                 .send => |parameters| {
                     if (self.getAgentContext(parameters.agent_id)) |agent_context| b: {
                         agent_context.processSend(c) catch unreachable;
